@@ -1,0 +1,1741 @@
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 05d216de78..af91d47074 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -336,6 +336,7 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
+ 
+ SYSTEM_ADD_ONS_DRIVERS_POWER += [ FFilterByBuildFeatures
+ 	acpi_battery@x86,x86_64
++	sony_ec@x86,x86_64
+ ] ;
+ 
+ SYSTEM_ADD_ONS_FILE_SYSTEMS +=
+diff --git a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
+index d3ceae1c5d..c1dc30408c 100644
+--- a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
++++ b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
+@@ -462,7 +462,6 @@ bluetooth_std_ops(int32 op, ...)
+ 			mutex_init(&sListLock, "bluetooth devices");
+ 
+ 			// status = InitializeAclConnectionThread();
+-			ERROR("%s: Connection Thread error\n", __func__);
+ 
+ 			add_debugger_command("btLocalDevices", &dump_bluetooth_devices,
+ 				"Lists Bluetooth LocalDevices registered in the Stack");
+diff --git a/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c b/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c
+index ab68836056..f88332b1a0 100644
+--- a/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c
++++ b/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c
+@@ -195,6 +195,23 @@ AcpiEvInitGlobalLockHandler (
+         return_ACPI_STATUS (AE_OK);
+     }
+ 
++    /*
++     * Create the pending-lock and clear its pending flag *before* installing
++     * the fixed event handler below. On some hardware the Global Lock status
++     * bit is already set at this point (e.g. left over from a previous
++     * unclean shutdown, or possibly asserted the instant the event is
++     * enabled), which makes the SCI fire synchronously from within
++     * AcpiInstallFixedEventHandler() -> AcpiEnableEvent(), invoking
++     * AcpiEvGlobalLockHandler() before this function returns. That handler
++     * uses AcpiGbl_GlobalLockPendingLock, so it must already exist.
++     */
++    Status = AcpiOsCreateLock (&AcpiGbl_GlobalLockPendingLock);
++    if (ACPI_FAILURE (Status))
++    {
++        return_ACPI_STATUS (Status);
++    }
++    AcpiGbl_GlobalLockPending = FALSE;
++
+     /* Attempt installation of the global lock handler */
+ 
+     Status = AcpiInstallFixedEventHandler (ACPI_EVENT_GLOBAL,
+@@ -212,16 +229,17 @@ AcpiEvInitGlobalLockHandler (
+         ACPI_ERROR ((AE_INFO,
+             "No response from Global Lock hardware, disabling lock"));
+ 
++        AcpiOsDeleteLock (AcpiGbl_GlobalLockPendingLock);
++        AcpiGbl_GlobalLockPendingLock = NULL;
+         return_ACPI_STATUS (AE_OK);
+     }
+-
+-    Status = AcpiOsCreateLock (&AcpiGbl_GlobalLockPendingLock);
+-    if (ACPI_FAILURE (Status))
++    else if (ACPI_FAILURE (Status))
+     {
++        AcpiOsDeleteLock (AcpiGbl_GlobalLockPendingLock);
++        AcpiGbl_GlobalLockPendingLock = NULL;
+         return_ACPI_STATUS (Status);
+     }
+ 
+-    AcpiGbl_GlobalLockPending = FALSE;
+     AcpiGbl_GlobalLockPresent = TRUE;
+     return_ACPI_STATUS (Status);
+ }
+diff --git a/src/add-ons/kernel/bus_managers/pci/pci.cpp b/src/add-ons/kernel/bus_managers/pci/pci.cpp
+index 5bfe169d68..00b660976a 100644
+--- a/src/add-ons/kernel/bus_managers/pci/pci.cpp
++++ b/src/add-ons/kernel/bus_managers/pci/pci.cpp
+@@ -1564,13 +1564,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+ 	if (device > (info->max_bus_devices - 1)
+ 		|| function > 7
+ 		|| (size != 1 && size != 2 && size != 4)
+-		|| (size == 2 && (offset & 3) == 3)
+-		|| (size == 4 && (offset & 3) != 0)) {
++		|| (size == 2 && (offset & 3) == 3)) {
+ 		dprintf("PCI: can't read config for domain %d, %u:%u:%u, offset %u, size %u\n",
+ 			 domain, bus, device, function, offset, size);
+ 		return B_ERROR;
+ 	}
+ 
++	if (size == 4 && (offset & 3) != 0) {
++		if ((offset & 1) != 0) {
++			dprintf("PCI: can't read config for domain %d, %u:%u:%u, offset %u, size %u\n",
++				 domain, bus, device, function, offset, size);
++			return B_ERROR;
++		}
++
++		uint32 low, high;
++		status_t status = ReadConfig(domain, bus, device, function, offset,
++			2, &low);
++		if (status == B_OK) {
++			status = ReadConfig(domain, bus, device, function, offset + 2,
++				2, &high);
++		}
++		if (status == B_OK)
++			*value = low | (high << 16);
++		return status;
++	}
++
+ 	status_t status = (*info->controller->read_pci_config)(info->controller_cookie,
+ 		bus, device, function, offset, size, value);
+ 	if (status != B_OK) {
+@@ -1617,13 +1635,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+ 	if (device > (info->max_bus_devices - 1)
+ 		|| function > 7
+ 		|| (size != 1 && size != 2 && size != 4)
+-		|| (size == 2 && (offset & 3) == 3)
+-		|| (size == 4 && (offset & 3) != 0)) {
++		|| (size == 2 && (offset & 3) == 3)) {
+ 		dprintf("PCI: can't write config for domain %d, bus %u, device %u, function %u, offset %u, size %u\n",
+ 			 domain, bus, device, function, offset, size);
+ 		return B_ERROR;
+ 	}
+ 
++	if (size == 4 && (offset & 3) != 0) {
++		if ((offset & 1) != 0) {
++			dprintf("PCI: can't write config for domain %d, bus %u, device %u, function %u, offset %u, size %u\n",
++				 domain, bus, device, function, offset, size);
++			return B_ERROR;
++		}
++
++		status_t status = WriteConfig(domain, bus, device, function, offset,
++			2, value & 0xffff);
++		if (status == B_OK) {
++			status = WriteConfig(domain, bus, device, function, offset + 2,
++				2, value >> 16);
++		}
++		return status;
++	}
++
+ 	return (*info->controller->write_pci_config)(info->controller_cookie, bus,
+ 		device, function, offset, size, value);
+ }
+diff --git a/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp b/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
+index 177b1997ec..3b74aa192a 100644
+--- a/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
++++ b/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
+@@ -155,6 +155,26 @@ intel_fixup_ahci(PCI *pci, uint8 domain, uint8 bus, uint8 device,
+ }
+ 
+ 
++static void
++intel_fixup_ehci_bar(PCI *pci, uint8 domain, uint8 bus, uint8 device,
++	uint8 function, uint16 deviceId)
++{
++	if (deviceId != 0x8117)
++		return;
++
++	uint32 bar0 = pci->ReadConfig(domain, bus, device, function,
++		PCI_base_registers, 4);
++	if (bar0 != 0)
++		return;
++
++	dprintf("intel_fixup_ehci_bar: domain %u, bus %u, device %u, function %u "
++		"has an unassigned BAR0, assigning a fallback address\n",
++		domain, bus, device, function);
++	pci->WriteConfig(domain, bus, device, function, PCI_base_registers, 4,
++		0xf0000000);
++}
++
++
+ static void
+ ati_fixup_ixp(PCI *pci, uint8 domain, uint8 bus, uint8 device, uint8 function,
+ 	uint16 deviceId)
+@@ -206,6 +226,7 @@ pci_fixup_device(PCI *pci, uint8 domain, uint8 bus, uint8 device,
+ 
+ 		case 0x8086:
+ 			intel_fixup_ahci(pci, domain, bus, device, function, deviceId);
++			intel_fixup_ehci_bar(pci, domain, bus, device, function, deviceId);
+ 			break;
+ 
+ 		case 0x1002:
+diff --git a/src/add-ons/kernel/bus_managers/ps2/ps2_common.cpp b/src/add-ons/kernel/bus_managers/ps2/ps2_common.cpp
+index 7b9dd027e6..c509f78641 100644
+--- a/src/add-ons/kernel/bus_managers/ps2/ps2_common.cpp
++++ b/src/add-ons/kernel/bus_managers/ps2/ps2_common.cpp
+@@ -466,7 +466,19 @@ ps2_init(void)
+ 		}
+ 
+ 		for (int idx = 1; idx <= 3; idx++) {
+-			ps2_service_notify_device_added(&ps2_device[PS2_DEVICE_MOUSE + idx]);
++			// Same rationale as device 0 above: only add ports that actually
++			// have something responding, instead of unconditionally probing
++			// (and paying the full reset + magic-knock timeout for) mux
++			// sub-ports nothing is plugged into.
++			if (ps2_dev_command_timeout(&ps2_device[PS2_DEVICE_MOUSE + idx],
++					PS2_CMD_MOUSE_SET_SCALE11, NULL, 0, NULL, 0, 100000)
++					== B_TIMED_OUT) {
++				INFO("ps2: accessing multiplexed mouse port %d timed out, "
++					"ignoring it!\n", idx);
++			} else {
++				ps2_service_notify_device_added(
++					&ps2_device[PS2_DEVICE_MOUSE + idx]);
++			}
+ 		}
+ 		ps2_service_notify_device_added(&ps2_device[PS2_DEVICE_KEYB]);
+ 	} else {
+diff --git a/src/add-ons/kernel/bus_managers/usb/BusManager.cpp b/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+index bc264e8aa1..853ef490ce 100644
+--- a/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+@@ -136,8 +136,51 @@ BusManager::AllocateDevice(Hub *parent, int8 hubAddress, uint8 hubPort,
+ 
+ 	defaultPipe->SetHubInfo(hubAddress, hubPort);
+ 
++	// Probe the device at address 0 before addressing it. This isn't
++	// required by the USB spec (SET_ADDRESS can be sent first), but it's
++	// what most host stacks do in practice, and some non-strictly-compliant
++	// devices rely on seeing a request at address 0 before they'll accept
++	// SET_ADDRESS. It also gives us a device class/subclass/protocol to log
++	// for devices that fail addressing entirely, which otherwise leave no
++	// trace of what they were.
++	bool respondedAtAddressZero = false;
++	{
++		usb_device_descriptor probeDescriptor;
++		size_t probeLength = 0;
++		status_t probeStatus = defaultPipe->SendRequest(
++			USB_REQTYPE_DEVICE_IN | USB_REQTYPE_STANDARD,
++			USB_REQUEST_GET_DESCRIPTOR,
++			USB_DESCRIPTOR_DEVICE << 8,
++			0,
++			8,
++			(void *)&probeDescriptor,
++			8,
++			&probeLength);
++
++		if (probeStatus >= B_OK && probeLength == 8) {
++			respondedAtAddressZero = true;
++			TRACE_ALWAYS("device at address 0 (hub %d port %d): class 0x%02x "
++				"subclass 0x%02x protocol 0x%02x max_packet_size_0 %d\n",
++				hubAddress, hubPort, probeDescriptor.device_class,
++				probeDescriptor.device_subclass,
++				probeDescriptor.device_protocol,
++				probeDescriptor.max_packet_size_0);
++		} else {
++			TRACE_ALWAYS("device at address 0 (hub %d port %d): did not "
++				"respond to GET_DESCRIPTOR (status 0x%08" B_PRIx32 ")\n",
++				hubAddress, hubPort, (uint32)probeStatus);
++		}
++	}
++
++	// A device that won't even answer the simplest possible request at
++	// address 0 is extremely unlikely to suddenly start responding to
++	// SET_ADDRESS on a 2nd or 3rd retry 200ms later; don't burn that time
++	// (repeated on every failed hub Explore() cycle) on a device that has
++	// already shown it isn't there.
++	int32 setAddressAttempts = respondedAtAddressZero ? 3 : 1;
++
+ 	status_t result = B_ERROR;
+-	for (int32 i = 0; i < 3; i++) {
++	for (int32 i = 0; i < setAddressAttempts; i++) {
+ 		// Set the address of the device USB 1.1 spec p202
+ 		result = defaultPipe->SendRequest(
+ 			USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_OUT,	// type
+diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+index e335e09054..f724eb3750 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+@@ -15,6 +15,23 @@
+ #include <algorithm>
+ 
+ 
++// Number of consecutive failed device setup attempts on a port (with no
++// real disconnect/reconnect in between) before Explore() stops retrying it
++// on every poll. Each attempt already involves a debounce, a full port
++// reset, and up to 3 retried SET_ADDRESS attempts (200ms apart), so even a
++// handful of attempts adds up to real, user-visible boot delay on a port
++// that's never going to succeed -- keep this low.
++static const uint8 kMaxPortFailedAttempts = 2;
++
++// Number of times a port that has exhausted kMaxPortFailedAttempts gets a
++// genuine power-off/power-on cycle (see PowerCyclePort()) as a last-resort
++// recovery attempt before Explore() gives up on it for good. Kept low: if a
++// real power cycle doesn't help after a couple of tries, more of them won't
++// either, and each one costs real time (power-off settle + power-on-to-
++// power-good delays).
++static const uint8 kMaxPortPowerCycleAttempts = 2;
++
++
+ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
+ 	usb_device_descriptor &desc, int8 deviceAddress, usb_speed speed,
+ 	bool isRootHub, void *controllerCookie)
+@@ -25,8 +42,11 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
+ 	TRACE("creating hub\n");
+ 
+ 	memset(&fHubDescriptor, 0, sizeof(fHubDescriptor));
+-	for (int32 i = 0; i < USB_MAX_PORT_COUNT; i++)
++	for (int32 i = 0; i < USB_MAX_PORT_COUNT; i++) {
+ 		fChildren[i] = NULL;
++		fFailedAttempts[i] = 0;
++		fPowerCycleAttempts[i] = 0;
++	}
+ 
+ 	if (!fInitOK) {
+ 		TRACE_ERROR("device failed to initialize\n");
+@@ -195,6 +215,35 @@ Hub::DisablePort(uint8 index)
+ }
+ 
+ 
++status_t
++Hub::PowerCyclePort(uint8 index)
++{
++	// A genuine power-off/power-on cycle (as opposed to just disabling the
++	// port's transaction servicing) is the closest a driver can get, in
++	// software, to what physically unplugging and replugging a device
++	// does. Some flaky devices that never recover via reset alone do
++	// recover from this. Not all hubs support per-port power switching
++	// (root hubs generally do); if this request fails there's nothing
++	// more to be done in software.
++	status_t status = DefaultPipe()->SendRequest(USB_REQTYPE_CLASS
++		| USB_REQTYPE_OTHER_OUT, USB_REQUEST_CLEAR_FEATURE, PORT_POWER,
++		index + 1, 0, NULL, 0, NULL);
++	if (status != B_OK)
++		return status;
++
++	snooze(100000);
++
++	status = DefaultPipe()->SendRequest(USB_REQTYPE_CLASS
++		| USB_REQTYPE_OTHER_OUT, USB_REQUEST_SET_FEATURE, PORT_POWER,
++		index + 1, 0, NULL, 0, NULL);
++	if (status != B_OK)
++		return status;
++
++	snooze(USB_DELAY_HUB_POWER_UP);
++	return B_OK;
++}
++
++
+ 
+ void
+ Hub::Explore(change_item **changeList)
+@@ -214,7 +263,9 @@ Hub::Explore(change_item **changeList)
+ 		}
+ #endif
+ 
+-		if ((fPortStatus[i].change & PORT_STATUS_CONNECTION)
++		bool freshConnection = (fPortStatus[i].change & PORT_STATUS_CONNECTION) != 0;
++
++		if (freshConnection
+ 				|| ((fPortStatus[i].status & PORT_STATUS_CONNECTION)
+ 					&& fChildren[i] == NULL)) {
+ 			// clear status change
+@@ -222,7 +273,22 @@ Hub::Explore(change_item **changeList)
+ 				USB_REQUEST_CLEAR_FEATURE, C_PORT_CONNECTION, i + 1,
+ 				0, NULL, 0, NULL);
+ 
+-			if (fPortStatus[i].status & PORT_STATUS_CONNECTION) {
++			if ((fPortStatus[i].status & PORT_STATUS_CONNECTION) != 0
++					&& fFailedAttempts[i] >= kMaxPortFailedAttempts) {
++				// This port has failed device setup repeatedly. Some flaky
++				// or failing internal devices don't just sit there
++				// "connected but broken" -- they genuinely bounce, raising a
++				// fresh disconnect/reconnect (and thus a fresh status change
++				// bit) on every single cycle. Deliberately do NOT reset the
++				// failure count just because this is a fresh connection
++				// event: for a bouncing device that would defeat the
++				// counter (it would never accumulate past 1) and this port
++				// would flood the bus with resets and address attempts
++				// forever, starving other USB traffic (and, on controllers
++				// sharing a legacy IRQ line, non-USB traffic too). Once a
++				// port has racked up enough consecutive failures, stop
++				// servicing it until it manages one full successful setup.
++			} else if (fPortStatus[i].status & PORT_STATUS_CONNECTION) {
+ 				// new device attached!
+ 				TRACE_ALWAYS("port %" B_PRId32 ": new device connected\n", i);
+ 
+@@ -299,6 +365,8 @@ Hub::Explore(change_item **changeList)
+ 					if (newDevice) {
+ 						newDevice->Changed(changeList, true);
+ 						fChildren[i] = newDevice;
++						fFailedAttempts[i] = 0;
++						fPowerCycleAttempts[i] = 0;
+ 						break;
+ 					} else {
+ 						// the device failed to setup correctly, disable the
+@@ -307,6 +375,35 @@ Hub::Explore(change_item **changeList)
+ 						DisablePort(i);
+ 					}
+ 				}
++
++				if (fChildren[i] == NULL
++						&& fFailedAttempts[i] < kMaxPortFailedAttempts) {
++					fFailedAttempts[i]++;
++					if (fFailedAttempts[i] >= kMaxPortFailedAttempts) {
++						if (fPowerCycleAttempts[i] < kMaxPortPowerCycleAttempts
++								&& PowerCyclePort(i) == B_OK) {
++							// A register-level reset couldn't get this port
++							// working after several tries; try an actual
++							// power-off/power-on cycle before giving up for
++							// good, since that's a meaningfully different
++							// (and stronger) recovery than another retry --
++							// closer to what physically unplugging and
++							// replugging the device would do. Give it a
++							// fresh set of retries under the new power
++							// cycle.
++							fPowerCycleAttempts[i]++;
++							fFailedAttempts[i] = 0;
++							TRACE_ALWAYS("port %" B_PRId32 ": repeated setup "
++								"failures, power-cycled the port (attempt "
++								"%u), retrying\n", i,
++								fPowerCycleAttempts[i]);
++						} else {
++							TRACE_ALWAYS("port %" B_PRId32 ": giving up after "
++								"repeated setup failures, ignoring until "
++								"reconnected\n", i);
++						}
++					}
++				}
+ 			} else {
+ 				// Device removed...
+ 				TRACE_ALWAYS("port %" B_PRId32 ": device removed\n", i);
+@@ -315,6 +412,14 @@ Hub::Explore(change_item **changeList)
+ 					fChildren[i]->Changed(changeList, false);
+ 					fChildren[i] = NULL;
+ 				}
++
++				// A clean disconnect (status no longer shows a connection at
++				// all, as opposed to a bouncing device that reconnects
++				// within the same Explore() cycle) is a much stronger
++				// signal than a bare status change bit, so it's safe to
++				// give a previously given-up port a fresh start here.
++				fFailedAttempts[i] = 0;
++				fPowerCycleAttempts[i] = 0;
+ 			}
+ 		}
+ 
+diff --git a/src/add-ons/kernel/bus_managers/usb/usb_private.h b/src/add-ons/kernel/bus_managers/usb/usb_private.h
+index 81f5137c83..538eef5411 100644
+--- a/src/add-ons/kernel/bus_managers/usb/usb_private.h
++++ b/src/add-ons/kernel/bus_managers/usb/usb_private.h
+@@ -657,6 +657,7 @@ virtual	status_t						GetDescriptor(uint8 descriptorType,
+ 		status_t						UpdatePortStatus(uint8 index);
+ 		status_t						ResetPort(uint8 index);
+ 		status_t						DisablePort(uint8 index);
++		status_t						PowerCyclePort(uint8 index);
+ 
+ 		void							Explore(change_item **changeList);
+ static	void							InterruptCallback(void *cookie,
+@@ -683,6 +684,8 @@ private:
+ 		usb_port_status					fInterruptStatus[USB_MAX_PORT_COUNT];
+ 		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];
+ 		Device *						fChildren[USB_MAX_PORT_COUNT];
++		uint8							fFailedAttempts[USB_MAX_PORT_COUNT];
++		uint8							fPowerCycleAttempts[USB_MAX_PORT_COUNT];
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
+index 3f3670c14f..e5d3177dab 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
++++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
+@@ -72,6 +72,8 @@
+ 
+ #include <machine/bus.h>
+ 
++#include <dev/pci/pcivar.h>
++
+ #include <net/if.h>
+ #include <net/if_var.h>
+ #include <net/if_dl.h>
+@@ -2504,6 +2506,32 @@ ath_bmiss_proc(void *arg, int pending)
+ 
+ 	ath_beacon_miss(sc);
+ 
++	/*
++	 * Escalate to a full PCI power cycle (D3 -> D0) if beacon-miss
++	 * recovery keeps being needed in a tight loop. A plain HAL reset
++	 * (below) only reprograms the chip's own registers; on hardware
++	 * where the radio ends up in a state a register-level reset can't
++	 * clear -- observed on some units as a beacon-miss/bb-hang cycle
++	 * that keeps recurring every time it reassociates -- only an actual
++	 * power-off/power-on cycle (the same effect a hardware kill switch
++	 * has) has been seen to reliably recover it.
++	 */
++	if (ticks - sc->sc_bmiss_last_tick > 30 * hz)
++		sc->sc_bmiss_count = 0;
++	sc->sc_bmiss_last_tick = ticks;
++	sc->sc_bmiss_count++;
++
++	if (sc->sc_bmiss_count >= 2) {
++		device_printf(sc->sc_dev,
++		    "repeated beacon miss recovery, power-cycling the "
++		    "adapter\n");
++		pci_set_powerstate(sc->sc_dev, PCI_POWERSTATE_D3);
++		DELAY(50000);
++		pci_set_powerstate(sc->sc_dev, PCI_POWERSTATE_D0);
++		pci_enable_busmaster(sc->sc_dev);
++		sc->sc_bmiss_count = 0;
++	}
++
+ 	/*
+ 	 * Do a reset upon any beacon miss event.
+ 	 *
+@@ -2516,8 +2544,8 @@ ath_bmiss_proc(void *arg, int pending)
+ 		    "bb hang detected (0x%x), resetting\n", hangs);
+ 	} else {
+ 		ath_reset(sc, ATH_RESET_NOLOSS, HAL_RESET_FORCE_COLD);
+-		ieee80211_beacon_miss(&sc->sc_ic);
+ 	}
++	ieee80211_beacon_miss(&sc->sc_ic);
+ 
+ 	/* Force a beacon resync, in case they've drifted */
+ 	sc->sc_syncbeacon = 1;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
+index 8302153b47..5be1b57c00 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
++++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
+@@ -595,6 +595,8 @@ struct ath_softc {
+ 	void 			(*sc_node_cleanup)(struct ieee80211_node *);
+ 	void 			(*sc_node_free)(struct ieee80211_node *);
+ 	device_t		sc_dev;
++	int			sc_bmiss_count;	/* consecutive bmiss recoveries */
++	int			sc_bmiss_last_tick;
+ 	HAL_BUS_TAG		sc_st;		/* bus space tag */
+ 	HAL_BUS_HANDLE		sc_sh;		/* bus space handle */
+ 	bus_dma_tag_t		sc_dmat;	/* bus DMA tag */
+diff --git a/src/add-ons/kernel/drivers/power/Jamfile b/src/add-ons/kernel/drivers/power/Jamfile
+index b929cd9759..b3bf398fce 100644
+--- a/src/add-ons/kernel/drivers/power/Jamfile
++++ b/src/add-ons/kernel/drivers/power/Jamfile
+@@ -7,3 +7,4 @@ SubInclude HAIKU_TOP src add-ons kernel drivers power acpi_lid ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power acpi_thermal ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power amd_thermal ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power pch_thermal ;
++SubInclude HAIKU_TOP src add-ons kernel drivers power sony_ec ;
+diff --git a/src/add-ons/kernel/drivers/power/sony_ec/Jamfile b/src/add-ons/kernel/drivers/power/sony_ec/Jamfile
+new file mode 100644
+index 0000000000..f7d6080a04
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/sony_ec/Jamfile
+@@ -0,0 +1,7 @@
++SubDir HAIKU_TOP src add-ons kernel drivers power sony_ec ;
++
++UsePrivateKernelHeaders ;
++
++KernelAddon sony_ec :
++	sony_ec.cpp
++	;
+diff --git a/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
+new file mode 100644
+index 0000000000..880a2d8719
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
+@@ -0,0 +1,516 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Diagnostic/bring-up driver for the Sony "SNC" notebook control ACPI
++ * device (HID "SNY5001"), found on Sony VAIO laptops of this era.
++ *
++ * This does NOT reimplement Linux's sony-laptop.c (which is GPL licensed
++ * and can't be copied into this MIT-licensed tree); it's an independent
++ * implementation written from an understanding of the SNC calling
++ * convention gathered by reading that driver and Sony's own published
++ * ACPI SNC readme. The convention, in short:
++ *
++ *   - The SNC device exposes up to 16 "capability" slots. Calling SN00
++ *     with an argument of (slot + 0x20) returns the vendor-defined
++ *     "handle" value assigned to that slot on this particular model (0
++ *     if unused). Which handle ends up in which slot is BIOS/model
++ *     specific and has to be discovered at runtime -- there is no fixed
++ *     mapping.
++ *   - SN02 takes a bitmask (obtained via SN00 with argument 0x10) and
++ *     enables ACPI Notify events for the capabilities present.
++ *   - Runtime ACPI Notify events on the SNC device use codes of
++ *     (0x90 + slot), i.e. they identify a slot, not a handle directly;
++ *     the handle has to be looked back up from the table above.
++ *   - SN05 acknowledges/clears an event for a given slot.
++ *   - Screen brightness is a separate, simpler pair of methods: GBRT
++ *     (get, no argument) and SBRT (set, one integer argument), which
++ *     don't go through the capability table at all.
++ *
++ * This driver only logs what it finds (capability table contents,
++ * brightness, and raw Notify event/slot/handle numbers) via dprintf, so
++ * the real per-model handle assignments (which slot is the wireless
++ * kill switch, which is the keyboard backlight, etc.) can be read out of
++ * the syslog on real hardware instead of guessed at. Once that's known,
++ * the interesting handles can be given real meaning (rfkill state,
++ * hotkey delivery, ...) as a follow-up.
++ */
++
++
++#include <ACPI.h>
++
++#include <stdlib.h>
++#include <string.h>
++
++
++#define SONY_EC_MODULE_NAME "drivers/power/sony_ec/driver_v1"
++#define SONY_EC_DEVICE_MODULE_NAME "drivers/power/sony_ec/device_v1"
++
++#define SONY_EC_HID "SNY5001"
++
++#define SONY_EC_CAP_SLOT_COUNT 16
++#define SONY_EC_CAP_SLOT_BASE 0x20
++#define SONY_EC_EVENT_BASE 0x90
++
++#define ERROR(x...)	dprintf("sony_ec: " x)
++#define TRACE(x...)	dprintf("sony_ec: " x)
++
++
++static device_manager_info *sDeviceManager;
++static struct acpi_module_info *sAcpi;
++
++
++typedef struct {
++	device_node *node;
++	acpi_device_module_info *acpi;
++	acpi_device acpi_cookie;
++
++	uint16 capabilities[SONY_EC_CAP_SLOT_COUNT];
++	uint32 statusValue[SONY_EC_CAP_SLOT_COUNT];
++	uint32 brightness;
++} sony_ec_device_info;
++
++static sony_ec_device_info *sSonyEcDevice;
++
++
++static status_t
++sony_ec_call_int(sony_ec_device_info *device, const char *method,
++	bool hasArgument, uint32 argument, uint32 *_result)
++{
++	acpi_object_type argumentObject;
++	acpi_objects arguments;
++	acpi_objects *argumentsPointer = NULL;
++
++	if (hasArgument) {
++		argumentObject.object_type = ACPI_TYPE_INTEGER;
++		argumentObject.integer.integer = argument;
++		arguments.count = 1;
++		arguments.pointer = &argumentObject;
++		argumentsPointer = &arguments;
++	}
++
++	uint8 resultBuffer[64];
++	memset(resultBuffer, 0, sizeof(resultBuffer));
++	acpi_data buffer;
++	buffer.pointer = resultBuffer;
++	buffer.length = sizeof(resultBuffer);
++
++	status_t status = device->acpi->evaluate_method(device->acpi_cookie,
++		method, argumentsPointer, &buffer);
++	if (status != B_OK)
++		return status;
++
++	// Some SNC methods (SBRT in particular) are setters with no meaningful
++	// return value -- the AML has no Return statement, so the buffer stays
++	// empty. That's not a failure: the method call itself already
++	// succeeded above. Only decode a result if the callee actually wants
++	// one and something recognizable came back; otherwise just report
++	// success with *_result left untouched.
++	if (buffer.length == 0)
++		return B_OK;
++
++	acpi_object_type *object = (acpi_object_type *)buffer.pointer;
++	if (object->object_type == ACPI_TYPE_INTEGER) {
++		*_result = (uint32)object->integer.integer;
++		return B_OK;
++	}
++
++	if (object->object_type == ACPI_TYPE_BUFFER && object->buffer.length >= 1) {
++		uint32 value = 0;
++		size_t count = min_c(object->buffer.length, sizeof(value));
++		memcpy(&value, object->buffer.buffer, count);
++		*_result = value;
++		return B_OK;
++	}
++
++	return B_OK;
++}
++
++
++static status_t
++sony_ec_call_handle(sony_ec_device_info *device, uint16 handle,
++	uint32 argument, uint32 *_result)
++{
++	for (int32 i = 0; i < SONY_EC_CAP_SLOT_COUNT; i++) {
++		if (device->capabilities[i] != handle)
++			continue;
++
++		return sony_ec_call_int(device, "SN07", true, i | argument, _result);
++	}
++
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++static void
++sony_ec_probe_capabilities(sony_ec_device_info *device)
++{
++	for (int32 i = 0; i < SONY_EC_CAP_SLOT_COUNT; i++) {
++		uint32 result = 0;
++		status_t status = sony_ec_call_int(device, "SN00", true,
++			SONY_EC_CAP_SLOT_BASE + i, &result);
++		device->capabilities[i] = (status == B_OK) ? (uint16)result : 0;
++		if (status == B_OK && result != 0) {
++			TRACE("capability slot %" B_PRId32 ": handle 0x%04" B_PRIx32
++				"\n", i, result);
++		}
++	}
++
++	// Diagnostic only: read back a "status" value (argument 0x0100, the
++	// same convention used to read the wireless kill switch's state) for
++	// every discovered handle. This doesn't control anything by itself,
++	// but gives real per-handle data to work from -- e.g. a handle whose
++	// value visibly tracks something we can toggle (like an indicator
++	// LED) instead of guessing blind.
++	for (int32 i = 0; i < SONY_EC_CAP_SLOT_COUNT; i++) {
++		if (device->capabilities[i] == 0)
++			continue;
++
++		uint32 result = 0;
++		status_t status = sony_ec_call_int(device, "SN07", true,
++			i | 0x0100, &result);
++		device->statusValue[i] = result;
++		TRACE("capability slot %" B_PRId32 " (handle 0x%04x) status: %s, "
++			"value 0x%04" B_PRIx32 "\n", i, device->capabilities[i],
++			strerror(status), result);
++	}
++
++	// The hotkey handles need to be "armed" once with a 0 argument before
++	// they start generating Notify events for Fn key presses -- unlike
++	// e.g. the wireless kill switch handle, which reports events out of
++	// the box.
++	static const uint16 kHotkeyHandles[] = { 0x0100, 0x0101, 0x0102, 0x0127 };
++	for (size_t i = 0; i < B_COUNT_OF(kHotkeyHandles); i++) {
++		uint32 result = 0;
++		status_t status = sony_ec_call_handle(device, kHotkeyHandles[i], 0,
++			&result);
++		if (status == B_OK) {
++			TRACE("armed hotkey handle 0x%04x\n", kHotkeyHandles[i]);
++		}
++	}
++
++	uint32 brightness = 0;
++	if (sony_ec_call_int(device, "GBRT", false, 0, &brightness) == B_OK) {
++		device->brightness = brightness;
++		TRACE("current brightness (GBRT): %" B_PRIu32 "\n", brightness);
++	} else {
++		TRACE("GBRT not available on this model\n");
++	}
++
++	uint32 eventMask = 0;
++	if (sony_ec_call_int(device, "SN00", true, 0x10, &eventMask) == B_OK) {
++		uint32 enableResult = 0;
++		status_t status = sony_ec_call_int(device, "SN02", true, eventMask,
++			&enableResult);
++		TRACE("enabling events (mask 0x%04" B_PRIx32 "): %s\n", eventMask,
++			strerror(status));
++	}
++}
++
++
++static void
++sony_ec_notify_handler(acpi_handle _device, uint32 value, void *context)
++{
++	sony_ec_device_info *device = (sony_ec_device_info *)context;
++
++	TRACE("notify event 0x%04" B_PRIx32 "\n", value);
++
++	if (value < SONY_EC_EVENT_BASE)
++		return;
++
++	uint32 offset = value - SONY_EC_EVENT_BASE;
++	if (offset >= SONY_EC_CAP_SLOT_COUNT) {
++		ERROR("notify event 0x%04" B_PRIx32 " is outside the capability "
++			"table\n", value);
++		return;
++	}
++
++	TRACE("notify event 0x%04" B_PRIx32 " -> slot %" B_PRIu32
++		" -> handle 0x%04x\n", value, offset, device->capabilities[offset]);
++
++	uint32 clearResult = 0;
++	sony_ec_call_int(device, "SN05", true, 1 << offset, &clearResult);
++}
++
++
++//	#pragma mark - device module API
++
++
++static status_t
++sony_ec_init_device(void *_cookie, void **cookie)
++{
++	// sSonyEcDevice is set up eagerly in sony_ec_register_child_devices(),
++	// since init_device() is only called once something actually opens
++	// power/sony_ec/0 -- and nothing does by default. We still want the
++	// capability table probed and the notify handler installed
++	// unconditionally at boot, not only if/when a client shows up.
++	if (sSonyEcDevice == NULL) {
++		ERROR("init_device called without a set up device\n");
++		return B_ERROR;
++	}
++
++	*cookie = sSonyEcDevice;
++	return B_OK;
++}
++
++
++static void
++sony_ec_uninit_device(void *_cookie)
++{
++	// The device is torn down in sony_ec_uninit_driver(), not here, since
++	// it was set up outside of the open()-triggered init_device() lifecycle
++	// too. Nothing to do per-close.
++}
++
++
++static status_t
++sony_ec_open(void *_cookie, const char *path, int flags, void **cookie)
++{
++	*cookie = _cookie;
++	return B_OK;
++}
++
++
++static status_t
++sony_ec_read(void *_cookie, off_t position, void *buffer, size_t *numBytes)
++{
++	sony_ec_device_info *device = (sony_ec_device_info *)_cookie;
++	if (*numBytes < sizeof(uint32)) {
++		*numBytes = 0;
++		return B_IO_ERROR;
++	}
++
++	if (user_memcpy(buffer, &device->brightness, sizeof(uint32)) < B_OK)
++		return B_BAD_ADDRESS;
++
++	*numBytes = sizeof(uint32);
++	return B_OK;
++}
++
++
++static status_t
++sony_ec_write(void *_cookie, off_t position, const void *buffer,
++	size_t *numBytes)
++{
++	sony_ec_device_info *device = (sony_ec_device_info *)_cookie;
++
++	// Accept a brightness level as an ASCII decimal string (e.g. "5"), so
++	// it's directly testable from a shell with something like
++	// `echo 5 > /dev/power/sony_ec/0`, without needing a dedicated tool.
++	char text[8];
++	size_t length = *numBytes;
++	if (length >= sizeof(text))
++		length = sizeof(text) - 1;
++	if (user_memcpy(text, buffer, length) < B_OK)
++		return B_BAD_ADDRESS;
++	text[length] = '\0';
++
++	uint32 level = (uint32)strtoul(text, NULL, 10);
++	if (level > 8)
++		level = 8;
++
++	uint32 result = 0;
++	status_t status = sony_ec_call_int(device, "SBRT", true, level, &result);
++	if (status == B_OK) {
++		device->brightness = level;
++		TRACE("brightness set to %" B_PRIu32 " (SBRT)\n", level);
++	} else {
++		ERROR("SBRT failed: %s\n", strerror(status));
++	}
++
++	// Read the level straight back from the EC (not just device->brightness,
++	// which we just set locally): if this still reports the OLD value, SBRT
++	// is a no-op on this model at the ACPI level. If it reports the NEW
++	// value, the EC accepted it, but whatever's between the EC and the
++	// actual panel backlight isn't responding -- a different, hardware-
++	// level problem this driver can't do anything more about.
++	uint32 readBack = 0xffffffff;
++	status_t readStatus = sony_ec_call_int(device, "GBRT", false, 0,
++		&readBack);
++	TRACE("brightness read-back after SBRT: status %s, value %" B_PRIu32
++		"\n", strerror(readStatus), readBack);
++
++	*numBytes = length;
++	return status;
++}
++
++
++static status_t
++sony_ec_control(void *_cookie, uint32 op, void *arg, size_t len)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static status_t
++sony_ec_close(void *cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++sony_ec_free(void *cookie)
++{
++	return B_OK;
++}
++
++
++//	#pragma mark - driver module API
++
++
++static float
++sony_ec_support(device_node *parent)
++{
++	const char *bus;
++	if (sDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "acpi") != 0) {
++		return 0.0;
++	}
++
++	uint32 deviceType;
++	if (sDeviceManager->get_attr_uint32(parent, ACPI_DEVICE_TYPE_ITEM,
++			&deviceType, false) != B_OK || deviceType != ACPI_TYPE_DEVICE) {
++		return 0.0;
++	}
++
++	const char *hid;
++	if (sDeviceManager->get_attr_string(parent, ACPI_DEVICE_HID_ITEM, &hid,
++			false) != B_OK || strcmp(hid, SONY_EC_HID) != 0) {
++		return 0.0;
++	}
++
++	TRACE("found Sony SNC device (%s)\n", hid);
++	return 0.6;
++}
++
++
++static status_t
++sony_ec_register_device(device_node *node)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Sony Notebook Control" }},
++		{ NULL }
++	};
++
++	return sDeviceManager->register_node(node, SONY_EC_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++sony_ec_init_driver(device_node *node, void **_driverCookie)
++{
++	*_driverCookie = node;
++	return B_OK;
++}
++
++
++static void
++sony_ec_uninit_driver(void *driverCookie)
++{
++	if (sSonyEcDevice == NULL)
++		return;
++
++	sSonyEcDevice->acpi->remove_notify_handler(sSonyEcDevice->acpi_cookie,
++		ACPI_DEVICE_NOTIFY, sony_ec_notify_handler);
++	free(sSonyEcDevice);
++	sSonyEcDevice = NULL;
++}
++
++
++static status_t
++sony_ec_register_child_devices(void *_cookie)
++{
++	device_node *node = (device_node *)_cookie;
++
++	// Set up (and probe) the device here, unconditionally, rather than in
++	// init_device(): init_device() is only called once something actually
++	// opens power/sony_ec/0, and nothing does that on its own -- this is a
++	// bring-up/diagnostic driver that needs its capability table logged
++	// and its notify handler installed at boot regardless of whether any
++	// client ever opens the device node.
++	sony_ec_device_info *device = (sony_ec_device_info *)calloc(1,
++		sizeof(*device));
++	if (device == NULL)
++		return B_NO_MEMORY;
++
++	device->node = node;
++
++	device_node *parent = sDeviceManager->get_parent_node(node);
++	sDeviceManager->get_driver(parent, (driver_module_info **)&device->acpi,
++		(void **)&device->acpi_cookie);
++	sDeviceManager->put_node(parent);
++
++	if (device->acpi == NULL) {
++		ERROR("could not get acpi device driver from parent node\n");
++		free(device);
++		return B_ERROR;
++	}
++
++	if (device->acpi->install_notify_handler(device->acpi_cookie,
++			ACPI_DEVICE_NOTIFY, sony_ec_notify_handler, device) != B_OK) {
++		ERROR("can't install notify handler\n");
++	}
++
++	sony_ec_probe_capabilities(device);
++
++	sSonyEcDevice = device;
++
++	return sDeviceManager->publish_device(node, "power/sony_ec/0",
++		SONY_EC_DEVICE_MODULE_NAME);
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info **)&sDeviceManager },
++	{ B_ACPI_MODULE_NAME, (module_info **)&sAcpi },
++	{}
++};
++
++
++driver_module_info sony_ec_driver_module = {
++	{
++		SONY_EC_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	sony_ec_support,
++	sony_ec_register_device,
++	sony_ec_init_driver,
++	sony_ec_uninit_driver,
++	sony_ec_register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++struct device_module_info sony_ec_device_module = {
++	{
++		SONY_EC_DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	sony_ec_init_device,
++	sony_ec_uninit_device,
++	NULL,
++
++	sony_ec_open,
++	sony_ec_close,
++	sony_ec_free,
++	sony_ec_read,
++	sony_ec_write,
++	NULL,
++	sony_ec_control,
++	NULL,
++	NULL
++};
++
++module_info *modules[] = {
++	(module_info *)&sony_ec_driver_module,
++	(module_info *)&sony_ec_device_module,
++	NULL
++};
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+index 4be0934ed6..6cfc85bbf3 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+@@ -28,7 +28,7 @@ addonSources =
+ 	QuickCamDevice.cpp
+ 	SonixCamDevice.cpp
+ 	NW80xCamDevice.cpp
+-#	UVCCamDevice.cpp UVCDeframer.cpp
++	UVCCamDevice.cpp UVCDeframer.cpp
+ ;
+ 
+ ## colorspace transforms sources
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 13987ee472..cb216cb18b 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -72,6 +72,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fUncompressedFormatIndex(1),
+ 	fUncompressedFrameIndex(1)
+ {
++	fIsYUY2 = false;
+ 	fDeframer = new UVCDeframer(this);
+ 	SetDataInput(fDeframer);
+ 
+@@ -191,6 +192,8 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 			const usbvc_format_descriptor* descriptor
+ 				= (const usbvc_format_descriptor*)_descriptor;
+ 			fUncompressedFormatIndex = descriptor->formatIndex;
++			fIsYUY2 = memcmp(descriptor->uncompressed.format, kYUY2Guid,
++				sizeof(usbvc_guid)) == 0;
+ 			printf("VS_FORMAT_UNCOMPRESSED:\tbFormatIdx=%d,#frmdesc=%d,guid=",
+ 				descriptor->formatIndex, descriptor->numFrameDescriptors);
+ 			print_guid(descriptor->uncompressed.format);
+@@ -1266,8 +1269,13 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ 		// TODO: The Video Producer only outputs B_RGB32.  This is OK for most
+ 		// applications.  This could be leveraged if applications can
+ 		// consume B_YUV422.
+-		_DecodeColor((unsigned char*)buffer->Data(),
+-			(unsigned char*)f->Buffer(), w, h);
++		if (fIsYUY2) {
++			_DecodeYUY2((unsigned char*)buffer->Data(),
++				(unsigned char*)f->Buffer(), w, h);
++		} else {
++			_DecodeColor((unsigned char*)buffer->Data(),
++				(unsigned char*)f->Buffer(), w, h);
++		}
+ 	}
+ 	delete f;
+ 	return B_OK;
+@@ -1349,6 +1357,49 @@ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+ }
+ 
+ 
++static inline unsigned char
++clamp_byte(int value)
++{
++	if (value < 0)
++		return 0;
++	if (value > 255)
++		return 255;
++	return (unsigned char)value;
++}
++
++
++void
++UVCCamDevice::_DecodeYUY2(unsigned char* dst, unsigned char* src,
++	int32 width, int32 height)
++{
++	// YUY2/YUYV packs 2 pixels into 4 bytes: Y0 U Y1 V (4:2:2 subsampling,
++	// chroma shared between the pixel pair). B_RGB32 stores each pixel as
++	// B, G, R, - in memory (little endian).
++	int32 pixelPairs = (width * height) / 2;
++	for (int32 i = 0; i < pixelPairs; i++) {
++		int y0 = src[0];
++		int u = src[1] - 128;
++		int y1 = src[2];
++		int v = src[3] - 128;
++		src += 4;
++
++		int r = (359 * v) >> 8;
++		int g = (88 * u + 183 * v) >> 8;
++		int b = (454 * u) >> 8;
++
++		dst[0] = clamp_byte(y0 + b);
++		dst[1] = clamp_byte(y0 - g);
++		dst[2] = clamp_byte(y0 + r);
++		dst[3] = 0xff;
++		dst[4] = clamp_byte(y1 + b);
++		dst[5] = clamp_byte(y1 - g);
++		dst[6] = clamp_byte(y1 + r);
++		dst[7] = 0xff;
++		dst += 8;
++	}
++}
++
++
+ 
+ 
+ UVCCamDeviceAddon::UVCCamDeviceAddon(WebCamMediaAddOn* webcam)
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 9b60f38bfb..4d276ba3ac 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -49,6 +49,9 @@ private:
+ 			void 				_DecodeColor(unsigned char *dst,
+ 									unsigned char *src, int32 width,
+ 									int32 height);
++			void				_DecodeYUY2(unsigned char *dst,
++									unsigned char *src, int32 width,
++									int32 height);
+ 
+ 			void				_AddProcessingParameter(BParameterGroup* group,
+ 									int32 index,
+@@ -93,6 +96,7 @@ private:
+ 			float				fGain;
+ 
+ 			bool				fBinaryBacklightCompensation;
++			bool				fIsYUY2;
+ 
+ 			int					fWBTempAuto;
+ 			int					fWBCompAuto;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+index de84f3840c..0d2d206b91 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+@@ -62,6 +62,16 @@ UVCDeframer::Write(const void* buffer, size_t size)
+ 		fFrames.AddItem(fCurrentFrame);
+ 		release_sem(fFrameSem);
+ 		fCurrentFrame = NULL;
++
++		// BMallocIO::SetSize(0) frees the backing buffer but does NOT reset
++		// the write position, so without also seeking back to 0 here, every
++		// subsequent frame's payload would keep appending after all prior
++		// frames' data instead of starting fresh -- meaning FillFrameBuffer()
++		// would always end up decoding the very first frame ever captured
++		// (often a dark/black frame from the sensor's power-up/auto-exposure
++		// ramp-up) and never anything newer.
++		fInputBuffer.SetSize(0);
++		fInputBuffer.Seek(0, SEEK_SET);
+ 	}
+ 
+ 	return size;
+diff --git a/src/apps/installer/WorkerThread.cpp b/src/apps/installer/WorkerThread.cpp
+index c9aa19729a..11d1ca82e6 100644
+--- a/src/apps/installer/WorkerThread.cpp
++++ b/src/apps/installer/WorkerThread.cpp
+@@ -425,6 +425,63 @@ WorkerThread::_WriteBootSector(BPath &path)
+ }
+ 
+ 
++void
++WorkerThread::_MarkPartitionActive(partition_id partitionID)
++{
++	BDiskDevice device;
++	BPartition* partition;
++	if (fDDRoster.GetPartitionWithID(partitionID, &device, &partition)
++			!= B_OK) {
++		return;
++	}
++
++	if (!partition->CanEditParameters())
++		return;
++
++	if (device.PrepareModifications() != B_OK)
++		return;
++
++	status_t status = partition->SetParameters("active true");
++	if (status == B_OK)
++		status = device.CommitModifications();
++	else
++		device.CancelModifications();
++
++	if (status != B_OK) {
++		fprintf(stderr, "WorkerThread::_MarkPartitionActive(): failed to "
++			"mark partition active: %s\n", strerror(status));
++	}
++}
++
++
++void
++WorkerThread::_WriteMBRBootCode(partition_id partitionID)
++{
++	BDiskDevice device;
++	BPartition* partition;
++	if (fDDRoster.GetPartitionWithID(partitionID, &device, &partition)
++			!= B_OK) {
++		return;
++	}
++
++	if (!partition->CanEditParameters())
++		return;
++
++	BPath devicePath;
++	if (device.GetPath(&devicePath) != B_OK)
++		return;
++
++	BString command;
++	command.SetToFormat("echo yes | writembr \"%s\"", devicePath.Path());
++	_SetStatusMessage(B_TRANSLATE("Writing master boot record."));
++	status_t status = system(command.String());
++	if (status != B_OK) {
++		fprintf(stderr, "WorkerThread::_WriteMBRBootCode(): failed to write "
++			"MBR boot code on %s\n", devicePath.Path());
++	}
++}
++
++
+ status_t
+ WorkerThread::_LaunchFinishScript(BPath &path)
+ {
+@@ -702,6 +759,9 @@ WorkerThread::_PerformInstall(partition_id sourcePartitionID,
+ 	if (err != B_OK)
+ 		return _InstallationError(err);
+ 
++	_MarkPartitionActive(targetPartitionID);
++	_WriteMBRBootCode(targetPartitionID);
++
+ 	err = _LaunchFinishScript(targetDirectory);
+ 	if (err != B_OK)
+ 		return _InstallationError(err);
+diff --git a/src/apps/installer/WorkerThread.h b/src/apps/installer/WorkerThread.h
+index 6156d5ece5..8fd4ba39a6 100644
+--- a/src/apps/installer/WorkerThread.h
++++ b/src/apps/installer/WorkerThread.h
+@@ -42,6 +42,8 @@ public:
+ 
+ private:
+ 			status_t			_WriteBootSector(BPath& path);
++			void				_MarkPartitionActive(partition_id partitionID);
++			void				_WriteMBRBootCode(partition_id partitionID);
+ 			status_t			_LaunchFinishScript(BPath& path);
+ 
+ 			status_t			_PerformInstall(partition_id sourcePartitionID,
+diff --git a/src/kits/storage/sniffer/RPattern.cpp b/src/kits/storage/sniffer/RPattern.cpp
+index 814f369e99..fe504b2b72 100644
+--- a/src/kits/storage/sniffer/RPattern.cpp
++++ b/src/kits/storage/sniffer/RPattern.cpp
+@@ -11,6 +11,8 @@
+ 	MIME sniffer rpattern implementation
+ */
+ 
++#include <cstddef>
++
+ #include "Err.h"
+ #include "RPattern.h"
+ #include "Range.h"
+diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c b/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c
+index 529552d371..ffa95d38a0 100644
+--- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c
++++ b/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c
+@@ -1281,7 +1281,26 @@ sta_pick_bss(struct ieee80211_scan_state *ss, struct ieee80211vap *vap)
+ 	/*
+ 	 * Automatic sequencing; look for a candidate and
+ 	 * if found join the network.
++	 *
++	 * But only if the user (via a higher layer -- NetServer/
++	 * wpa_supplicant) has actually asked to join a specific network by
++	 * setting a desired SSID first. Without this check, the very first
++	 * scan of the interface's life -- which happens as soon as it's
++	 * brought administratively up, before anything has requested a
++	 * particular network -- would auto-join whatever candidate this
++	 * scan happens to turn up. Since unset iv_flags means
++	 * IEEE80211_F_PRIVACY isn't requested either, that candidate is
++	 * effectively restricted to open (unencrypted) APs -- meaning an
++	 * unconfigured interface can silently associate with any open
++	 * network in range on its own, ahead of (and blocking any further
++	 * attempt at) the network the user actually wants.
+ 	 */
++	if (vap->iv_des_nssid == 0) {
++		IEEE80211_DPRINTF(vap, IEEE80211_MSG_SCAN,
++			"%s: no desired ssid set, not auto-joining; return 0\n",
++			__func__);
++		return 0;
++	}
+ 	/* NB: unlocked read should be ok */
+ 	if (TAILQ_FIRST(&st->st_entry) == NULL) {
+ 		IEEE80211_DPRINTF(vap, IEEE80211_MSG_SCAN,
+diff --git a/src/servers/launch/Job.cpp b/src/servers/launch/Job.cpp
+index b696c48674..c28656d18e 100644
+--- a/src/servers/launch/Job.cpp
++++ b/src/servers/launch/Job.cpp
+@@ -11,6 +11,7 @@
+ #include <Entry.h>
+ #include <Looper.h>
+ #include <Message.h>
++#include <OS.h>
+ #include <Roster.h>
+ 
+ #include <MessagePrivate.h>
+@@ -375,7 +376,17 @@ Job::Launch()
+ 		BString signature("application/");
+ 		signature << Name();
+ 
+-		return _Launch(signature.String(), NULL, 0, NULL, &environment[0]);
++		const int32 kSignatureLaunchRetries = 720;
++		const bigtime_t kSignatureLaunchRetryInterval = 250000;
++		status_t status;
++		for (int32 i = 0; i < kSignatureLaunchRetries; i++) {
++			status = _Launch(signature.String(), NULL, 0, NULL,
++				&environment[0]);
++			if (status != B_LAUNCH_FAILED_APP_NOT_FOUND)
++				break;
++			snooze(kSignatureLaunchRetryInterval);
++		}
++		return status;
+ 	}
+ 
+ 	// Build argument vector
+diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
+index 42bae2a7da..05d3705dfb 100644
+--- a/src/servers/net/AutoconfigLooper.cpp
++++ b/src/servers/net/AutoconfigLooper.cpp
+@@ -18,6 +18,7 @@
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+ 
++#include <NetworkDevice.h>
+ #include <NetworkInterface.h>
+ #include <NetworkNotifications.h>
+ 
+@@ -26,6 +27,8 @@
+ 
+ 
+ static const uint32 kMsgReadyToRun = 'rdyr';
++static const bigtime_t kJoinNetworkRetryTimeout = 8000000;
++	// 8 seconds
+ 
+ 
+ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+@@ -34,7 +37,8 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+ 	fDevice(device),
+ 	fCurrentClient(NULL),
+ 	fLastMediaStatus(0),
+-	fJoiningNetwork(false)
++	fJoiningNetwork(false),
++	fJoiningNetworkSince(0)
+ {
+ 	BMessage ready(kMsgReadyToRun);
+ 	PostMessage(&ready);
+@@ -194,18 +198,49 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+ 
+ 		case B_NETWORK_WLAN_SCANNED:
+ 		{
+-			if (fJoiningNetwork || (fLastMediaStatus & IFM_ACTIVE) != 0) {
+-				// We already have a link or are already joining.
++			if ((fLastMediaStatus & IFM_ACTIVE) != 0) {
++				// We already have a link -- but if it's to an open network,
++				// that's very likely not a network anyone actually asked
++				// for: net80211's default candidate scan (which runs before
++				// any specific network has been requested yet) only
++				// considers open APs, since IEEE80211_F_PRIVACY isn't set
++				// on the vap until a real join request configures it. On
++				// hardware that ends up racing that default scan against
++				// this looper's own join attempts, the interface can come
++				// up already "connected" to some unrelated open AP in range
++				// well before the real (password-protected) target network
++				// was ever tried, and a plain link-active check like this
++				// used to treat that as "done" forever. Only actually skip
++				// here if the current link looks like a deliberate one.
++				uint32 authenticationMode = B_NETWORK_AUTHENTICATION_NONE;
++				BNetworkDevice device(fDevice);
++				wireless_network network;
++				uint32 cookie = 0;
++				if (device.GetNextAssociatedNetwork(cookie, network) == B_OK)
++					authenticationMode = network.authentication_mode;
++
++				if (authenticationMode != B_NETWORK_AUTHENTICATION_NONE)
++					break;
++			}
++
++			if (fJoiningNetwork
++					&& system_time() - fJoiningNetworkSince
++						< kJoinNetworkRetryTimeout) {
++				// A join attempt is still within its grace period; give it
++				// a chance to complete instead of overlapping another one.
+ 				break;
+ 			}
+ 
+ 			fJoiningNetwork = true;
+-				// TODO: For now we never reset this flag. We can only do that
+-				// after infrastructure has been added to discern a scan reason.
+-				// If we would always auto join we would possibly interfere
+-				// with active scans in the process of connecting to an AP
+-				// either for the initial connection, or after connection loss
+-				// to re-establish the link.
++			fJoiningNetworkSince = system_time();
++				// The auto join request below is fire-and-forget -- this
++				// looper doesn't currently get told whether it actually
++				// succeeded (that needs infrastructure to discern a scan
++				// reason, see the wpa_supplicant TODOs). Retrying after a
++				// grace period instead of only ever trying once means a
++				// join attempt that loses a race with something else
++				// disrupting the interface (e.g. right after boot) isn't
++				// stuck forever with no link and no further attempts.
+ 
+ 			BMessage message(kMsgAutoJoinNetwork);
+ 			message.AddString("device", fDevice);
+diff --git a/src/servers/net/AutoconfigLooper.h b/src/servers/net/AutoconfigLooper.h
+index 948b9b4d6f..aa10189865 100644
+--- a/src/servers/net/AutoconfigLooper.h
++++ b/src/servers/net/AutoconfigLooper.h
+@@ -38,6 +38,7 @@ private:
+ 			AutoconfigClient*	fCurrentClient;
+ 			int32				fLastMediaStatus;
+ 			bool				fJoiningNetwork;
++			bigtime_t			fJoiningNetworkSince;
+ };
+ 
+ #endif	// AUTOCONFIG_LOOPER_H
+diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
+index 68acf3f830..9bc4ca148c 100644
+--- a/src/system/boot/platform/bios_ia32/smp.cpp
++++ b/src/system/boot/platform/bios_ia32/smp.cpp
+@@ -379,6 +379,10 @@ smp_init_other_cpus(void)
+ }
+ 
+ 
++static const uint32 kIPIDeliveryTimeout = 1000000;
++static const uint32 kApStartupTimeoutMs = 500;
++
++
+ void
+ smp_boot_other_cpus(void (*entryFunc)(void))
+ {
+@@ -412,6 +416,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+ 		uint32 config;
+ 		uint32 numStartups;
+ 		uint32 j;
++		bool startupFailed = false;
+ 
+ 		// set this stack up
+ 		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
+@@ -462,8 +467,20 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+ 
+ 		// wait for pending to end
+ 		TRACE(("wait for delivery\n"));
+-		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
+-			asm volatile ("pause;");
++		{
++			uint32 deliveryTimeout = kIPIDeliveryTimeout;
++			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
++				&& --deliveryTimeout != 0) {
++				asm volatile ("pause;");
++			}
++			if (deliveryTimeout == 0) {
++				dprintf("smp: timeout sending INIT IPI to cpu %" B_PRIu32
++					" (apic id %u), skipping it\n", i,
++					gKernelArgs.arch_args.cpu_apic_id[i]);
++				gKernelArgs.num_cpus = i;
++				break;
++			}
++		}
+ 
+ 		/* deassert INIT */
+ 		TRACE(("deassert INIT\n"));
+@@ -476,8 +493,20 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+ 
+ 		// wait for pending to end
+ 		TRACE(("wait for delivery\n"));
+-		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
+-			asm volatile ("pause;");
++		{
++			uint32 deliveryTimeout = kIPIDeliveryTimeout;
++			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
++				&& --deliveryTimeout != 0) {
++				asm volatile ("pause;");
++			}
++			if (deliveryTimeout == 0) {
++				dprintf("smp: timeout deasserting INIT IPI to cpu %" B_PRIu32
++					" (apic id %u), skipping it\n", i,
++					gKernelArgs.arch_args.cpu_apic_id[i]);
++				gKernelArgs.num_cpus = i;
++				break;
++			}
++		}
+ 
+ 		/* wait 10ms */
+ 		spin(10000);
+@@ -506,16 +535,41 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+ 			spin(200);
+ 
+ 			TRACE(("wait for delivery\n"));
+-			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
++			uint32 deliveryTimeout = kIPIDeliveryTimeout;
++			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
++				&& --deliveryTimeout != 0) {
+ 				asm volatile ("pause;");
++			}
++			if (deliveryTimeout == 0) {
++				dprintf("smp: timeout sending STARTUP IPI to cpu %" B_PRIu32
++					" (apic id %u), skipping it\n", i,
++					gKernelArgs.arch_args.cpu_apic_id[i]);
++				startupFailed = true;
++				break;
++			}
++		}
++
++		if (startupFailed) {
++			gKernelArgs.num_cpus = i;
++			break;
+ 		}
+ 
+ 		// Wait for the trampoline code to clear the final stack location.
+ 		// This serves as a notification for us that it has loaded the address
+ 		// and it is safe for us to overwrite it to trampoline the next CPU.
+ 		tempStack++;
+-		while (*tempStack != 0)
+-			spin(1000);
++		{
++			uint32 startupTimeoutMs = kApStartupTimeoutMs;
++			while (*tempStack != 0 && --startupTimeoutMs != 0)
++				spin(1000);
++			if (startupTimeoutMs == 0) {
++				dprintf("smp: cpu %" B_PRIu32 " (apic id %u) did not respond "
++					"within %" B_PRIu32 " ms, skipping it\n", i,
++					gKernelArgs.arch_args.cpu_apic_id[i], kApStartupTimeoutMs);
++				gKernelArgs.num_cpus = i;
++				break;
++			}
++		}
+ 	}
+ 
+ 	TRACE(("done trampolining\n"));
+diff --git a/src/system/boot/platform/bios_ia32/video.cpp b/src/system/boot/platform/bios_ia32/video.cpp
+index 30b5b69088..ba3a5ffdd3 100644
+--- a/src/system/boot/platform/bios_ia32/video.cpp
++++ b/src/system/boot/platform/bios_ia32/video.cpp
+@@ -994,6 +994,13 @@ platform_init_video(void)
+ 			memcpy(gKernelArgs.edid_info, &info, sizeof(edid1_info));
+ 	}
+ 
++	// This machine's VESA BIOS doesn't support DDC (vesa_get_edid() always
++	// fails), so the native 1600x768 panel resolution can never be detected
++	// through EDID above. Prefer it directly if the mode list has it.
++	video_mode *nativeMode = find_video_mode(1600, 768, false);
++	if (nativeMode != NULL)
++		sDefaultMode = nativeMode;
++
+ 	sMode = sDefaultMode;
+ 	return B_OK;
+ }
+diff --git a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp b/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
+index 9435811872..64064e554c 100644
+--- a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
++++ b/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
+@@ -296,8 +296,8 @@ choose_link_device_configurations(acpi_module_info* acpi,
+ 			irq_routing_entry* irqEntry = link->used_by.ElementAt(j);
+ 			irqEntry->needs_configuration = j == 0; // only configure once
+ 			irqEntry->irq = chosenDescriptor.irq;
+-			irqEntry->polarity = chosenDescriptor.polarity;
+-			irqEntry->trigger_mode = chosenDescriptor.trigger_mode;
++			irqEntry->polarity = B_LOW_ACTIVE_POLARITY;
++			irqEntry->trigger_mode = B_LEVEL_TRIGGERED;
+ 		}
+ 
+ 		delete link;
+diff --git a/src/system/kernel/arch/x86/ioapic.cpp b/src/system/kernel/arch/x86/ioapic.cpp
+index 5fab87c231..60fabc372d 100644
+--- a/src/system/kernel/arch/x86/ioapic.cpp
++++ b/src/system/kernel/arch/x86/ioapic.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <arch/x86/ioapic.h>
+ 
++#include <debug.h>
+ #include <interrupts.h>
+ #include <vm/vm.h>
+ 
+@@ -13,6 +14,7 @@
+ #include <ACPI.h>
+ #include <AutoDeleter.h>
+ #include <safemode.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+ 
+@@ -189,6 +191,58 @@ ioapic_write_64(struct ioapic& ioapic, uint8 registerSelect, uint64 value,
+ }
+ 
+ 
++static void
++dump_redirection_entry(struct ioapic& ioapic, uint8 pin)
++{
++	uint64 entry = ioapic_read_64(ioapic, IO_APIC_REDIRECTION_TABLE + pin * 2);
++	int32 gsi = ioapic.global_interrupt_base + pin;
++	uint8 vector = entry & IO_APIC_INTERRUPT_VECTOR_MASK;
++
++	kprintf("io-apic %u pin %2u (gsi %3" B_PRId32 "): raw 0x%016" B_PRIx64
++		" vector %3u (irq %3d) %s %s %s %s dest %u\n",
++		ioapic.number, pin, gsi, entry, vector,
++		vector - ARCH_INTERRUPT_BASE,
++		(entry & IO_APIC_INTERRUPT_MASKED) != 0 ? "masked  " : "unmasked",
++		(entry & IO_APIC_TRIGGER_MODE_MASK) != 0 ? "level" : "edge ",
++		(entry & IO_APIC_PIN_POLARITY_MASK) != 0 ? "low activ " : "high active",
++		(entry & IO_APIC_REMOTE_IRR) != 0 ? "IRR-pending" : "           ",
++		(uint8)((entry >> IO_APIC_DESTINATION_FIELD_SHIFT)
++			& IO_APIC_DESTINATION_FIELD_MASK));
++}
++
++
++static int
++dump_ioapics(int argc, char** argv)
++{
++	if (sIOAPICs == NULL) {
++		kprintf("no io-apics in use (legacy PIC or safemode disabled)\n");
++		return 0;
++	}
++
++	if (argc > 1) {
++		int32 gsi = atoi(argv[1]);
++		struct ioapic* ioapic = find_ioapic(gsi);
++		if (ioapic == NULL) {
++			kprintf("gsi %" B_PRId32 " is not handled by any io-apic\n", gsi);
++			return 0;
++		}
++
++		print_ioapic(*ioapic);
++		dump_redirection_entry(*ioapic, gsi - ioapic->global_interrupt_base);
++		return 0;
++	}
++
++	for (struct ioapic* ioapic = sIOAPICs; ioapic != NULL;
++			ioapic = ioapic->next) {
++		print_ioapic(*ioapic);
++		for (int32 pin = 0; pin <= ioapic->max_redirection_entry; pin++)
++			dump_redirection_entry(*ioapic, pin);
++	}
++
++	return 0;
++}
++
++
+ static void
+ ioapic_configure_pin(struct ioapic& ioapic, uint8 pin, uint8 vector,
+ 	uint8 triggerPolarity, uint16 deliveryMode)
+@@ -690,6 +744,12 @@ ioapic_init(kernel_args* args)
+ 		&ioapic_assign_interrupt_to_cpu,
+ 	};
+ 
++	add_debugger_command_etc("ioapic", &dump_ioapics,
++		"Dump io-apic redirection table entries",
++		"[ <gsi> ]\n"
++		"Dumps the redirection table entries of all io-apics, or, if a gsi "
++		"is given, only the entry handling that gsi.\n", 0);
++
+ 	if (!apic_available())
+ 		return;
+ 
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index 45e7fb785a..a8044f3faa 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -477,6 +477,17 @@ vfs_mount_boot_file_system(kernel_args* args)
+ 	if (status < B_OK) {
+ 		panic("get_boot_partitions failed!");
+ 	}
++
++	const int32 kBootPartitionRetries = 40;
++	const bigtime_t kBootPartitionRetryInterval = 250000;
++	for (int32 i = 0; partitions.IsEmpty() && i < kBootPartitionRetries; i++) {
++		snooze(kBootPartitionRetryInterval);
++		status = get_boot_partitions(bootVolume, partitions);
++		if (status < B_OK) {
++			panic("get_boot_partitions failed!");
++		}
++	}
++
+ 	if (partitions.IsEmpty()) {
+ 		panic("did not find any boot partitions! @! syslog | tail 15");
+ 	}
