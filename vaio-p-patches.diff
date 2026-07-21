@@ -1,5 +1,38 @@
+diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
+index f558fb184c..f1a8e54a47 100644
+--- a/build/jam/DefaultBuildProfiles
++++ b/build/jam/DefaultBuildProfiles
+@@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
+ 			for architectureObject in [ MultiArchSubDirSetup ] {
+ 				on $(architectureObject) {
+ 					AddHaikuImageSystemPackages openssl3 ;
++					# libfreetype pulls in libharfbuzz at runtime, but
++					# harfbuzz isn't in the default nightly image, so every
++					# boot logs "Cannot open file libharfbuzz.so.0 (needed
++					# by libfreetype.so.6.20.4)". Ship it.
++					AddHaikuImageSystemPackages harfbuzz ;
+ 				}
+ 			}
+ 
+@@ -161,6 +166,16 @@ rule DefineDefaultBuildProfiles
+ 					p7zip_x86@secondary_x86
+ 					xz_utils_x86@secondary_x86
+ 				}@
++				# harfbuzz isn't in the default nightly image, so gcc2's
++				# libfreetype -- which was linked against it -- logs
++				# "Cannot open file libharfbuzz.so.0" on every boot. There's
++				# no prebuilt harfbuzz package for the primary gcc2
++				# architecture though (only the secondary_x86 one), so this
++				# can only be silenced for !gcc2 primary archs; on gcc2
++				# hybrids libfreetype's harfbuzz-based shaping stays
++				# unavailable (cosmetic -- FreeType degrades gracefully
++				# without it).
++				!gcc2 @{ harfbuzz }@
+ 				;
+ 			AddHaikuImageSourcePackages
+ 				nano
 diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
-index 05d216de78..af91d47074 100644
+index 05d216de78..f9870064e4 100644
 --- a/build/jam/images/definitions/regular
 +++ b/build/jam/images/definitions/regular
 @@ -336,6 +336,7 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
@@ -10,6 +43,76 @@ index 05d216de78..af91d47074 100644
  ] ;
  
  SYSTEM_ADD_ONS_FILE_SYSTEMS +=
+@@ -385,3 +386,14 @@ AddDirectoryToHaikuImage home config settings touchpad ;
+ local shortcutsSettingsFile = <settings>shortcuts_settings ;
+ SEARCH on $(shortcutsSettingsFile) = [ FDirName $(HAIKU_TOP) data settings ] ;
+ AddFilesToHaikuImage home config settings : $(shortcutsSettingsFile) ;
++
++# VAIO P: Intel Atom (Bonnell, family 06 model 1c stepping 2) microcode
++# update. The boot loader's ucode_load() only searches
++# system/non-packaged/data/firmware/intel-ucode/<fam>-<model>-<stepping>,
++# and without it this CPU runs on its shipped microcode forever
++# ("ucode_load: couldn't find microcode" every boot).
++local vaioPUcodeFile = 06-1c-02 ;
++SEARCH on $(vaioPUcodeFile)
++	= [ FDirName $(HAIKU_TOP) data system data firmware intel-ucode ] ;
++AddFilesToHaikuImage system non-packaged data firmware intel-ucode
++	: $(vaioPUcodeFile) ;
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index ae768e4be9..66a8159c6e 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -102,10 +102,22 @@ AddFilesToPackage add-ons kernel interrupt_controllers :
+ 	;
+ AddFilesToPackage add-ons kernel power cpufreq :
+ 	amd_pstates@x86,x86_64
++	# Legacy Intel Enhanced SpeedStep, via ACPI _PSS/_PCT + IA32_PERF_CTL.
++	# Covers pre-HWP EST CPUs that intel_pstates rejects (e.g. the
++	# first-gen Atom in the VAIO P), which otherwise run pinned at a
++	# single frequency ("no valid cpufreq module found").
++	intel_est@x86,x86_64
+ 	intel_pstates@x86,x86_64
+ 	;
+ AddFilesToPackage add-ons kernel power cpuidle :
+ 	x86_cstates@x86,x86_64
++	# ACPI _CST-based C-states. Needed for CPUs that don't enumerate
++	# their MWAIT C-states through CPUID leaf 5 (which x86_cstates
++	# requires) but do declare them via ACPI -- e.g. the first-gen Atom
++	# (Bonnell) in the VAIO P, where x86_cstates alone fails with "no
++	# valid cpuidle module found" and the CPU never enters a deep idle
++	# state.
++	x86_acpi_cstates@x86,x86_64
+ 	;
+ 
+ if $(TARGET_ARCH) = x86 || $(TARGET_ARCH) = x86_64 {
+diff --git a/data/system/data/firmware/intel-ucode/06-1c-02 b/data/system/data/firmware/intel-ucode/06-1c-02
+new file mode 100644
+index 0000000000..db30b527ac
+Binary files /dev/null and b/data/system/data/firmware/intel-ucode/06-1c-02 differ
+diff --git a/headers/os/device/USBKit.h b/headers/os/device/USBKit.h
+index 1e82f83f5a..2a7e7e556b 100644
+--- a/headers/os/device/USBKit.h
++++ b/headers/os/device/USBKit.h
+@@ -350,6 +350,19 @@ public:
+ 										usb_iso_packet_descriptor *packetDescriptors,
+ 										uint32 packetCount)	const;
+ 
++		// QueueIsochronous()/WaitIsochronous() split IsochronousTransfer()
++		// into a non-blocking submit step (returns a request ID) and a
++		// separate blocking wait step, so a caller can have more than one
++		// isochronous transfer genuinely outstanding with the host
++		// controller at once -- queue several, then wait on each in
++		// submission order. See their implementations for why that
++		// matters for isochronous IN throughput specifically.
++		int32						QueueIsochronous(void *data,
++										size_t length,
++										usb_iso_packet_descriptor *packetDescriptors,
++										uint32 packetCount) const;
++		ssize_t						WaitIsochronous(int32 requestID) const;
++
+ 		// These are convenience methods for getting and clearing the halt
+ 		// state of an endpoint. They use the control pipe of the device to
+ 		// send the corresponding requests.
 diff --git a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
 index d3ceae1c5d..c1dc30408c 100644
 --- a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
@@ -142,10 +245,10 @@ index 5bfe169d68..00b660976a 100644
  		device, function, offset, size, value);
  }
 diff --git a/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp b/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
-index 177b1997ec..3b74aa192a 100644
+index 177b1997ec..b326705a68 100644
 --- a/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
 +++ b/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
-@@ -155,6 +155,26 @@ intel_fixup_ahci(PCI *pci, uint8 domain, uint8 bus, uint8 device,
+@@ -155,6 +155,106 @@ intel_fixup_ahci(PCI *pci, uint8 domain, uint8 bus, uint8 device,
  }
  
  
@@ -158,21 +261,101 @@ index 177b1997ec..3b74aa192a 100644
 +
 +	uint32 bar0 = pci->ReadConfig(domain, bus, device, function,
 +		PCI_base_registers, 4);
-+	if (bar0 != 0)
-+		return;
++	if (bar0 == 0) {
++		dprintf("intel_fixup_ehci_bar: domain %u, bus %u, device %u, function "
++			"%u has an unassigned BAR0, assigning a fallback address\n",
++			domain, bus, device, function);
++		pci->WriteConfig(domain, bus, device, function, PCI_base_registers, 4,
++			0xf0000000);
++		bar0 = 0xf0000000;
++	}
 +
-+	dprintf("intel_fixup_ehci_bar: domain %u, bus %u, device %u, function %u "
-+		"has an unassigned BAR0, assigning a fallback address\n",
-+		domain, bus, device, function);
-+	pci->WriteConfig(domain, bus, device, function, PCI_base_registers, 4,
-+		0xf0000000);
++	// Take the EHCI controller away from the BIOS *now*, at PCI scan time,
++	// long before any USB controller driver initializes. On this chipset
++	// (Poulsbo/SCH, as found in the Sony VAIO P) the BIOS never
++	// acknowledges the normal EHCI legacy-support handoff -- the EHCI
++	// driver's own attempt later logs "bios won't give up control over the
++	// host controller" on every boot. The EHCI driver does force-clear the
++	// BIOS claim at that point, but by then it's too late for the
++	// full-speed devices on the *companion UHCI controllers*: those are
++	// lower PCI function numbers, so their drivers initialize and start
++	// enumerating devices while the BIOS still believes it owns USB and
++	// keeps intervening via SMM -- observed as UHCI "host process error"
++	// halts and a companion-port device (the internal Bluetooth module)
++	// failing SET_ADDRESS/GET_DESCRIPTOR forever during exactly that
++	// window. Clearing the BIOS's claim and all of its SMI enables here
++	// closes that window before any USB driver runs.
++	uint16 pciCommand = pci->ReadConfig(domain, bus, device, function,
++		PCI_command, 2);
++	pci->WriteConfig(domain, bus, device, function, PCI_command, 2,
++		pciCommand | PCI_command_memory);
++
++	// The extended capability pointer (EECP) lives in the MMIO HCCPARAMS
++	// register; the capability registers themselves are in PCI config
++	// space. Map the register window just long enough to read it.
++	uint8 eecp = 0;
++	void *regs = NULL;
++	area_id area = map_physical_memory("ehci bios handoff fixup",
++		bar0 & ~(phys_addr_t)0xfff, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &regs);
++	if (area >= 0) {
++		uint32 hccparams
++			= *(volatile uint32 *)((uint8 *)regs + 8);
++		eecp = (hccparams >> 8) & 0xff;
++		delete_area(area);
++	}
++	if (eecp < 0x40) {
++		// Fall back to the SCH datasheet's fixed offset if the MMIO read
++		// wasn't possible; validated by the capability ID check below
++		// either way.
++		eecp = 0x68;
++	}
++
++	uint32 legacySupport = pci->ReadConfig(domain, bus, device, function,
++		eecp, 4);
++	if ((legacySupport & 0xff) != 0x01) {
++		dprintf("intel_fixup_ehci_bar: no legacy support capability at "
++			"0x%02x (0x%08" B_PRIx32 "), skipping early BIOS handoff\n",
++			eecp, legacySupport);
++		pci->WriteConfig(domain, bus, device, function, PCI_command, 2,
++			pciCommand);
++		return;
++	}
++
++	if ((legacySupport & (1 << 16)) != 0) {
++		// BIOS-owned: request ownership politely first.
++		pci->WriteConfig(domain, bus, device, function, eecp + 3, 1, 1);
++		for (int32 i = 0; i < 100; i++) {
++			legacySupport = pci->ReadConfig(domain, bus, device, function,
++				eecp, 4);
++			if ((legacySupport & (1 << 16)) == 0)
++				break;
++			spin(5000);
++		}
++	}
++
++	if ((legacySupport & (1 << 16)) != 0) {
++		dprintf("intel_fixup_ehci_bar: BIOS did not release the EHCI "
++			"controller, forcing the handoff\n");
++	} else {
++		dprintf("intel_fixup_ehci_bar: early EHCI BIOS handoff complete\n");
++	}
++
++	// Force the BIOS semaphore off and disable/clear every BIOS SMI source
++	// (USBLEGCTLSTS at EECP+4) regardless -- same hard-force the EHCI
++	// driver applies, just early enough to matter.
++	pci->WriteConfig(domain, bus, device, function, eecp + 2, 1, 0);
++	pci->WriteConfig(domain, bus, device, function, eecp + 4, 4, 0);
++
++	pci->WriteConfig(domain, bus, device, function, PCI_command, 2,
++		pciCommand);
 +}
 +
 +
  static void
  ati_fixup_ixp(PCI *pci, uint8 domain, uint8 bus, uint8 device, uint8 function,
  	uint16 deviceId)
-@@ -206,6 +226,7 @@ pci_fixup_device(PCI *pci, uint8 domain, uint8 bus, uint8 device,
+@@ -206,6 +306,7 @@ pci_fixup_device(PCI *pci, uint8 domain, uint8 bus, uint8 device,
  
  		case 0x8086:
  			intel_fixup_ahci(pci, domain, bus, device, function, deviceId);
@@ -263,7 +446,7 @@ index bc264e8aa1..853ef490ce 100644
  		result = defaultPipe->SendRequest(
  			USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_OUT,	// type
 diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
-index e335e09054..f724eb3750 100644
+index e335e09054..40735fa886 100644
 --- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
 +++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
 @@ -15,6 +15,23 @@
@@ -290,7 +473,7 @@ index e335e09054..f724eb3750 100644
  Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
  	usb_device_descriptor &desc, int8 deviceAddress, usb_speed speed,
  	bool isRootHub, void *controllerCookie)
-@@ -25,8 +42,11 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
+@@ -25,8 +42,12 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
  	TRACE("creating hub\n");
  
  	memset(&fHubDescriptor, 0, sizeof(fHubDescriptor));
@@ -299,11 +482,12 @@ index e335e09054..f724eb3750 100644
  		fChildren[i] = NULL;
 +		fFailedAttempts[i] = 0;
 +		fPowerCycleAttempts[i] = 0;
++		fPermanentlyIgnored[i] = false;
 +	}
  
  	if (!fInitOK) {
  		TRACE_ERROR("device failed to initialize\n");
-@@ -195,6 +215,35 @@ Hub::DisablePort(uint8 index)
+@@ -195,11 +216,43 @@ Hub::DisablePort(uint8 index)
  }
  
  
@@ -339,7 +523,15 @@ index e335e09054..f724eb3750 100644
  
  void
  Hub::Explore(change_item **changeList)
-@@ -214,7 +263,9 @@ Hub::Explore(change_item **changeList)
+ {
+ 	for (int32 i = 0; i < fHubDescriptor.num_ports; i++) {
++		if (fPermanentlyIgnored[i])
++			continue;
++
+ 		status_t result = UpdatePortStatus(i);
+ 		if (result < B_OK)
+ 			continue;
+@@ -214,7 +267,9 @@ Hub::Explore(change_item **changeList)
  		}
  #endif
  
@@ -350,7 +542,7 @@ index e335e09054..f724eb3750 100644
  				|| ((fPortStatus[i].status & PORT_STATUS_CONNECTION)
  					&& fChildren[i] == NULL)) {
  			// clear status change
-@@ -222,7 +273,22 @@ Hub::Explore(change_item **changeList)
+@@ -222,7 +277,22 @@ Hub::Explore(change_item **changeList)
  				USB_REQUEST_CLEAR_FEATURE, C_PORT_CONNECTION, i + 1,
  				0, NULL, 0, NULL);
  
@@ -374,7 +566,7 @@ index e335e09054..f724eb3750 100644
  				// new device attached!
  				TRACE_ALWAYS("port %" B_PRId32 ": new device connected\n", i);
  
-@@ -299,6 +365,8 @@ Hub::Explore(change_item **changeList)
+@@ -299,6 +369,8 @@ Hub::Explore(change_item **changeList)
  					if (newDevice) {
  						newDevice->Changed(changeList, true);
  						fChildren[i] = newDevice;
@@ -383,7 +575,7 @@ index e335e09054..f724eb3750 100644
  						break;
  					} else {
  						// the device failed to setup correctly, disable the
-@@ -307,6 +375,35 @@ Hub::Explore(change_item **changeList)
+@@ -307,6 +379,45 @@ Hub::Explore(change_item **changeList)
  						DisablePort(i);
  					}
  				}
@@ -410,16 +602,26 @@ index e335e09054..f724eb3750 100644
 +								"%u), retrying\n", i,
 +								fPowerCycleAttempts[i]);
 +						} else {
++							// VAIO P personal quirk: this unit has an
++							// internal device on this port that has never,
++							// across many boots, gotten past address
++							// assignment -- not even a power cycle helps.
++							// Stop touching this port for the rest of this
++							// boot instead of re-arming on every physical
++							// bounce, which otherwise keeps costing boot
++							// time and disrupting other USB/PCI traffic for
++							// a recovery that's never once worked.
++							fPermanentlyIgnored[i] = true;
 +							TRACE_ALWAYS("port %" B_PRId32 ": giving up after "
-+								"repeated setup failures, ignoring until "
-+								"reconnected\n", i);
++								"repeated setup failures, ignoring for the "
++								"rest of this boot\n", i);
 +						}
 +					}
 +				}
  			} else {
  				// Device removed...
  				TRACE_ALWAYS("port %" B_PRId32 ": device removed\n", i);
-@@ -315,6 +412,14 @@ Hub::Explore(change_item **changeList)
+@@ -315,6 +426,14 @@ Hub::Explore(change_item **changeList)
  					fChildren[i]->Changed(changeList, false);
  					fChildren[i] = NULL;
  				}
@@ -435,7 +637,7 @@ index e335e09054..f724eb3750 100644
  		}
  
 diff --git a/src/add-ons/kernel/bus_managers/usb/usb_private.h b/src/add-ons/kernel/bus_managers/usb/usb_private.h
-index 81f5137c83..538eef5411 100644
+index 81f5137c83..d7a74d11f2 100644
 --- a/src/add-ons/kernel/bus_managers/usb/usb_private.h
 +++ b/src/add-ons/kernel/bus_managers/usb/usb_private.h
 @@ -657,6 +657,7 @@ virtual	status_t						GetDescriptor(uint8 descriptorType,
@@ -446,14 +648,974 @@ index 81f5137c83..538eef5411 100644
  
  		void							Explore(change_item **changeList);
  static	void							InterruptCallback(void *cookie,
-@@ -683,6 +684,8 @@ private:
+@@ -683,6 +684,9 @@ private:
  		usb_port_status					fInterruptStatus[USB_MAX_PORT_COUNT];
  		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];
  		Device *						fChildren[USB_MAX_PORT_COUNT];
 +		uint8							fFailedAttempts[USB_MAX_PORT_COUNT];
 +		uint8							fPowerCycleAttempts[USB_MAX_PORT_COUNT];
++		bool							fPermanentlyIgnored[USB_MAX_PORT_COUNT];
  };
  
+ 
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index c6c5372065..f7f443275d 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -1204,6 +1204,33 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 	if ((isochronousData->flags & USB_ISO_ASAP) != 0 ||
+ 		isochronousData->starting_frame_number == NULL) {
+ 
++		// Deciding the starting frame AND reserving it (by advancing
++		// fNextStartingFrame past the range this submission will use)
++		// has to happen as one atomic step. Historically only one
++		// isochronous submission was ever in flight at a time (each
++		// caller waited for completion before submitting the next), so
++		// this reads/writes of fFirstIsochronousTransfer/
++		// fNextStartingFrame were never actually contended. That's no
++		// longer true: usb_raw.cpp now lets two callers have a
++		// transfer outstanding simultaneously specifically so EHCI's
++		// chaining below can eliminate the schedule gap between
++		// submissions -- which means two threads can now call
++		// SubmitIsochronous() concurrently. Without this lock, both
++		// could read the same fNextStartingFrame and schedule
++		// overlapping ITDs into the same fItdEntries[] slots.
++		//
++		// The number of virtual frames this submission will occupy is
++		// knowable up front (packet_count is fixed by the caller, one
++		// itd covers up to 8 packets/microframes = 1 frame), so the
++		// reservation doesn't need to wait for the ITD-building loop
++		// below to actually run.
++		uint32 expectedFrameCount = (isochronousData->packet_count + 7) / 8;
++
++		if (!LockIsochronous()) {
++			delete[] isoRequest;
++			return B_ERROR;
++		}
++
+ 		if (fFirstIsochronousTransfer != NULL && fNextStartingFrame != -1)
+ 			currentFrame = fNextStartingFrame;
+ 		else {
+@@ -1224,6 +1251,11 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 		// 2. We stay in the range 0-127
+ 		// 3. There is enough bandwidth in the first entry
+ 		currentFrame &= EHCI_VFRAMELIST_ENTRIES_COUNT - 1;
++
++		fNextStartingFrame = (currentFrame + expectedFrameCount)
++			& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1);
++
++		UnlockIsochronous();
+ 	} else {
+ 		// Find out if the frame number specified has enough bandwidth,
+ 		// otherwise find the first next available frame with enough bandwidth
+@@ -1246,6 +1278,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 
+ 	phys_addr_t currentPhy = bufferPhy;
+ 	uint32 frameCount = 0;
++	uint32 firstFrame = currentFrame;
+ 	while (dataLength > 0) {
+ 		ehci_itd* itd = CreateItdDescriptor();
+ 		isoRequest[itdIndex++] = itd;
+@@ -1256,8 +1289,13 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 			"\n", currentPhy);
+ 		for (int32 i = 0; i < 8 && dataLength > 0; i++) {
+ 			size_t length = min_c(dataLength, packetSize);
++			// A length that doesn't fit the 12-bit TLENGTH field would
++			// silently bleed into the adjacent status bits (shifted right
++			// next to it) instead of being truncated, corrupting the
++			// descriptor's status before the transaction even runs.
+ 			itd->token[i] = (EHCI_ITD_STATUS_ACTIVE << EHCI_ITD_STATUS_SHIFT)
+-				| (length << EHCI_ITD_TLENGTH_SHIFT) | (pg << EHCI_ITD_PG_SHIFT)
++				| ((length & EHCI_ITD_TLENGTH_MASK) << EHCI_ITD_TLENGTH_SHIFT)
++				| (pg << EHCI_ITD_PG_SHIFT)
+ 				| (offset << EHCI_ITD_TOFFSET_SHIFT);
+ 			itd->last_token = i;
+ 			TRACE("isochronous filled slot %" B_PRId32 " 0x%" B_PRIx32 "\n", i,
+@@ -1303,7 +1341,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 
+ 	// Add transfer to the list
+ 	result = AddPendingIsochronousTransfer(transfer, isoRequest,
+-		itdIndex - 1, directionIn, bufferPhy, bufferLog,
++		itdIndex - 1, firstFrame, directionIn, bufferPhy, bufferLog,
+ 		transfer->DataLength());
+ 	if (result != B_OK) {
+ 		TRACE_ERROR("failed to add pending isochronous transfer\n");
+@@ -1315,7 +1353,12 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 
+ 	TRACE("appended isochronous transfer by starting at frame number %d\n",
+ 		currentFrame);
+-	fNextStartingFrame = currentFrame + 1;
++	// fNextStartingFrame was already reserved (advanced past this whole
++	// submission's frame range) up front, atomically with deciding
++	// currentFrame -- see the comment above where it's set. Writing it
++	// again here, unlocked, would at best be redundant and at worst
++	// clobber a second thread's concurrent reservation with a now-stale
++	// value, corrupting the chaining this exists to make safe.
+ 
+ 	// Wake up the isochronous finisher thread
+ 	release_sem_etc(fFinishIsochronousTransfersSem, 1 /*frameCount*/,
+@@ -1698,8 +1741,8 @@ EHCI::AddPendingTransfer(Transfer *transfer, ehci_qh *queueHead,
+ 
+ status_t
+ EHCI::AddPendingIsochronousTransfer(Transfer *transfer, ehci_itd **isoRequest,
+-	uint32 lastIndex, bool directionIn, addr_t bufferPhy, void* bufferLog,
+-	size_t bufferSize)
++	uint32 lastIndex, uint32 firstFrame, bool directionIn, addr_t bufferPhy,
++	void* bufferLog, size_t bufferSize)
+ {
+ 	if (!transfer || !isoRequest)
+ 		return B_BAD_VALUE;
+@@ -1712,6 +1755,7 @@ EHCI::AddPendingIsochronousTransfer(Transfer *transfer, ehci_itd **isoRequest,
+ 	data->transfer = transfer;
+ 	data->descriptors = isoRequest;
+ 	data->last_to_process = lastIndex;
++	data->first_frame = firstFrame;
+ 	data->incoming = directionIn;
+ 	data->is_active = true;
+ 	data->link = NULL;
+@@ -2212,6 +2256,27 @@ EHCI::FinishIsochronousTransfers()
+ 
+ 					itd = itd->prev;
+ 
++					// The itd examined above (transfer->descriptors[
++					// last_to_process]) was already unlinked from its own
++					// frame slot by the UnlinkITDescriptors() call before
++					// this if/else. A multi-descriptor transfer's *other*
++					// descriptors are linked into their own, different
++					// frame slots (transfer->first_frame + i, one itd per
++					// virtual frame) and were never visited or unlinked --
++					// only ever matched against by index, since
++					// FindIsochronousTransfer() only compares the last
++					// one. Freeing them without unlinking first leaves
++					// whatever frame slot they're still in pointing at
++					// freed memory, corrupting that chain for whenever it
++					// next gets scanned (confirmed via a real use-after-
++					// free page fault doing exactly this).
++					for (uint32 i = 0; i < transfer->last_to_process; i++) {
++						uint32 slot = (transfer->first_frame + i)
++							& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1);
++						UnlinkITDescriptors(transfer->descriptors[i],
++							&fItdEntries[slot]);
++					}
++
+ 					for (uint32 i = 0; i <= transfer->last_to_process; i++)
+ 						FreeDescriptor(transfer->descriptors[i]);
+ 
+@@ -2238,6 +2303,27 @@ EHCI::FinishIsochronousTransfers()
+ 			fFrameBandwidth[currentFrame] = MAX_AVAILABLE_BANDWIDTH;
+ 			currentFrame = (currentFrame + 1) % EHCI_VFRAMELIST_ENTRIES_COUNT;
+ 		}
++
++		if (!transferDone) {
++			// Read-only diagnostic: no behavior change from stock (still
++			// silently gives up, exactly as before), just logging so an
++			// actual failure can be characterized instead of guessed at.
++			// Two prior attempts to *act* on this condition (freeing the
++			// unfound transfer's descriptors, then not freeing them but
++			// still force-completing it) both made a real, reproducible
++			// black-screen-after-sustained-streaming failure worse
++			// (kernel panic, then a full system hang) -- so this is
++			// intentionally observation-only until there's a concrete
++			// dprintf trail to reason from.
++			uint32 liveFrame = (ReadOpReg(EHCI_FRINDEX) / 8)
++				& (EHCI_FRAMELIST_ENTRIES_COUNT - 1);
++			TRACE_ERROR("FinishIsochronousTransfers gave up: scanned all %"
++				B_PRIu32 " virtual frames without finding a completed "
++				"transfer (started at frame %" B_PRIu32 ", live frame now %"
++				B_PRIu32 ", pending list %s)\n", loop, currentFrame,
++				liveFrame, fFirstIsochronousTransfer != NULL ? "non-empty"
++					: "empty");
++		}
+ 	}
+ }
+ 
+diff --git a/src/add-ons/kernel/busses/usb/ehci.h b/src/add-ons/kernel/busses/usb/ehci.h
+index a5eea1f28f..270a2d649c 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.h
++++ b/src/add-ons/kernel/busses/usb/ehci.h
+@@ -39,6 +39,14 @@ typedef struct isochronous_transfer_data {
+ 	// transfer type
+ 	ehci_itd **					descriptors;
+ 	uint16						last_to_process;
++	uint32						first_frame;
++		// Virtual frame list index (fItdEntries[]) that descriptors[0] was
++		// linked into; descriptors[i] is at (first_frame + i) & mask. Only
++		// the last descriptor gets unlinked by the normal completion scan
++		// (it's the one FindIsochronousTransfer() matched on); this lets
++		// completion also unlink every *other* descriptor from its own
++		// frame slot before freeing it, instead of freeing memory that's
++		// still linked into some other frame's itd chain.
+ 	bool						incoming;
+ 	bool						is_active;
+ 	isochronous_transfer_data *	link;
+@@ -103,8 +111,9 @@ static	int32						InterruptPollThread(void *data);
+ 		status_t					AddPendingIsochronousTransfer(
+ 										Transfer *transfer,
+ 										ehci_itd **isoRequest, uint32 lastIndex,
+-										bool directionIn, addr_t bufferPhy,
+-										void *bufferLog, size_t bufferSize);
++										uint32 firstFrame, bool directionIn,
++										addr_t bufferPhy, void *bufferLog,
++										size_t bufferSize);
+ 		status_t					CancelAllPendingTransfers();
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/usb/uhci.cpp b/src/add-ons/kernel/busses/usb/uhci.cpp
+index 227cac1c87..93d13ee93b 100644
+--- a/src/add-ons/kernel/busses/usb/uhci.cpp
++++ b/src/add-ons/kernel/busses/usb/uhci.cpp
+@@ -508,8 +508,13 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		fDevice(device),
+ 		fStack(stack),
+ 		fEnabledInterrupts(0),
++		fControllerHalted(false),
++		fControllerGaveUpOnHalts(false),
++		fLastHaltTime(0),
++		fHaltRecoveryCount(0),
+ 		fFrameArea(-1),
+ 		fFrameList(NULL),
++		fFrameListPhysical(0),
+ 		fFrameBandwidth(NULL),
+ 		fFirstIsochronousDescriptor(NULL),
+ 		fLastIsochronousDescriptor(NULL),
+@@ -585,6 +590,8 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		return;
+ 	}
+ 
++	fFrameListPhysical = physicalAddress;
++
+ 	// Set base pointer and reset frame number
+ 	WriteReg32(UHCI_FRBASEADD, (uint32)physicalAddress);
+ 	WriteReg16(UHCI_FRNUM, 0);
+@@ -1495,6 +1502,44 @@ UHCI::FinishTransfers()
+ 		if (semCount > 0)
+ 			acquire_sem_etc(fFinishTransfersSem, semCount, B_RELATIVE_TIMEOUT, 0);
+ 
++		if (fControllerHalted) {
++			fControllerHalted = false;
++
++			if (fControllerGaveUpOnHalts) {
++				// Already established this controller re-halts no matter
++				// what we do; interrupts are already off from the ISR, so
++				// there's nothing left to do here.
++				continue;
++			}
++
++			// If halts keep recurring in a tight loop (observed on some
++			// hardware: the controller re-halts immediately on schedule
++			// restart, with no device activity in between at all -- not a
++			// stuck-descriptor problem recovery can fix), retrying forever
++			// just pegs the CPU in an endless reset loop. Bound it: after a
++			// handful of recoveries within a couple seconds of each other,
++			// stop trying and fall back to the original safe behavior
++			// (leave interrupts off, give up on this controller).
++			bigtime_t now = system_time();
++			if (now - fLastHaltTime < 2000000)
++				fHaltRecoveryCount++;
++			else
++				fHaltRecoveryCount = 1;
++			fLastHaltTime = now;
++
++			if (fHaltRecoveryCount > 3) {
++				TRACE_ALWAYS("halt recovery: controller re-halted %" B_PRId32
++					" times in under 2 seconds each with no sign it's "
++					"actually working; giving up on recovering it\n",
++					fHaltRecoveryCount);
++				fControllerGaveUpOnHalts = true;
++				continue;
++			}
++
++			RecoverFromHalt();
++			continue;
++		}
++
+ 		if (!Lock())
+ 			continue;
+ 
+@@ -1862,6 +1907,91 @@ UHCI::ControllerReset()
+ }
+ 
+ 
++/*!	Called from the finish thread after the interrupt handler observes
++	UHCI_USBSTS_HCHALT. Previously the interrupt handler just masked
++	interrupts and left the controller (and everything attached to it)
++	permanently unusable for the rest of the boot.
++
++	An earlier version of this recovery cancelled the software-side
++	transfer_data bookkeeping but never unlinked the corresponding queue
++	head/descriptors from the schedule (frame list). HCRESET doesn't touch
++	that software-owned memory, so the still-linked, still-failing
++	descriptor chain got re-executed the instant the schedule restarted,
++	re-halting the controller immediately and pegging the CPU in a tight
++	loop. Properly removing each transfer from its queue (the same
++	queue->RemoveTransfer() the normal completion path uses) before
++	resetting is what actually breaks that cycle.
++*/
++void
++UHCI::RecoverFromHalt()
++{
++	TRACE_ALWAYS("attempting to recover from host controller halt\n");
++
++	// Cancel all pending regular transfers -- they were in flight when the
++	// controller halted and will never complete on their own now that the
++	// schedule is about to be reset out from under them.
++	if (Lock()) {
++		transfer_data *transfer = fFirstTransfer;
++		fFirstTransfer = NULL;
++		fLastTransfer = NULL;
++		Unlock();
++
++		while (transfer != NULL) {
++			transfer_data *next = transfer->link;
++			transfer->transfer->Finished(B_CANCELED, 0);
++			// Unlink this transfer's queue head from the schedule -- this
++			// is the step the earlier, buggy version of this recovery
++			// skipped.
++			transfer->queue->RemoveTransfer(transfer->transfer_queue);
++			delete transfer->transfer;
++			AddToFreeList(transfer);
++			transfer = next;
++		}
++	}
++
++	// UHCI's SubmitTransfer() doesn't actually support isochronous transfers
++	// (it unconditionally returns B_NOT_SUPPORTED for them), so
++	// fFirstIsochronousTransfer should always be empty here in practice.
++	// Clear it defensively anyway, mirroring the simpler cleanup the
++	// destructor already does for a full teardown.
++	if (LockIsochronous()) {
++		isochronous_transfer_data *isoTransfer = fFirstIsochronousTransfer;
++		fFirstIsochronousTransfer = NULL;
++		fLastIsochronousTransfer = NULL;
++		UnlockIsochronous();
++
++		while (isoTransfer != NULL) {
++			isochronous_transfer_data *next = isoTransfer->link;
++			delete isoTransfer;
++			isoTransfer = next;
++		}
++	}
++
++	if (ControllerReset() < B_OK) {
++		TRACE_MODULE_ERROR("halt recovery: controller reset failed, giving "
++			"up on this controller\n");
++		return;
++	}
++
++	// HCRESET doesn't touch the root hub object or the pipes/devices
++	// already known to the bus manager -- only the host controller's own
++	// internal schedule state -- so re-arm the frame list and restart the
++	// schedule rather than redoing the whole of Start() (which would try
++	// to allocate a second root hub).
++	WriteReg32(UHCI_FRBASEADD, (uint32)fFrameListPhysical);
++	WriteReg16(UHCI_FRNUM, 0);
++
++	fEnabledInterrupts = UHCI_USBSTS_USBINT | UHCI_USBSTS_ERRINT
++		| UHCI_USBSTS_HOSTERR | UHCI_USBSTS_HCPRERR | UHCI_USBSTS_HCHALT;
++	WriteReg16(UHCI_USBINTR, UHCI_USBINTR_CRC | UHCI_USBINTR_IOC
++		| UHCI_USBINTR_SHORT);
++
++	WriteReg16(UHCI_USBCMD, ReadReg16(UHCI_USBCMD) | UHCI_USBCMD_RS);
++
++	TRACE_ALWAYS("host controller halt recovery complete\n");
++}
++
++
+ status_t
+ UHCI::GetPortStatus(uint8 index, usb_port_status *status)
+ {
+@@ -2059,10 +2189,15 @@ UHCI::Interrupt()
+ 
+ 	if (status & UHCI_USBSTS_HCHALT) {
+ 		TRACE_MODULE_ERROR("host controller halted\n");
+-		// at least disable interrupts so we do not flood the system
++		// Disable interrupts immediately so we do not flood the system with
++		// halt notifications while the controller sits idle. The actual
++		// reset/restart can't happen here (interrupt context can't snooze()
++		// or wait on register writes settling), so hand it off to the
++		// finish thread instead of just leaving the controller stuck.
+ 		WriteReg16(UHCI_USBINTR, 0);
+ 		fEnabledInterrupts = 0;
+-		// ToDo: cancel all transfers and reset the host controller
++		fControllerHalted = true;
++		finishTransfers = true;
+ 		// acknowledge not needed
+ 	}
+ 
+diff --git a/src/add-ons/kernel/busses/usb/uhci.h b/src/add-ons/kernel/busses/usb/uhci.h
+index a6db03bb30..52b1baa508 100644
+--- a/src/add-ons/kernel/busses/usb/uhci.h
++++ b/src/add-ons/kernel/busses/usb/uhci.h
+@@ -122,6 +122,7 @@ private:
+ 		// Controller resets
+ 		void						GlobalReset();
+ 		status_t					ControllerReset();
++		void						RecoverFromHalt();
+ 
+ 		// Interrupt functions
+ static	int32						InterruptHandler(void *data);
+@@ -212,10 +213,15 @@ inline	uint32						ReadReg32(uint32 reg);
+ 		pci_device*					fDevice;
+ 		Stack *						fStack;
+ 		uint32						fEnabledInterrupts;
++		bool						fControllerHalted;
++		bool						fControllerGaveUpOnHalts;
++		bigtime_t					fLastHaltTime;
++		int32						fHaltRecoveryCount;
+ 
+ 		// Frame list memory
+ 		area_id						fFrameArea;
+ 		uint32 *					fFrameList;
++		phys_addr_t					fFrameListPhysical;
+ 
+ 		// fFrameBandwidth[n] holds the available bandwidth
+ 		// of the nth frame in microseconds
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+index 41eb86a6d7..79769d7fe6 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+@@ -32,6 +32,40 @@
+ #define DRIVER_NAME		"usb_raw"
+ #define DEVICE_NAME		"bus/usb/raw"
+ 
++// Isochronous capture needs 2 requests genuinely in flight at once: EHCI
++// only avoids a multi-millisecond schedule gap between one isochronous
++// submission and the next when the new one is queued *before* the
++// previous one has completed and been removed from the pending list (see
++// EHCI::SubmitIsochronous()'s fNextStartingFrame chaining). Waiting for
++// one ISOCHRONOUS_TRANSFER ioctl to fully complete before issuing the
++// next -- which sharing the single device->notify/status/actual_length
++// below would force, since a second concurrent call would corrupt those
++// fields -- guarantees that gap on every single submission. These two
++// slots give isochronous callers their own private completion state so
++// two threads can have a transfer outstanding at the same time; every
++// other transfer type (control/interrupt/bulk) is untouched and keeps
++// using the single notify/status/actual_length fields below as before.
++typedef struct {
++	sem_id				notify;
++	status_t			status;
++	size_t				actual_length;
++	bool				in_use;
++
++	// Only populated/used by the QUEUE_ISOCHRONOUS + WAIT_ISOCHRONOUS
++	// pair: QUEUE submits and returns immediately, so the descriptor
++	// buffer and the userland destination to eventually copy them back
++	// to have to survive until the matching WAIT call runs (arbitrarily
++	// later, from the caller's perspective) instead of being freed/
++	// copied back before the ioctl returns like the plain, blocking
++	// ISOCHRONOUS_TRANSFER does.
++	usb_iso_packet_descriptor *packetDescriptors;
++	usb_iso_packet_descriptor *userPacketDescriptors;
++	size_t				descriptorsSize;
++	usb_pipe			endpointHandle;
++} iso_slot;
++
++#define USB_RAW_ISO_SLOT_COUNT 2
++
+ typedef struct {
+ 	usb_device			device;
+ 	mutex				lock;
+@@ -43,6 +77,9 @@ typedef struct {
+ 	sem_id				notify;
+ 	status_t			status;
+ 	size_t				actual_length;
++
++	mutex				isoSlotLock;
++	iso_slot			isoSlots[USB_RAW_ISO_SLOT_COUNT];
+ } raw_device;
+ 
+ int32 api_version = B_CUR_DRIVER_API_VERSION;
+@@ -67,6 +104,21 @@ usb_raw_device_added(usb_device newDevice, void **cookie)
+ 		return B_NO_MORE_SEMS;
+ 	}
+ 
++	mutex_init(&device->isoSlotLock, "usb_raw iso slot lock");
++	for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++) {
++		device->isoSlots[i].in_use = false;
++		device->isoSlots[i].notify = create_sem(0, "usb_raw iso slot notify");
++		if (device->isoSlots[i].notify < B_OK) {
++			for (int j = 0; j < i; j++)
++				delete_sem(device->isoSlots[j].notify);
++			mutex_destroy(&device->isoSlotLock);
++			delete_sem(device->notify);
++			mutex_destroy(&device->lock);
++			free(device);
++			return B_NO_MORE_SEMS;
++		}
++	}
++
+ 	char deviceName[64];
+ 	memcpy(deviceName, &newDevice, sizeof(usb_device));
+ 	if (gUSBModule->usb_ioctl('DNAM', deviceName, sizeof(deviceName)) >= B_OK) {
+@@ -236,6 +288,9 @@ usb_raw_free(void *cookie)
+ 		mutex_lock(&device->lock);
+ 		mutex_destroy(&device->lock);
+ 		delete_sem(device->notify);
++		mutex_destroy(&device->isoSlotLock);
++		for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++)
++			delete_sem(device->isoSlots[i].notify);
+ 		free(device);
+ 	}
+ 
+@@ -276,6 +331,38 @@ usb_raw_callback(void *cookie, status_t status, void *data, size_t actualLength)
+ }
+ 
+ 
++static status_t
++usb_raw_status_from_transfer_status(status_t status)
++{
++	switch (status) {
++		case B_OK:
++			return B_USB_RAW_STATUS_SUCCESS;
++		case B_TIMED_OUT:
++			return B_USB_RAW_STATUS_TIMEOUT;
++		case B_CANCELED:
++			return B_USB_RAW_STATUS_ABORTED;
++		case B_DEV_CRC_ERROR:
++			return B_USB_RAW_STATUS_CRC_ERROR;
++		case B_DEV_STALLED:
++			return B_USB_RAW_STATUS_STALLED;
++		default:
++			return B_USB_RAW_STATUS_FAILED;
++	}
++}
++
++
++static void
++usb_raw_iso_callback(void *cookie, status_t status, void *data,
++	size_t actualLength)
++{
++	TRACE((DRIVER_NAME": iso_callback()\n"));
++	iso_slot *slot = (iso_slot *)cookie;
++	slot->status = usb_raw_status_from_transfer_status(status);
++	slot->actual_length = actualLength;
++	release_sem(slot->notify);
++}
++
++
+ static status_t
+ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ {
+@@ -764,7 +851,6 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 
+ 		case B_USB_RAW_COMMAND_INTERRUPT_TRANSFER:
+ 		case B_USB_RAW_COMMAND_BULK_TRANSFER:
+-		case B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER:
+ 		{
+ 			if (length < sizeof(command.transfer))
+ 				return B_BUFFER_OVERFLOW;
+@@ -801,49 +887,23 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 				break;
+ 			}
+ 
+-			size_t descriptorsSize = 0;
+-			usb_iso_packet_descriptor *packetDescriptors = NULL;
+ 			void *transferData = NULL;
+-			MemoryDeleter descriptorsDeleter, dataDeleter;
++			MemoryDeleter dataDeleter;
+ 
+ 			bool inTransfer = (endpointInfo->descr->endpoint_address
+ 				& USB_ENDPOINT_ADDR_DIR_IN) != 0;
+-			if (op == B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER) {
+-				if (length < sizeof(command.isochronous))
+-					return B_BUFFER_OVERFLOW;
+-
+-				descriptorsSize = sizeof(usb_iso_packet_descriptor)
+-					* command.isochronous.packet_count;
+-				packetDescriptors
+-					= (usb_iso_packet_descriptor *)malloc(descriptorsSize);
+-				if (packetDescriptors == NULL) {
+-					command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
+-					command.transfer.length = 0;
+-					break;
+-				}
+-				descriptorsDeleter.SetTo(packetDescriptors);
+-
+-				if (!IS_USER_ADDRESS(command.isochronous.data)
+-					|| !IS_USER_ADDRESS(command.isochronous.packet_descriptors)
+-					|| user_memcpy(packetDescriptors,
+-						command.isochronous.packet_descriptors,
+-						descriptorsSize) != B_OK) {
+-					return B_BAD_ADDRESS;
+-				}
+-			} else {
+-				transferData = malloc(command.transfer.length);
+-				if (transferData == NULL) {
+-					command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
+-					command.transfer.length = 0;
+-					break;
+-				}
+-				dataDeleter.SetTo(transferData);
++			transferData = malloc(command.transfer.length);
++			if (transferData == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++				command.transfer.length = 0;
++				break;
++			}
++			dataDeleter.SetTo(transferData);
+ 
+-				if (!IS_USER_ADDRESS(command.transfer.data) || (!inTransfer
+-						&& user_memcpy(transferData, command.transfer.data,
+-							command.transfer.length) != B_OK)) {
+-					return B_BAD_ADDRESS;
+-				}
++			if (!IS_USER_ADDRESS(command.transfer.data) || (!inTransfer
++					&& user_memcpy(transferData, command.transfer.data,
++						command.transfer.length) != B_OK)) {
++				return B_BAD_ADDRESS;
+ 			}
+ 
+ 			status_t status;
+@@ -852,15 +912,10 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 				status = gUSBModule->queue_interrupt(endpointInfo->handle,
+ 					transferData, command.transfer.length,
+ 					usb_raw_callback, device);
+-			} else if (op == B_USB_RAW_COMMAND_BULK_TRANSFER) {
++			} else {
+ 				status = gUSBModule->queue_bulk(endpointInfo->handle,
+ 					transferData, command.transfer.length,
+ 					usb_raw_callback, device);
+-			} else {
+-				status = gUSBModule->queue_isochronous(endpointInfo->handle,
+-					command.isochronous.data, command.isochronous.length,
+-					packetDescriptors, command.isochronous.packet_count, NULL,
+-					0, usb_raw_callback, device);
+ 			}
+ 
+ 			if (status < B_OK) {
+@@ -882,17 +937,282 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 
+ 			if (command.transfer.status == B_OK)
+ 				status = B_OK;
+-			if (op == B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER) {
+-				if (user_memcpy(command.isochronous.packet_descriptors,
+-						packetDescriptors, descriptorsSize) != B_OK) {
+-					status = B_BAD_ADDRESS;
++			if (inTransfer && user_memcpy(command.transfer.data,
++				transferData, command.transfer.length) != B_OK) {
++				status = B_BAD_ADDRESS;
++			}
++
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER:
++		{
++			if (length < sizeof(command.isochronous))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			const usb_configuration_info *configurationInfo =
++				gUSBModule->get_configuration(device->device);
++			if (configurationInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_CONFIGURATION;
++				break;
++			}
++
++			if (command.transfer.interface >= configurationInfo->interface_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_INTERFACE;
++				break;
++			}
++
++			const usb_interface_info *interfaceInfo =
++				configurationInfo->interface[command.transfer.interface].active;
++			if (interfaceInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_ABORTED;
++				break;
++			}
++
++			if (command.transfer.endpoint >= interfaceInfo->endpoint_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			const usb_endpoint_info *endpointInfo =
++				&interfaceInfo->endpoint[command.transfer.endpoint];
++			if (!endpointInfo->handle) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			size_t descriptorsSize = sizeof(usb_iso_packet_descriptor)
++				* command.isochronous.packet_count;
++			usb_iso_packet_descriptor *packetDescriptors
++				= (usb_iso_packet_descriptor *)malloc(descriptorsSize);
++			if (packetDescriptors == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++				command.transfer.length = 0;
++				break;
++			}
++			MemoryDeleter descriptorsDeleter(packetDescriptors);
++
++			if (!IS_USER_ADDRESS(command.isochronous.data)
++				|| !IS_USER_ADDRESS(command.isochronous.packet_descriptors)
++				|| user_memcpy(packetDescriptors,
++					command.isochronous.packet_descriptors,
++					descriptorsSize) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++
++			// Claim a completion slot. Held only long enough to find a
++			// free slot and submit -- NOT across the wait below -- so a
++			// second thread's ISOCHRONOUS_TRANSFER call can submit its
++			// own request while this one is still in flight, instead of
++			// being serialized behind it (see the iso_slot comment near
++			// its definition for why that matters).
++			int slotIndex = -1;
++			mutex_lock(&device->isoSlotLock);
++			for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++) {
++				if (!device->isoSlots[i].in_use) {
++					device->isoSlots[i].in_use = true;
++					slotIndex = i;
++					break;
+ 				}
+-			} else {
+-				if (inTransfer && user_memcpy(command.transfer.data,
+-					transferData, command.transfer.length) != B_OK) {
+-					status = B_BAD_ADDRESS;
++			}
++			mutex_unlock(&device->isoSlotLock);
++
++			if (slotIndex < 0) {
++				// Every slot already has a request in flight -- this
++				// device only expects up to USB_RAW_ISO_SLOT_COUNT
++				// concurrent isochronous callers.
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				break;
++			}
++
++			iso_slot *slot = &device->isoSlots[slotIndex];
++			status_t status = gUSBModule->queue_isochronous(
++				endpointInfo->handle, command.isochronous.data,
++				command.isochronous.length, packetDescriptors,
++				command.isochronous.packet_count, NULL, 0,
++				usb_raw_iso_callback, slot);
++
++			if (status < B_OK) {
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				status = B_OK;
++				mutex_lock(&device->isoSlotLock);
++				slot->in_use = false;
++				mutex_unlock(&device->isoSlotLock);
++				break;
++			}
++
++			status = acquire_sem_etc(slot->notify, 1, B_KILL_CAN_INTERRUPT, 0);
++			if (status != B_OK) {
++				gUSBModule->cancel_queued_transfers(endpointInfo->handle);
++				acquire_sem(slot->notify);
++			}
++
++			command.transfer.status = slot->status;
++			command.transfer.length = slot->actual_length;
++
++			mutex_lock(&device->isoSlotLock);
++			slot->in_use = false;
++			mutex_unlock(&device->isoSlotLock);
++
++			if (command.transfer.status == B_OK)
++				status = B_OK;
++			if (user_memcpy(command.isochronous.packet_descriptors,
++					packetDescriptors, descriptorsSize) != B_OK) {
++				status = B_BAD_ADDRESS;
++			}
++
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_QUEUE_ISOCHRONOUS:
++		{
++			if (length < sizeof(command.isochronous))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			const usb_configuration_info *configurationInfo =
++				gUSBModule->get_configuration(device->device);
++			if (configurationInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_CONFIGURATION;
++				break;
++			}
++
++			if (command.transfer.interface >= configurationInfo->interface_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_INTERFACE;
++				break;
++			}
++
++			const usb_interface_info *interfaceInfo =
++				configurationInfo->interface[command.transfer.interface].active;
++			if (interfaceInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_ABORTED;
++				break;
++			}
++
++			if (command.transfer.endpoint >= interfaceInfo->endpoint_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			const usb_endpoint_info *endpointInfo =
++				&interfaceInfo->endpoint[command.transfer.endpoint];
++			if (!endpointInfo->handle) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			size_t descriptorsSize = sizeof(usb_iso_packet_descriptor)
++				* command.isochronous.packet_count;
++			usb_iso_packet_descriptor *packetDescriptors
++				= (usb_iso_packet_descriptor *)malloc(descriptorsSize);
++			if (packetDescriptors == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++				command.transfer.length = 0;
++				break;
++			}
++			MemoryDeleter descriptorsDeleter(packetDescriptors);
++
++			if (!IS_USER_ADDRESS(command.isochronous.data)
++				|| !IS_USER_ADDRESS(command.isochronous.packet_descriptors)
++				|| user_memcpy(packetDescriptors,
++					command.isochronous.packet_descriptors,
++					descriptorsSize) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++
++			int slotIndex = -1;
++			mutex_lock(&device->isoSlotLock);
++			for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++) {
++				if (!device->isoSlots[i].in_use) {
++					device->isoSlots[i].in_use = true;
++					slotIndex = i;
++					break;
+ 				}
+ 			}
++			mutex_unlock(&device->isoSlotLock);
++
++			if (slotIndex < 0) {
++				// Every slot already has a request outstanding -- the
++				// caller must WAIT_ISOCHRONOUS on one of its existing
++				// requests before queuing another.
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				command.isochronous.request_id = -1;
++				break;
++			}
++
++			iso_slot *slot = &device->isoSlots[slotIndex];
++			slot->packetDescriptors = packetDescriptors;
++			slot->userPacketDescriptors = command.isochronous.packet_descriptors;
++			slot->descriptorsSize = descriptorsSize;
++			slot->endpointHandle = endpointInfo->handle;
++
++			status_t submitStatus = gUSBModule->queue_isochronous(
++				endpointInfo->handle, command.isochronous.data,
++				command.isochronous.length, packetDescriptors,
++				command.isochronous.packet_count, NULL, 0,
++				usb_raw_iso_callback, slot);
++
++			if (submitStatus < B_OK) {
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				command.isochronous.request_id = -1;
++				mutex_lock(&device->isoSlotLock);
++				slot->in_use = false;
++				mutex_unlock(&device->isoSlotLock);
++				break;
++			}
++
++			// Ownership of packetDescriptors now belongs to the slot
++			// (freed at WAIT_ISOCHRONOUS time, once the transfer using
++			// it has actually completed) -- don't free it when this
++			// scope exits.
++			descriptorsDeleter.Detach();
++
++			command.transfer.status = B_USB_RAW_STATUS_SUCCESS;
++			command.isochronous.request_id = slotIndex;
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_WAIT_ISOCHRONOUS:
++		{
++			if (length < sizeof(command.isochronous))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			int32 slotIndex = command.isochronous.request_id;
++			if (slotIndex < 0 || slotIndex >= USB_RAW_ISO_SLOT_COUNT
++				|| !device->isoSlots[slotIndex].in_use) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			iso_slot *slot = &device->isoSlots[slotIndex];
++			status = acquire_sem_etc(slot->notify, 1, B_KILL_CAN_INTERRUPT, 0);
++			if (status != B_OK) {
++				gUSBModule->cancel_queued_transfers(slot->endpointHandle);
++				acquire_sem(slot->notify);
++			}
++
++			command.transfer.status = slot->status;
++			command.transfer.length = slot->actual_length;
++
++			if (command.transfer.status == B_OK)
++				status = B_OK;
++			if (user_memcpy(slot->userPacketDescriptors,
++					slot->packetDescriptors, slot->descriptorsSize) != B_OK) {
++				status = B_BAD_ADDRESS;
++			}
++
++			free(slot->packetDescriptors);
++			slot->packetDescriptors = NULL;
++
++			mutex_lock(&device->isoSlotLock);
++			slot->in_use = false;
++			mutex_unlock(&device->isoSlotLock);
+ 
+ 			break;
+ 		}
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.h b/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+index 9968fa825e..0122e5a55e 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+@@ -37,7 +37,26 @@ typedef enum {
+ 	B_USB_RAW_COMMAND_CONTROL_TRANSFER = 0x4000,
+ 	B_USB_RAW_COMMAND_INTERRUPT_TRANSFER,
+ 	B_USB_RAW_COMMAND_BULK_TRANSFER,
+-	B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER
++	B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER,
++
++	// Submit-then-wait split of ISOCHRONOUS_TRANSFER: QUEUE returns
++	// immediately with isochronous.request_id identifying the request
++	// (instead of blocking for completion like ISOCHRONOUS_TRANSFER
++	// does), and a later WAIT call (passing that same request_id back in)
++	// blocks for that specific request's completion and fills in the
++	// result fields exactly like ISOCHRONOUS_TRANSFER would have. This
++	// lets one caller have two isochronous transfers genuinely
++	// outstanding at once -- submit both, then wait on each in turn --
++	// which matters for isochronous IN specifically: the host controller
++	// can schedule a second submission to start immediately where the
++	// first one's schedule range ends only if it's queued before the
++	// first completes (see EHCI::SubmitIsochronous's fNextStartingFrame
++	// chaining); waiting for each transfer to fully finish before
++	// queuing the next guarantees a scheduling gap between every pair of
++	// submissions, during which an isochronous IN device keeps
++	// transmitting into microframes nothing was scheduled to receive.
++	B_USB_RAW_COMMAND_QUEUE_ISOCHRONOUS,
++	B_USB_RAW_COMMAND_WAIT_ISOCHRONOUS
+ } usb_raw_command_id;
+ 
+ 
+@@ -182,6 +201,10 @@ typedef union {
+ 		size_t							length;
+ 		usb_iso_packet_descriptor		*packet_descriptors;
+ 		uint32							packet_count;
++		// Only used by QUEUE_ISOCHRONOUS (out: identifies this request)
++		// and WAIT_ISOCHRONOUS (in: which request to wait for). Unused
++		// by the plain (submit-and-block) ISOCHRONOUS_TRANSFER.
++		int32							request_id;
+ 	} isochronous;
+ } usb_raw_command;
  
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 index 3f3670c14f..e5d3177dab 100644
@@ -548,22 +1710,23 @@ index 0000000000..f7d6080a04
 +	;
 diff --git a/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
 new file mode 100644
-index 0000000000..880a2d8719
+index 0000000000..9ef318eb3e
 --- /dev/null
 +++ b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,584 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All rights reserved.
 + * Distributed under the terms of the MIT License.
 + *
-+ * Diagnostic/bring-up driver for the Sony "SNC" notebook control ACPI
-+ * device (HID "SNY5001"), found on Sony VAIO laptops of this era.
++ * Driver for the Sony "SNC" notebook control ACPI device (HID "SNY5001"),
++ * found on Sony VAIO laptops of this era.
 + *
 + * This does NOT reimplement Linux's sony-laptop.c (which is GPL licensed
 + * and can't be copied into this MIT-licensed tree); it's an independent
 + * implementation written from an understanding of the SNC calling
-+ * convention gathered by reading that driver and Sony's own published
-+ * ACPI SNC readme. The convention, in short:
++ * convention gathered by reading that driver, Sony's own published ACPI
++ * SNC readme, and this model's disassembled DSDT. The convention, in
++ * short:
 + *
 + *   - The SNC device exposes up to 16 "capability" slots. Calling SN00
 + *     with an argument of (slot + 0x20) returns the vendor-defined
@@ -577,21 +1740,26 @@ index 0000000000..880a2d8719
 + *     (0x90 + slot), i.e. they identify a slot, not a handle directly;
 + *     the handle has to be looked back up from the table above.
 + *   - SN05 acknowledges/clears an event for a given slot.
++ *   - SN07 dispatches to a per-handle sub-function, selected by the
++ *     argument's bit 8-15 (bit 16-23 is a further control byte for
++ *     writes). On this model, handle 0x0124 is the wireless kill switch:
++ *     sub-function 3 reads the persistent H8EC.WLPW (radio power) and
++ *     H8EC.WLSL (status LED) bits back (bit 0 / bit 1 of the result),
++ *     sub-function 4 writes them the same way. The indicator LED next to
++ *     the switch does not visibly respond to H8EC.WLSL either way (0 or
++ *     1, confirmed via direct register readback) -- it appears to be
++ *     wired directly to the physical switch rather than driven by the
++ *     EC, so this driver no longer tries to control it.
 + *   - Screen brightness is a separate, simpler pair of methods: GBRT
 + *     (get, no argument) and SBRT (set, one integer argument), which
 + *     don't go through the capability table at all.
-+ *
-+ * This driver only logs what it finds (capability table contents,
-+ * brightness, and raw Notify event/slot/handle numbers) via dprintf, so
-+ * the real per-model handle assignments (which slot is the wireless
-+ * kill switch, which is the keyboard backlight, etc.) can be read out of
-+ * the syslog on real hardware instead of guessed at. Once that's known,
-+ * the interesting handles can be given real meaning (rfkill state,
-+ * hotkey delivery, ...) as a follow-up.
 + */
 +
 +
 +#include <ACPI.h>
++
++#include <KernelExport.h>
++#include <stdio.h>
 +
 +#include <stdlib.h>
 +#include <string.h>
@@ -620,7 +1788,6 @@ index 0000000000..880a2d8719
 +	acpi_device acpi_cookie;
 +
 +	uint16 capabilities[SONY_EC_CAP_SLOT_COUNT];
-+	uint32 statusValue[SONY_EC_CAP_SLOT_COUNT];
 +	uint32 brightness;
 +} sony_ec_device_info;
 +
@@ -710,25 +1877,6 @@ index 0000000000..880a2d8719
 +		}
 +	}
 +
-+	// Diagnostic only: read back a "status" value (argument 0x0100, the
-+	// same convention used to read the wireless kill switch's state) for
-+	// every discovered handle. This doesn't control anything by itself,
-+	// but gives real per-handle data to work from -- e.g. a handle whose
-+	// value visibly tracks something we can toggle (like an indicator
-+	// LED) instead of guessing blind.
-+	for (int32 i = 0; i < SONY_EC_CAP_SLOT_COUNT; i++) {
-+		if (device->capabilities[i] == 0)
-+			continue;
-+
-+		uint32 result = 0;
-+		status_t status = sony_ec_call_int(device, "SN07", true,
-+			i | 0x0100, &result);
-+		device->statusValue[i] = result;
-+		TRACE("capability slot %" B_PRId32 " (handle 0x%04x) status: %s, "
-+			"value 0x%04" B_PRIx32 "\n", i, device->capabilities[i],
-+			strerror(status), result);
-+	}
-+
 +	// The hotkey handles need to be "armed" once with a 0 argument before
 +	// they start generating Notify events for Fn key presses -- unlike
 +	// e.g. the wireless kill switch handle, which reports events out of
@@ -784,6 +1932,50 @@ index 0000000000..880a2d8719
 +
 +	uint32 clearResult = 0;
 +	sony_ec_call_int(device, "SN05", true, 1 << offset, &clearResult);
++
++	if (device->capabilities[offset] == 0x0124) {
++		// Wireless switch changed state. Re-request WLAN power on (handle
++		// 0x0124, sub-function 4) every time this fires, not just once at
++		// boot -- the DSDT's F124 method only turns H8EC.WLPW on when
++		// explicitly asked to (it unconditionally zeroes it when the
++		// hardware RF-kill line is asserted, i.e. switch off, but does
++		// NOT automatically restore it when the switch goes back on). A
++		// single boot-time-only request left the radio never coming back
++		// after an off/on cycle. This runs well after boot, triggered only
++		// by an actual physical toggle, so it doesn't collide with the
++		// USB/ATA enumeration window a boot-time call did.
++		//
++		// The control byte's bit 0x01 maps to H8EC.WLPW (radio power) and
++		// bit 0x02 maps to H8EC.WLSL (status LED); both are set here to
++		// match the DSDT's own intent, though WLSL has been confirmed (via
++		// direct register readback) to have no visible effect on the
++		// physical indicator LED on this unit -- it appears to be hardware
++		// wired to the switch rather than EC controlled.
++		uint32 wlanPowerResult = 0;
++		status_t wlanPowerStatus = sony_ec_call_handle(device, 0x0124,
++			0x030400, &wlanPowerResult);
++		TRACE("wireless switch toggled: re-requesting WLAN power on: %s\n",
++			strerror(wlanPowerStatus));
++
++		// Also request Bluetooth power (sub-function 6 writes H8EC.BTPW/
++		// BTSL, the BT analogs of WLPW/WLSL; sub-function 5 reads them
++		// back). The internal Bluetooth module's USB port detects a
++		// connection (its presence pull-up runs off standby power) but the
++		// module never answers a single control transfer -- exactly what a
++		// logic-power-gated device looks like -- and nothing anywhere ever
++		// turns BTPW on: Haiku has no Sony BT power driver, and the EC
++		// doesn't do it by itself on switch-on either (same as it doesn't
++		// for WLPW above).
++		uint32 btPowerResult = 0;
++		status_t btPowerStatus = sony_ec_call_handle(device, 0x0124,
++			0x030600, &btPowerResult);
++		uint32 btStateResult = 0;
++		status_t btStateStatus = sony_ec_call_handle(device, 0x0124,
++			0x0500, &btStateResult);
++		TRACE("wireless switch toggled: requesting BT power on: %s, "
++			"readback (sub-function 5): %s, value 0x%04" B_PRIx32 "\n",
++			strerror(btPowerStatus), strerror(btStateStatus), btStateResult);
++	}
 +}
 +
 +
@@ -975,6 +2167,29 @@ index 0000000000..880a2d8719
 +
 +
 +static status_t
++sony_ec_deferred_bt_power_on(void *_device)
++{
++	sony_ec_device_info *device = (sony_ec_device_info *)_device;
++
++	// Well past the boot-time USB/ATA enumeration window; see the comment
++	// at the spawn site.
++	snooze(10000000);
++
++	if (sSonyEcDevice != device)
++		return B_OK;
++
++	uint32 btPowerResult = 0;
++	status_t btPowerStatus = sony_ec_call_handle(device, 0x0124, 0x030600,
++		&btPowerResult);
++	uint32 btStateResult = 0;
++	sony_ec_call_handle(device, 0x0124, 0x0500, &btStateResult);
++	TRACE("boot-time BT power on: %s, readback 0x%04" B_PRIx32 "\n",
++		strerror(btPowerStatus), btStateResult);
++	return B_OK;
++}
++
++
++static status_t
 +sony_ec_register_child_devices(void *_cookie)
 +{
 +	device_node *node = (device_node *)_cookie;
@@ -1011,6 +2226,21 @@ index 0000000000..880a2d8719
 +	sony_ec_probe_capabilities(device);
 +
 +	sSonyEcDevice = device;
++
++	// Enable Bluetooth module power once at boot, deferred well past the
++	// boot-time USB/ATA enumeration window (an EC call made synchronously
++	// right here was observed to collide with it). The EC never turns
++	// H8EC.BTPW on by itself, so without this the module sits half-powered
++	// (presence pull-up on standby power, logic dead) -- and a half-
++	// powered device on the bus is exactly what was observed to babble
++	// the companion UHCI controller into "host process error" halts
++	// during every boot's enumeration attempts. The notify handler also
++	// re-requests BT power on every wireless-switch toggle, mirroring the
++	// WLAN handling.
++	thread_id thread = spawn_kernel_thread(sony_ec_deferred_bt_power_on,
++		"sony_ec bt power on", B_LOW_PRIORITY, device);
++	if (thread >= 0)
++		resume_thread(thread);
 +
 +	return sDeviceManager->publish_device(node, "power/sony_ec/0",
 +		SONY_EC_DEVICE_MODULE_NAME);
@@ -1068,6 +2298,1317 @@ index 0000000000..880a2d8719
 +	(module_info *)&sony_ec_device_module,
 +	NULL
 +};
+diff --git a/src/add-ons/kernel/power/cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/Jamfile
+index 81306a7e6b..01097bf66c 100644
+--- a/src/add-ons/kernel/power/cpufreq/Jamfile
++++ b/src/add-ons/kernel/power/cpufreq/Jamfile
+@@ -1,5 +1,6 @@
+ SubDir HAIKU_TOP src add-ons kernel power cpufreq ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel power cpufreq amd_pstates ;
++SubInclude HAIKU_TOP src add-ons kernel power cpufreq intel_est ;
+ SubInclude HAIKU_TOP src add-ons kernel power cpufreq intel_pstates ;
+ 
+diff --git a/src/add-ons/kernel/power/cpufreq/intel_est/Jamfile b/src/add-ons/kernel/power/cpufreq/intel_est/Jamfile
+new file mode 100644
+index 0000000000..61ceffd259
+--- /dev/null
++++ b/src/add-ons/kernel/power/cpufreq/intel_est/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src add-ons kernel power cpufreq intel_est ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders [ FDirName kernel arch $(TARGET_KERNEL_ARCH_DIR) ] ;
++
++KernelAddon intel_est :
++	intel_est.cpp
++	;
+diff --git a/src/add-ons/kernel/power/cpufreq/intel_est/intel_est.cpp b/src/add-ons/kernel/power/cpufreq/intel_est/intel_est.cpp
+new file mode 100644
+index 0000000000..442fd236a9
+--- /dev/null
++++ b/src/add-ons/kernel/power/cpufreq/intel_est/intel_est.cpp
+@@ -0,0 +1,596 @@
++/*
++ * Copyright 2026, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Legacy Intel Enhanced SpeedStep (EST) cpufreq driver.
++ *
++ * The in-tree intel_pstates driver only handles HWP (hardware-managed
++ * P-states), which arrived with Skylake. Older EST-capable CPUs -- e.g.
++ * the first-generation Atom (Bonnell) in the Sony VAIO P -- advertise
++ * IA32_FEATURE_EST in CPUID but not HWP, so intel_pstates rejects them and
++ * the machine runs pinned at a single frequency forever ("no valid
++ * cpufreq module found").
++ *
++ * Legacy EST doesn't expose its P-state table through an MSR the way HWP
++ * does; the available (frequency, control-value) pairs come from the ACPI
++ * _PSS object under each processor, and switching is done by writing the
++ * control value to the register _PCT describes. On most EST-era chips
++ * that's IA32_PERF_CTL (MSR 0x199), the same MSR HWP-era chips use, just
++ * fed ACPI-supplied values instead of platform-info-derived ratios. Some
++ * platforms (e.g. the Poulsbo-based Sony VAIO P) instead describe a
++ * SystemMemory-space register in _PCT -- P-state switching there is a
++ * chipset MMIO write, not an MSR write at all. This driver reads _PSS/_PCT
++ * via ACPI and supports both control methods; anything else (e.g.
++ * SystemIO) is left alone.
++ */
++
++
++#include <cpufreq.h>
++#include <KernelExport.h>
++#include <new>
++#include <stdlib.h>
++
++#include <ACPI.h>
++#include <arch_cpu.h>
++#include <arch_system_info.h>
++#include <cpu.h>
++#include <smp.h>
++#include <util/AutoLock.h>
++
++#include <device_manager.h>
++
++
++#define INTEL_EST_MODULE_NAME	CPUFREQ_MODULES_PREFIX "/intel_est/v1"
++
++
++// _OSC/_PDC capability bits (mirrors x86_acpi_cstates' acpi_cpuidle.cpp).
++#define ACPI_PDC_REVID			0x1
++#define ACPI_PDC_P_FFH			(1 << 0)
++#define ACPI_PDC_C_C1_HALT		(1 << 1)
++#define ACPI_PDC_T_FFH			(1 << 2)
++#define ACPI_PDC_SMP_C1PT		(1 << 3)
++#define ACPI_PDC_SMP_C2C3		(1 << 4)
++#define ACPI_PDC_SMP_P_SW		(1 << 5)
++#define ACPI_PDC_SMP_C_SW		(1 << 6)
++#define ACPI_PDC_SMP_T_SW		(1 << 7)
++#define ACPI_PDC_C_C1_FFH		(1 << 8)
++#define ACPI_PDC_C_C2C3_FFH		(1 << 9)
++#define ACPI_PDC_P_HWCOORD		(1 << 11)
++
++// Not in arch_cpu.h: the architectural MISC_ENABLE MSR. Bit 16 gates EST
++// -- while it's clear, writes to IA32_PERF_CTL are silently ignored, so
++// having the CPUID feature and a valid _PSS isn't enough by itself.
++// Firmware usually sets it, but not dependably on every machine/boot
++// path.
++#define IA32_MSR_MISC_ENABLE		0x1a0
++#define IA32_MISC_ENABLE_EST		(1ULL << 16)
++
++
++const int kMinimalInterval = 50000;
++#define MAX_PSTATES 16
++
++
++// Layout of a "Register()" ASL resource descriptor, i.e. a Generic Address
++// Structure wrapped in a small-resource header -- matches what _PCT's
++// package elements decode to (mirrors x86_acpi_cstates' acpicpu_reg).
++struct acpi_gas_reg {
++	uint8	reg_desc;
++	uint16	reg_reslen;
++	uint8	reg_spaceid;
++	uint8	reg_bitwidth;
++	uint8	reg_bitoffset;
++	uint8	reg_accesssize;
++	uint64	reg_addr;
++} __attribute__((packed));
++
++
++struct pstate {
++	uint32	frequencyMHz;
++	uint32	control;	// value to write to the _PCT control register
++};
++
++
++// The control register _PCT describes, resolved once at init and reused
++// for every P-state transition.
++enum control_method {
++	CONTROL_METHOD_NONE = 0,
++	CONTROL_METHOD_FIXED_HW,	// IA32_PERF_CTL (MSR 0x199)
++	CONTROL_METHOD_SYSTEM_MEMORY	// chipset MMIO register
++};
++
++static control_method sControlMethod = CONTROL_METHOD_NONE;
++static area_id sControlArea = -1;
++static vuint8* sControlBase;	// exact register address within the mapping
++static uint8 sControlBitWidth;
++
++
++// P-states as read from _PSS, sorted highest-performance (index 0) to
++// lowest. _PSS itself lists them highest-first already, but we normalize
++// to be safe. Shared across CPUs: on every EST laptop of this era all
++// logical CPUs share one identical table.
++static pstate sPStates[MAX_PSTATES];
++static int32 sPStateCount;
++
++static bool sAvoidBoost;
++
++
++struct CPUEntry {
++				CPUEntry();
++
++	int32		fCurrentState;	// index into sPStates
++	bigtime_t	fLastUpdate;
++} CACHE_LINE_ALIGN;
++static CPUEntry* sCPUEntries;
++
++
++CPUEntry::CPUEntry()
++	:
++	fCurrentState(-1),
++	fLastUpdate(0)
++{
++}
++
++
++static acpi_module_info* sAcpi;
++static device_manager_info* sDeviceManager;
++
++
++static bool
++est_cpu_supported(cpu_ent* cpu)
++{
++	if (cpu->arch.vendor != VENDOR_INTEL)
++		return false;
++	// EST is advertised in CPUID.1:ECX[7].
++	if (!x86_check_feature(IA32_FEATURE_EXT_EST, FEATURE_EXT))
++		return false;
++	// If HWP is present, the dedicated intel_pstates driver (higher rank)
++	// handles it -- don't fight over those CPUs.
++	if (x86_check_feature(IA32_FEATURE_HWP, FEATURE_6_EAX))
++		return false;
++	return true;
++}
++
++
++static void
++set_pstate_index(int32 index)
++{
++	CPUEntry* entry = &sCPUEntries[smp_get_current_cpu()];
++	if (index < 0)
++		index = 0;
++	if (index >= sPStateCount)
++		index = sPStateCount - 1;
++
++	if (entry->fCurrentState == index)
++		return;
++
++	entry->fCurrentState = index;
++	entry->fLastUpdate = system_time();
++
++	uint32 control = sPStates[index].control;
++
++	if (sControlMethod == CONTROL_METHOD_SYSTEM_MEMORY) {
++		// Dedicated MMIO register -- write the ACPI-supplied control value
++		// through as-is, sized to the width _PCT declared. Unlike the MSR
++		// case there's nothing else sharing this register to preserve.
++		if (sControlBitWidth <= 8)
++			*sControlBase = (uint8)control;
++		else if (sControlBitWidth <= 16)
++			*(vuint16*)sControlBase = (uint16)control;
++		else
++			*(vuint32*)sControlBase = control;
++		return;
++	}
++
++	// CONTROL_METHOD_FIXED_HW: IA32_PERF_CTL, bits 15:0 carry the target
++	// performance state; the ACPI _PSS control field is already in that
++	// encoding for FixedHW EST, so it can be written through directly
++	// (preserving the upper bits, which on some parts hold the
++	// IDA/turbo-disable flag).
++	uint64 perfCtl = x86_read_msr(IA32_MSR_PERF_CTL);
++	perfCtl &= ~(uint64)0xffff;
++	perfCtl |= control & 0xffff;
++	x86_write_msr(IA32_MSR_PERF_CTL, perfCtl);
++}
++
++
++static void
++set_normal_pstate(void* /* dummy */, int cpu)
++{
++	// EST must be globally enabled before IA32_PERF_CTL writes have any
++	// effect; per-logical-CPU, since MISC_ENABLE is per-thread on some
++	// parts. Firmware usually did this already, but don't rely on it.
++	uint64 miscEnable = x86_read_msr(IA32_MSR_MISC_ENABLE);
++	if ((miscEnable & IA32_MISC_ENABLE_EST) == 0) {
++		x86_write_msr(IA32_MSR_MISC_ENABLE,
++			miscEnable | IA32_MISC_ENABLE_EST);
++	}
++
++	// Default to the highest-performance state; the scheduler drives it
++	// down from there via decrease_performance().
++	CPUEntry* entry = &sCPUEntries[cpu];
++	entry->fCurrentState = -1;
++	set_pstate_index(0);
++}
++
++
++static void
++est_set_scheduler_mode(scheduler_mode mode)
++{
++	sAvoidBoost = mode == SCHEDULER_MODE_POWER_SAVING;
++}
++
++
++static status_t
++est_increase_performance(int delta)
++{
++	CPUEntry* entry = &sCPUEntries[smp_get_current_cpu()];
++
++	if (system_time() - entry->fLastUpdate < kMinimalInterval)
++		return B_OK;
++
++	// Lower index == higher performance. Move up (toward index 0) by a
++	// fraction of the remaining headroom proportional to delta.
++	int32 current = entry->fCurrentState < 0 ? sPStateCount - 1
++		: entry->fCurrentState;
++	int32 step = current * delta / kCPUPerformanceScaleMax;
++	if (step < 1 && delta > 0)
++		step = 1;
++	int32 target = current - step;
++
++	// In power-saving mode, never jump straight to the top ("boost")
++	// state -- cap at the second-highest.
++	if (sAvoidBoost && target < 1 && sPStateCount > 1)
++		target = 1;
++
++	set_pstate_index(target);
++	return B_OK;
++}
++
++
++static status_t
++est_decrease_performance(int delta)
++{
++	CPUEntry* entry = &sCPUEntries[smp_get_current_cpu()];
++
++	if (system_time() - entry->fLastUpdate < kMinimalInterval)
++		return B_OK;
++
++	int32 current = entry->fCurrentState < 0 ? 0 : entry->fCurrentState;
++	int32 room = (sPStateCount - 1) - current;
++	int32 step = room * delta / kCPUPerformanceScaleMax;
++	if (step < 1 && delta > 0)
++		step = 1;
++
++	set_pstate_index(current + step);
++	return B_OK;
++}
++
++
++static void
++sort_pstates_by_performance()
++{
++	// _PSS is specified highest-performance-first, but sort defensively
++	// (higher frequency == higher performance == lower index).
++	for (int32 i = 0; i < sPStateCount - 1; i++) {
++		for (int32 j = i + 1; j < sPStateCount; j++) {
++			if (sPStates[j].frequencyMHz > sPStates[i].frequencyMHz) {
++				pstate tmp = sPStates[i];
++				sPStates[i] = sPStates[j];
++				sPStates[j] = tmp;
++			}
++		}
++	}
++}
++
++
++// On some platforms (e.g. the Sony VAIO P's Atom Z520) _PSS/_PCT don't
++// exist in the static DSDT at all -- the BIOS injects them via an AML
++// Load() of an OEM SSDT that's only triggered as a side effect of
++// evaluating _OSC (observed on real hardware: the dynamic table load
++// happens right after _OSC runs, and cpuidle's _CST evaluation -- which
++// also evaluates _OSC first -- succeeds right after). Do the same here
++// before ever giving up on _PSS/_PCT. Best-effort: if _OSC and the _PDC
++// fallback both fail, keep going and let prepare_control_register()/read_pss()
++// report their own failure as before.
++static void
++acpi_eval_osc_or_pdc(acpi_device_module_info* acpi, acpi_device cookie)
++{
++	uint32 pdcCap = ACPI_PDC_C_C1_HALT | ACPI_PDC_SMP_C1PT | ACPI_PDC_SMP_C2C3
++		| ACPI_PDC_SMP_P_SW | ACPI_PDC_SMP_C_SW | ACPI_PDC_SMP_T_SW
++		| ACPI_PDC_C_C1_FFH | ACPI_PDC_C_C2C3_FFH | ACPI_PDC_P_FFH
++		| ACPI_PDC_P_HWCOORD | ACPI_PDC_T_FFH;
++
++	// _OSC (guid for Intel platform)
++	static uint8 uuid[] = {
++		0x16, 0xA6, 0x77, 0x40, 0x0C, 0x29, 0xBE, 0x47,
++		0x9E, 0xBD, 0xD8, 0x70, 0x58, 0x71, 0x39, 0x53
++	};
++	uint32 oscCap[2] = { 0, pdcCap };
++
++	acpi_objects arg;
++	acpi_object_type obj[4];
++	arg.count = 4;
++	arg.pointer = obj;
++	obj[0].object_type = ACPI_TYPE_BUFFER;
++	obj[0].buffer.length = sizeof(uuid);
++	obj[0].buffer.buffer = uuid;
++	obj[1].object_type = ACPI_TYPE_INTEGER;
++	obj[1].integer.integer = ACPI_PDC_REVID;
++	obj[2].object_type = ACPI_TYPE_INTEGER;
++	obj[2].integer.integer = sizeof(oscCap) / sizeof(oscCap[0]);
++	obj[3].object_type = ACPI_TYPE_BUFFER;
++	obj[3].buffer.length = sizeof(oscCap);
++	obj[3].buffer.buffer = (void*)oscCap;
++
++	acpi_data buf;
++	buf.pointer = NULL;
++	buf.length = ACPI_ALLOCATE_LOCAL_BUFFER;
++	status_t status = acpi->evaluate_method(cookie, "_OSC", &arg, &buf);
++	if (buf.pointer != NULL)
++		free(buf.pointer);
++	if (status == B_OK)
++		return;
++
++	// _PDC fallback (deprecated pre-3.0 mechanism, same intent as _OSC).
++	acpi_objects pdcArg;
++	acpi_object_type pdcObj;
++	uint32 pdcBuf[3] = { 1, 1, pdcCap };
++	pdcArg.count = 1;
++	pdcArg.pointer = &pdcObj;
++	pdcObj.object_type = ACPI_TYPE_BUFFER;
++	pdcObj.buffer.length = sizeof(pdcBuf);
++	pdcObj.buffer.buffer = pdcBuf;
++	acpi->evaluate_method(cookie, "_PDC", &pdcArg, NULL);
++}
++
++
++// Undo whatever prepare_control_register() set up, for a candidate that
++// didn't pan out (its _PSS turned out unusable) or on module uninit.
++static void
++release_control_register()
++{
++	if (sControlArea >= 0) {
++		delete_area(sControlArea);
++		sControlArea = -1;
++	}
++	sControlBase = NULL;
++	sControlBitWidth = 0;
++	sControlMethod = CONTROL_METHOD_NONE;
++}
++
++
++// Parse _PCT's control register and prepare whatever's needed to drive it:
++// nothing for FixedHW (MSR 0x199 is always accessible), or a kernel MMIO
++// mapping for SystemMemory. Rejects anything else (e.g. SystemIO).
++static status_t
++prepare_control_register(acpi_device_module_info* acpi, acpi_device cookie)
++{
++	acpi_data buffer;
++	buffer.pointer = NULL;
++	buffer.length = ACPI_ALLOCATE_BUFFER;
++
++	status_t status = acpi->evaluate_method(cookie, "_PCT", NULL, &buffer);
++	if (status != B_OK)
++		return status;
++
++	acpi_object_type* pct = (acpi_object_type*)buffer.pointer;
++	status = B_NOT_SUPPORTED;
++	if (pct->object_type == ACPI_TYPE_PACKAGE && pct->package.count >= 2) {
++		// Both elements are Register() resource descriptors; element 0 is
++		// the control register.
++		acpi_object_type* control = &pct->package.objects[0];
++		if (control->object_type == ACPI_TYPE_BUFFER
++			&& control->buffer.length >= sizeof(acpi_gas_reg)) {
++			acpi_gas_reg* reg = (acpi_gas_reg*)control->buffer.buffer;
++
++			if (reg->reg_spaceid == ACPI_ADR_SPACE_FIXED_HARDWARE) {
++				sControlMethod = CONTROL_METHOD_FIXED_HW;
++				status = B_OK;
++			} else if (reg->reg_spaceid == ACPI_ADR_SPACE_SYSTEM_MEMORY
++					&& reg->reg_addr != 0
++					&& reg->reg_bitwidth > 0 && reg->reg_bitwidth <= 32) {
++				phys_addr_t physPage = reg->reg_addr & ~(phys_addr_t)(B_PAGE_SIZE - 1);
++				uint32 pageOffset = reg->reg_addr & (B_PAGE_SIZE - 1);
++				size_t regBytes = (reg->reg_bitwidth + 7) / 8;
++				size_t mapSize = ((pageOffset + regBytes + B_PAGE_SIZE - 1)
++					/ B_PAGE_SIZE) * B_PAGE_SIZE;
++
++				void* mappedBase;
++				area_id area = map_physical_memory("intel_est _PCT control",
++					physPage, mapSize, B_ANY_KERNEL_ADDRESS,
++					B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &mappedBase);
++				if (area >= 0) {
++					sControlArea = area;
++					sControlBase = (vuint8*)mappedBase + pageOffset;
++					sControlBitWidth = reg->reg_bitwidth;
++					sControlMethod = CONTROL_METHOD_SYSTEM_MEMORY;
++					status = B_OK;
++				} else {
++					dprintf("intel_est: failed to map _PCT MMIO control "
++						"register: 0x%" B_PRIx32 "\n", (uint32)area);
++					status = area;
++				}
++			}
++		}
++	}
++
++	free(buffer.pointer);
++	return status;
++}
++
++
++static status_t
++read_pss(acpi_device_module_info* acpi, acpi_device cookie)
++{
++	acpi_data buffer;
++	buffer.pointer = NULL;
++	buffer.length = ACPI_ALLOCATE_BUFFER;
++
++	status_t status = acpi->evaluate_method(cookie, "_PSS", NULL, &buffer);
++	if (status != B_OK) {
++		dprintf("intel_est: _PSS evaluate_method failed: 0x%" B_PRIx32 "\n",
++			(uint32)status);
++		return status;
++	}
++
++	acpi_object_type* pss = (acpi_object_type*)buffer.pointer;
++	if (pss->object_type != ACPI_TYPE_PACKAGE || pss->package.count == 0) {
++		free(buffer.pointer);
++		return B_BAD_DATA;
++	}
++
++	int32 count = 0;
++	for (uint32 i = 0; i < pss->package.count && count < MAX_PSTATES; i++) {
++		acpi_object_type* state = &pss->package.objects[i];
++		// Each _PSS entry is a package of 6 integers:
++		// CoreFrequency(MHz), Power(mW), Latency, BusMasterLatency,
++		// Control, Status.
++		if (state->object_type != ACPI_TYPE_PACKAGE
++			|| state->package.count < 6)
++			continue;
++		if (state->package.objects[0].object_type != ACPI_TYPE_INTEGER
++			|| state->package.objects[4].object_type != ACPI_TYPE_INTEGER)
++			continue;
++
++		sPStates[count].frequencyMHz
++			= (uint32)state->package.objects[0].integer.integer;
++		sPStates[count].control
++			= (uint32)state->package.objects[4].integer.integer;
++		count++;
++	}
++
++	free(buffer.pointer);
++
++	if (count == 0)
++		return B_BAD_DATA;
++
++	sPStateCount = count;
++	sort_pstates_by_performance();
++	return B_OK;
++}
++
++
++static status_t
++init_est()
++{
++	if (!x86_check_feature(IA32_FEATURE_MSR, FEATURE_COMMON))
++		return B_ERROR;
++
++	int32 cpuCount = smp_get_num_cpus();
++	for (int32 i = 0; i < cpuCount; i++) {
++		if (!est_cpu_supported(&gCPU[i]))
++			return B_ERROR;
++	}
++
++	// Find any ACPI processor node and read its _PCT/_PSS. The table is
++	// identical across all logical CPUs on these platforms.
++	device_node* root = sDeviceManager->get_root_node();
++	device_attr acpiAttrs[] = {
++		{ B_DEVICE_BUS, B_STRING_TYPE, { .string = "acpi" }},
++		{ ACPI_DEVICE_TYPE_ITEM, B_UINT32_TYPE,
++			{ .ui32 = ACPI_TYPE_PROCESSOR }},
++		{ NULL }
++	};
++
++	status_t status = B_ERROR;
++	device_node* processor = NULL;
++	while (sDeviceManager->find_child_node(root, acpiAttrs, &processor)
++			== B_OK) {
++		acpi_device_module_info* acpi;
++		acpi_device cookie;
++		sDeviceManager->get_driver(processor,
++			(driver_module_info**)&acpi, (void**)&cookie);
++
++		acpi_eval_osc_or_pdc(acpi, cookie);
++
++		if (prepare_control_register(acpi, cookie) == B_OK
++			&& read_pss(acpi, cookie) == B_OK) {
++			status = B_OK;
++			sDeviceManager->put_node(processor);
++			break;
++		}
++		release_control_register();
++	}
++	sDeviceManager->put_node(root);
++
++	if (status != B_OK) {
++		dprintf("intel_est: no usable ACPI _PSS/_PCT found\n");
++		return status;
++	}
++
++	dprintf("intel_est: control method %s\n",
++		sControlMethod == CONTROL_METHOD_FIXED_HW ? "FixedHW (MSR)"
++			: "SystemMemory (MMIO)");
++
++	dprintf("intel_est: using ACPI EST, %" B_PRId32 " P-states (%" B_PRIu32
++		" MHz ... %" B_PRIu32 " MHz)\n", sPStateCount,
++		sPStates[0].frequencyMHz, sPStates[sPStateCount - 1].frequencyMHz);
++
++	sCPUEntries = new(std::nothrow) CPUEntry[cpuCount];
++	if (sCPUEntries == NULL) {
++		release_control_register();
++		return B_NO_MEMORY;
++	}
++
++	est_set_scheduler_mode(SCHEDULER_MODE_LOW_LATENCY);
++	call_all_cpus_sync(set_normal_pstate, NULL);
++	return B_OK;
++}
++
++
++static status_t
++uninit_est()
++{
++	call_all_cpus_sync(set_normal_pstate, NULL);
++	delete[] sCPUEntries;
++	release_control_register();
++	return B_OK;
++}
++
++
++static status_t
++std_ops(int32 op, ...)
++{
++	switch (op) {
++		case B_MODULE_INIT:
++			return init_est();
++
++		case B_MODULE_UNINIT:
++			uninit_est();
++			return B_OK;
++	}
++
++	return B_ERROR;
++}
++
++
++static cpufreq_module_info sIntelEST = {
++	{
++		INTEL_EST_MODULE_NAME,
++		0,
++		std_ops,
++	},
++
++	// Lower rank than intel_pstates (1.0) so an HWP-capable machine still
++	// prefers that driver; this one only wins on CPUs intel_pstates
++	// rejects.
++	0.8f,
++
++	est_set_scheduler_mode,
++
++	est_increase_performance,
++	est_decrease_performance,
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sIntelEST,
++	NULL
++};
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&sDeviceManager },
++	{ B_ACPI_MODULE_NAME, (module_info**)&sAcpi },
++	{}
++};
+diff --git a/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp b/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
+index fda337add7..98288463d0 100644
+--- a/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
++++ b/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
+@@ -234,6 +234,11 @@ acpi_cstate_set_scheduler_mode(scheduler_mode mode)
+ 		maxState = ACPI_STATE_C1;
+ 
+ 	acpi_cpuidle_driver_info *pi = sAcpiProcessor[0];
++	if (pi == NULL) {
++		sStateIndex = -1;
++		return;
++	}
++
+ 	int32 index = -1;
+ 	for (int i = 0; i < pi->state_count; i++) {
+ 		if (pi->states[i].type > maxState)
+@@ -254,6 +259,14 @@ acpi_cstate_idle()
+ 		panic("invalid thread state");
+ 
+ 	acpi_cpuidle_driver_info *pi = sAcpiProcessor[smp_get_current_cpu()];
++	if (pi == NULL) {
++		// Not every logical CPU necessarily got a working ACPI cstate
++		// device (e.g. an HT sibling whose Processor() object never had a
++		// usable _CST) -- fall back to a plain halt rather than crash.
++		acpi_cstate_halt();
++		return;
++	}
++
+ 	acpi_cstate_info *ci = NULL;
+ 	int32 stateIndex = -1;
+ 
+@@ -267,7 +280,9 @@ acpi_cstate_idle()
+ 	int result = setjmp(idlingState.reset_jump);
+ 	if (result != 0) {
+ 		enable_interrupts();
+-		if (ci->type == ACPI_STATE_C3)
++		// ci is still NULL if the interrupt that triggered this longjmp
++		// arrived before we ever picked a C-state to enter.
++		if (ci != NULL && ci->type == ACPI_STATE_C3)
+ 			goto C3_out;
+ 
+ 		thread->post_interrupt_callback = NULL;
+@@ -450,6 +465,26 @@ acpi_cstate_quirks(acpi_cpuidle_driver_info *device)
+ 		return;
+ 	if (cpu->arch.family > 0xf || (cpu->arch.family == 6 && model >= 0xf))
+ 		device->flags &= ~ACPI_FLAG_C_ARB;
++
++	// First-generation Atom (Bonnell/Silverthorne, model 0x1c -- e.g. the
++	// Z520 in the Sony VAIO P) hard-hangs the machine -- no panic, no
++	// debugger, no keyboard input, freeze point different every boot --
++	// confirmed on real hardware once both logical CPUs actually use this
++	// driver's idle path (they didn't before both got a working _CST
++	// mapping). Downgrading FFH (MONITOR/MWAIT) to plain HALT alone did
++	// not stop the hangs, which points at acpi_cstate_bm_check() instead:
++	// unlike C-state entry itself, it runs on *every* idle entry on *both*
++	// CPUs and hits the ACPI bus manager's bus-master-status bit register,
++	// which apparently isn't safe against concurrent access from two
++	// logical CPUs on this old chipset. Skip it entirely here, and
++	// downgrade FFH to HALT as a second precaution.
++	if (cpu->arch.family == 6 && model == 0x1c) {
++		for (int32 i = 0; i < device->state_count; i++) {
++			if (device->states[i].method == ACPI_CSTATE_FFH)
++				device->states[i].method = ACPI_CSTATE_HALT;
++			device->states[i].skip_bm_sts = 1;
++		}
++	}
+ }
+ 
+ 
+@@ -514,7 +549,7 @@ acpi_cpuidle_setup(acpi_cpuidle_driver_info *device)
+ 
+ 
+ static status_t
+-acpi_processor_init(acpi_cpuidle_driver_info *device)
++acpi_processor_get_id(acpi_cpuidle_driver_info *device, uint32 *_cpuId)
+ {
+ 	// get the CPU index
+ 	acpi_data buffer;
+@@ -528,30 +563,9 @@ acpi_processor_init(acpi_cpuidle_driver_info *device)
+ 	}
+ 
+ 	acpi_object_type *tmpObject = (acpi_object_type *)buffer.pointer;
+-	const uint32 processor_cpu_id = tmpObject->processor.cpu_id;
++	*_cpuId = tmpObject->processor.cpu_id;
+ 	free(buffer.pointer);
+-
+-	// Find this processor's CPU index.
+-	int32 cpuIndex = -1;
+-	for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+-		cpu_ent* cpu = &gCPU[i];
+-		if ((uint32)cpu->arch.acpi_processor_id == processor_cpu_id) {
+-			cpuIndex = i;
+-			break;
+-		}
+-	}
+-
+-	if (cpuIndex < 0) {
+-		dprintf("can't find matching cpu_ent for acpi cpu %" B_PRId32 "\n",
+-			processor_cpu_id);
+-		return B_ERROR;
+-	}
+-
+-	dprintf("acpi cpu %" B_PRId32 " maps to cpu %" B_PRId32 "\n",
+-		processor_cpu_id, cpuIndex);
+-
+-	sAcpiProcessor[cpuIndex] = device;
+-	return status;
++	return B_OK;
+ }
+ 
+ 
+@@ -575,10 +589,35 @@ acpi_cpuidle_init()
+ 	if (x86_check_feature(IA32_FEATURE_EXT_HYPERVISOR, FEATURE_EXT))
+ 		return B_ERROR;
+ 
++	// This driver hard-hangs the machine on the first-generation Atom
++	// (Bonnell/Silverthorne, model 0x1c -- e.g. the Z520 in the Sony VAIO
++	// P) once both logical CPUs actually use its idle path -- confirmed
++	// on real hardware across several independent attempted fixes
++	// (skipping the redundant per-CPU _CST re-evaluation, downgrading
++	// MWAIT to HLT, skipping the per-idle bus-master-status register
++	// check). The freeze point moves around from boot to boot, consistent
++	// with a genuine SMP deadlock somewhere below this driver (ACPICA or
++	// the chipset itself) that isn't safe to keep chasing blind without a
++	// working kernel debugger entry point on the affected machine. Refuse
++	// to claim this CPU model outright; the machine is known to boot
++	// reliably without cpuidle.
++	{
++		cpu_ent* cpu = get_cpu_struct();
++		uint32 model = (cpu->arch.extended_model << 4) + cpu->arch.model;
++		if (cpu->arch.vendor == VENDOR_INTEL && cpu->arch.family == 6
++				&& model == 0x1c) {
++			return B_ERROR;
++		}
++	}
++
+ 	device_node* root = sDeviceManager->get_root_node();
+ 
++	const int32 numCpus = smp_get_num_cpus();
++	acpi_cpuidle_driver_info* devices[SMP_MAX_CPUS];
++	uint32 deviceCpuIds[SMP_MAX_CPUS];
++	int32 deviceCount = 0;
++
+ 	status_t status = B_OK;
+-	int32 processors = 0;
+ 	device_node* processor = NULL;
+ 	while (true) {
+ 		device_attr acpiAttrs[] = {
+@@ -602,29 +641,113 @@ acpi_cpuidle_init()
+ 		sDeviceManager->get_driver(processor, (driver_module_info **)&device->acpi,
+ 			(void **)&device->acpi_cookie);
+ 
+-		status = acpi_processor_init(device);
+-		if (status != B_OK) {
++		uint32 cpuId;
++		if (deviceCount >= numCpus
++				|| acpi_processor_get_id(device, &cpuId) != B_OK) {
+ 			sDeviceManager->put_node(processor);
+ 			free(device);
+-
+-			// Ignore the error and continue: there are sometimes processor
+-			// objects that don't map to cpu_ents, apparently.
+-			status = B_OK;
+ 			continue;
+ 		}
+ 
+-		processors++;
++		devices[deviceCount] = device;
++		deviceCpuIds[deviceCount] = cpuId;
++		deviceCount++;
+ 	}
+ 
+ 	sDeviceManager->put_node(root);
+-	if (status == B_OK && processors != smp_get_num_cpus()) {
++
++	bool cpuClaimed[SMP_MAX_CPUS] = {};
++	bool deviceClaimed[SMP_MAX_CPUS] = {};
++
++	// First pass: match by the ACPI processor ID, as ioapic.cpp filled it in
++	// from the MADT's LAPIC entries.
++	for (int32 d = 0; status == B_OK && d < deviceCount; d++) {
++		for (int32 i = 0; i < numCpus; i++) {
++			if (!cpuClaimed[i]
++					&& (uint32)gCPU[i].arch.acpi_processor_id
++						== deviceCpuIds[d]) {
++				sAcpiProcessor[i] = devices[d];
++				cpuClaimed[i] = true;
++				deviceClaimed[d] = true;
++				dprintf("acpi cpu %" B_PRIu32 " maps to cpu %" B_PRId32 "\n",
++					deviceCpuIds[d], i);
++				break;
++			}
++		}
++	}
++
++	// Second pass: some firmwares (e.g. the Sony VAIO P / Atom Z520, on its
++	// HT sibling thread) disagree between the MADT LAPIC ProcessorId and the
++	// DSDT Processor() object's ProcessorId. Fall back to matching whatever
++	// is left over by discovery order.
++	int32 nextCpu = 0;
++	for (int32 d = 0; status == B_OK && d < deviceCount; d++) {
++		if (deviceClaimed[d])
++			continue;
++		while (nextCpu < numCpus && cpuClaimed[nextCpu])
++			nextCpu++;
++		if (nextCpu >= numCpus)
++			break;
++		dprintf("acpi cpu %" B_PRIu32 " id mismatch, falling back to "
++			"discovery order -> cpu %" B_PRId32 "\n", deviceCpuIds[d],
++			nextCpu);
++		sAcpiProcessor[nextCpu] = devices[d];
++		cpuClaimed[nextCpu] = true;
++		deviceClaimed[d] = true;
++		nextCpu++;
++	}
++
++	int32 processors = 0;
++	for (int32 d = 0; d < deviceCount; d++) {
++		if (!deviceClaimed[d]) {
++			sDeviceManager->put_node(devices[d]->processor);
++			free(devices[d]);
++		} else {
++			processors++;
++		}
++	}
++
++	if (status == B_OK && processors != numCpus) {
+ 		dprintf("can't use x86 ACPI idle: missing %" B_PRId32 " processor objects\n",
+-			smp_get_num_cpus() - processors);
++			numCpus - processors);
+ 		status = B_NOT_SUPPORTED;
+ 	}
+ 
+-	for (int32 i = 0; status == B_OK && i < smp_get_num_cpus(); i++)
+-		status = acpi_cpuidle_setup(sAcpiProcessor[i]);
++	// Evaluate _OSC/_CST on a single representative CPU only, then copy the
++	// resulting C-state table to the rest. On this class of hardware (e.g.
++	// Sony VAIO P / Atom Z520), the first _CST evaluation dynamically
++	// Load()s a shared OEM SSDT via AML; evaluating _OSC/_CST a second time
++	// for the HT sibling hangs the machine hard (observed on real hardware
++	// -- looks like an ACPICA dynamic-table-load deadlock on a repeat
++	// Load() of the same table). All logical CPUs share one identical
++	// table on these platforms anyway, matching the same assumption
++	// intel_est already makes for _PSS/_PCT, so there's nothing lost by
++	// not re-running the AML per CPU.
++	int32 representative = -1;
++	for (int32 i = 0; i < numCpus; i++) {
++		if (sAcpiProcessor[i] != NULL) {
++			representative = i;
++			break;
++		}
++	}
++
++	if (status == B_OK && representative < 0)
++		status = B_NOT_SUPPORTED;
++
++	if (status == B_OK)
++		status = acpi_cpuidle_setup(sAcpiProcessor[representative]);
++
++	if (status == B_OK) {
++		acpi_cpuidle_driver_info* source = sAcpiProcessor[representative];
++		for (int32 i = 0; i < numCpus; i++) {
++			if (i == representative || sAcpiProcessor[i] == NULL)
++				continue;
++			sAcpiProcessor[i]->flags = source->flags;
++			sAcpiProcessor[i]->state_count = source->state_count;
++			memcpy(sAcpiProcessor[i]->states, source->states,
++				sizeof(source->states));
++		}
++	}
+ 
+ 	if (status == B_OK) {
+ 		acpi_cstate_set_scheduler_mode(SCHEDULER_MODE_LOW_LATENCY);
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 0e067c49cd..5afe292084 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <OS.h>
+ #include <Autolock.h>
++#include <new>
+ 
+ //#define DEBUG_WRITE_DUMP
+ //#define DEBUG_DISCARD_DATA
+@@ -44,8 +45,17 @@ CamDevice::CamDevice(CamDeviceAddon &_addon, BUSBDevice* _device)
+ 	  fSupportedDeviceIndex(-1),
+ 	  fChipIsBigEndian(false),
+ 	  fTransferEnabled(false),
+-	  fLocker("WebcamDeviceLock")
+-{
++	  fLocker("WebcamDeviceLock"),
++	  fIsoPipelineReady(false),
++	  fIsoConsumerThread(-1),
++	  fIsoNumPacketDescriptors(0),
++	  fIsoMaxPacketSize(0)
++{
++	fIsoBufferReady[0] = fIsoBufferReady[1] = -1;
++	fIsoBufferFree[0] = fIsoBufferFree[1] = -1;
++	fIsoBuffer[0] = fIsoBuffer[1] = NULL;
++	fIsoPacketDescriptors[0] = fIsoPacketDescriptors[1] = NULL;
++	fIsoTransferLen[0] = fIsoTransferLen[1] = 0;
+ 	// fill in the generic flavor
+ 	_addon.WebCamAddOn()->FillDefaultFlavorInfo(&fFlavorInfo);
+ 	// if we use id matching, cache the index to the list
+@@ -74,6 +84,18 @@ CamDevice::~CamDevice()
+ {
+ 	close(fDumpFD);
+ 	free(fBuffer);
++	free(fIsoBuffer[0]);
++	free(fIsoBuffer[1]);
++	delete[] fIsoPacketDescriptors[0];
++	delete[] fIsoPacketDescriptors[1];
++	if (fIsoBufferReady[0] >= 0)
++		delete_sem(fIsoBufferReady[0]);
++	if (fIsoBufferReady[1] >= 0)
++		delete_sem(fIsoBufferReady[1]);
++	if (fIsoBufferFree[0] >= 0)
++		delete_sem(fIsoBufferFree[0]);
++	if (fIsoBufferFree[1] >= 0)
++		delete_sem(fIsoBufferFree[1]);
+ 	if (fDeframer)
+ 		delete fDeframer;
+ }
+@@ -155,8 +177,20 @@ CamDevice::StartTransfer()
+ 	PRINT((CH "()" CT));
+ 	if (fTransferEnabled)
+ 		return EALREADY;
+-	fPumpThread = spawn_thread(_DataPumpThread, "USB Webcam Data Pump", 50,
+-		this);
++	// The isochronous pump loop is latency-sensitive: each
++	// IsochronousTransfer() call is synchronous and only one is ever
++	// outstanding, so the camera keeps transmitting into microframes
++	// during the gap between one call returning and the next being
++	// submitted, and whatever it sends in that gap is lost (visible as
++	// the periodic green-line/noise artifacts during capture). At normal
++	// priority, this thread can be held off the CPU by other work (e.g.
++	// JPEG decode on the receiving end) for long enough to widen that
++	// gap noticeably. B_REAL_TIME_DISPLAY_PRIORITY is what Haiku intends
++	// for exactly this kind of continuous, time-sensitive capture/display
++	// work, so the thread gets back onto the CPU and resubmits as soon as
++	// each transfer completes instead of waiting its turn.
++	fPumpThread = spawn_thread(_DataPumpThread, "USB Webcam Data Pump",
++		B_REAL_TIME_DISPLAY_PRIORITY, this);
+ 	if (fPumpThread < B_OK)
+ 		return fPumpThread;
+ 	if (fSensor)
+@@ -188,6 +222,22 @@ CamDevice::StopTransfer()
+ 	wait_for_thread(fPumpThread, &err);
+ 	fLocker.Lock();
+ 
++	if (fIsoPipelineReady) {
++		// The producer (fPumpThread, just joined above) is done issuing
++		// new isochronous requests, but IsoConsumerThread() may still be
++		// blocked waiting on fIsoBufferReady[]. Deleting the semaphores
++		// makes that acquire_sem() return an error instead of blocking
++		// forever, so the consumer notices and exits.
++		delete_sem(fIsoBufferReady[0]);
++		delete_sem(fIsoBufferReady[1]);
++		wait_for_thread(fIsoConsumerThread, &err);
++		delete_sem(fIsoBufferFree[0]);
++		delete_sem(fIsoBufferFree[1]);
++		fIsoBufferReady[0] = fIsoBufferReady[1] = -1;
++		fIsoBufferFree[0] = fIsoBufferFree[1] = -1;
++		fIsoPipelineReady = false;
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -564,13 +614,111 @@ CamDevice::DataPumpThread()
+ 	}
+ #ifdef SUPPORT_ISO
+ 	else if (SupportsIsochronous()) {
+-		int numPacketDescriptors = 16;
+-		usb_iso_packet_descriptor packetDescriptors[numPacketDescriptors];
+-		
+-		// Initialize packetDescriptor request lengths
+-		for (int i = 0; i<numPacketDescriptors; i++)
+-			packetDescriptors[i].request_length = 256;	
++		// 24 packets = 3 EHCI itds per isochronous submission (each itd
++		// covers up to 8 microframe transactions -- see ehci.cpp's
++		// SubmitIsochronous), cutting the number of round trips per video
++		// frame roughly 3x versus one itd (8 packets) per call. This used
++		// to crash the kernel: EHCI::FinishIsochronousTransfers froze all
++		// of a multi-itd transfer's descriptors at once when the last one
++		// was found, but only that last one had actually been unlinked
++		// from its own per-frame chain (fItdEntries[]) -- the earlier
++		// itds got freed while still linked into whichever other frame
++		// slots they occupied, corrupting those chains and eventually
++		// use-after-freeing when the finisher thread scanned one of them
++		// again. Fixed at the root in ehci.cpp/ehci.h (isochronous_
++		// transfer_data now tracks first_frame, so completion can unlink
++		// every descriptor from its own slot before freeing it), so it's
++		// safe to use more than one itd per submission again.
++		int numPacketDescriptors = 24;
++
++		// Size each packet request -- and the buffers backing them -- to
++		// the endpoint's actual max payload instead of a fixed 256 bytes.
++		// BUSBEndpoint::MaxPacketSize() returns the raw wMaxPacketSize
++		// descriptor field, which for high-bandwidth isochronous endpoints
++		// packs an 11-bit base size (bits 0-10) and a transactions-per-
++		// microframe multiplier minus one (bits 11-12) -- NOT a plain byte
++		// count. Using the raw value directly (e.g. 5076 on this camera)
++		// overflows the EHCI iTD's 12-bit per-transaction length field,
++		// corrupting the descriptor's status bits before the transfer even
++		// runs -- which is why isochronous transfers were completing with
++		// 0 bytes every time. Decode it properly; the result (e.g. 980 * 3
++		// = 2940 bytes) matches the endpoint's real negotiated payload
++		// size and fits the length field.
++		size_t maxPacketSize = 256;
++		if (fIsoIn != NULL && fIsoIn->MaxPacketSize() > 0) {
++			uint16 rawMaxPacketSize = fIsoIn->MaxPacketSize();
++			size_t baseSize = rawMaxPacketSize & 0x7ff;
++			size_t transactionsPerMicroframe = ((rawMaxPacketSize >> 11) & 0x3) + 1;
++			maxPacketSize = baseSize * transactionsPerMicroframe;
++		}
++		size_t neededBufferLen = maxPacketSize * numPacketDescriptors;
++
++		// Pipeline the capture across two buffers/descriptor sets, handed
++		// off to a second thread (IsoConsumerThread) that does the
++		// memcpy- and deframer-logic work of splitting each completed
++		// transfer's packets out to fDataInput. That used to happen right
++		// here, in between one blocking IsochronousTransfer() call and
++		// the next -- widening the gap during which the camera keeps
++		// transmitting into microframes nothing is listening to. With two
++		// buffers, this thread can resubmit into the *other* buffer
++		// immediately once a transfer completes, instead of waiting on
++		// that processing first.
++		if (!fIsoPipelineReady || fIsoNumPacketDescriptors != numPacketDescriptors
++				|| fIsoMaxPacketSize != maxPacketSize) {
++			for (int b = 0; b < 2; b++) {
++				uint8* newBuffer = (uint8*)realloc(fIsoBuffer[b], neededBufferLen);
++				if (newBuffer != NULL)
++					fIsoBuffer[b] = newBuffer;
++
++				usb_iso_packet_descriptor* newDescriptors
++					= new(std::nothrow) usb_iso_packet_descriptor[numPacketDescriptors];
++				delete[] fIsoPacketDescriptors[b];
++				fIsoPacketDescriptors[b] = newDescriptors;
++				for (int i = 0; i < numPacketDescriptors; i++)
++					fIsoPacketDescriptors[b][i].request_length = (int16)maxPacketSize;
++
++				if (fIsoBufferFree[b] < 0) {
++					// Starts at 0 (not free), not 1: both buffers are
++					// used immediately by the priming QueueIsochronous()
++					// calls below (unconditionally, without acquiring
++					// this semaphore first), so by the time the main
++					// loop's first requeue attempt checks whether it's
++					// safe to overwrite a buffer, that permit must not
++					// already be sitting there unearned -- it has to
++					// come only from the consumer actually finishing
++					// with that buffer's data.
++					fIsoBufferFree[b] = create_sem(0, "iso buffer free");
++				}
++				if (fIsoBufferReady[b] < 0)
++					fIsoBufferReady[b] = create_sem(0, "iso buffer ready");
++			}
++			fIsoNumPacketDescriptors = numPacketDescriptors;
++			fIsoMaxPacketSize = maxPacketSize;
++			fIsoPipelineReady = true;
++
++			fIsoConsumerThread = spawn_thread(_IsoConsumerThread,
++				"USB Webcam Iso Consumer", B_REAL_TIME_DISPLAY_PRIORITY - 1,
++				this);
++			resume_thread(fIsoConsumerThread);
++		}
+ 
++		// Prime the pipeline: get both buffers' transfers queued with the
++		// host controller before waiting on either. Buffer 1's
++		// QueueIsochronous() call below runs while buffer 0's transfer is
++		// still outstanding, which is what lets the controller schedule
++		// it immediately following buffer 0's range instead of leaving a
++		// gap (see the class comment on fIsoPipelineReady).
++		int32 requestId[2] = { -1, -1 };
++		if (fIsoIn != NULL) {
++			requestId[0] = fIsoIn->QueueIsochronous(fIsoBuffer[0],
++				neededBufferLen, fIsoPacketDescriptors[0],
++				numPacketDescriptors);
++			requestId[1] = fIsoIn->QueueIsochronous(fIsoBuffer[1],
++				neededBufferLen, fIsoPacketDescriptors[1],
++				numPacketDescriptors);
++		}
++
++		int cur = 0;
+ 		while (fTransferEnabled) {
+ 			ssize_t len = -1;
+ 			BAutolock lock(fLocker);
+@@ -578,40 +726,62 @@ CamDevice::DataPumpThread()
+ 				break;
+ 			if (!fIsoIn)
+ 				break;
++			if (requestId[cur] < 0) {
++				// Couldn't even get this buffer's transfer queued
++				// (e.g. transient allocation failure) -- nothing to
++				// wait for.
++				PRINT((CH ": QueueIsochronous failed for buffer %d" CT, cur));
++				break;
++			}
+ #ifndef DEBUG_DISCARD_INPUT
+-			len = fIsoIn->IsochronousTransfer(fBuffer, fBufferLen, packetDescriptors,
+-				numPacketDescriptors);
++			len = fIsoIn->WaitIsochronous(requestId[cur]);
+ #endif
++			// Waited on and consumed -- not outstanding anymore until
++			// (if) the requeue below succeeds. Tracking this precisely
++			// is what lets the drain step after the loop know exactly
++			// which of the two buffers (if any) still has a request the
++			// kernel hasn't finished with yet, however this loop ends up
++			// exiting.
++			requestId[cur] = -1;
++			fIsoTransferLen[cur] = len;
++
++			if (len <= 0)
++				PRINT((CH ": IsoIn: %s" CT, strerror(len)));
+ 
+-			//PRINT((CH ": got %d bytes" CT, len));
+-#ifdef DEBUG_WRITE_DUMP
+-			write(fDumpFD, fBuffer, len);
+-#endif
+-#ifdef DEBUG_READ_DUMP
+-			if ((len = read(fDumpFD, fBuffer, fBufferLen)) < fBufferLen)
+-				lseek(fDumpFD, 0LL, SEEK_SET);
++			// Hand this buffer's just-completed data to the consumer...
++			release_sem(fIsoBufferReady[cur]);
++
++			// ...then, once the consumer is done with whatever was
++			// previously in this buffer (from the last time it was used,
++			// two cycles ago), requeue it. This happens while the
++			// *other* buffer's transfer (queued last cycle, or in the
++			// priming step above) is still outstanding -- the whole
++			// point of interleaving queue/wait this way instead of
++			// waiting for both before requeuing either.
++			if (acquire_sem(fIsoBufferFree[cur]) != B_OK)
++				break;
++#ifndef DEBUG_DISCARD_INPUT
++			requestId[cur] = fIsoIn->QueueIsochronous(fIsoBuffer[cur],
++				neededBufferLen, fIsoPacketDescriptors[cur],
++				numPacketDescriptors);
+ #endif
+ 
+-			if (len <= 0) {
+-				PRINT((CH ": IsoIn: %s" CT, strerror(len)));
+-				continue;
+-			}
++			cur = 1 - cur;
++			//snooze(2000);
++		}
+ 
+-#ifndef DEBUG_DISCARD_DATA
+-			if (fDataInput) {
+-				int fBufferIndex = 0;
+-				for (int i = 0; i < numPacketDescriptors; i++) {
+-					int actual_length = ((usb_iso_packet_descriptor)
+-						packetDescriptors[i]).actual_length;
+-					if (actual_length > 0) {
+-						fDataInput->Write(&fBuffer[fBufferIndex],
+-							actual_length);
+-					}
+-					fBufferIndex += actual_length;
+-				}				
++		// However the loop above exited, up to one buffer's transfer can
++		// legitimately still be outstanding with the kernel (that's the
++		// nature of keeping 2 requests in flight at once) -- wait for it
++		// before returning. Otherwise the kernel could still be DMA-ing
++		// completion data into fIsoBuffer[]/fIsoPacketDescriptors[] after
++		// this function returns, racing a StopTransfer()/StartTransfer()
++		// cycle that reallocates or frees them.
++		if (fIsoIn != NULL) {
++			for (int i = 0; i < 2; i++) {
++				if (requestId[i] >= 0)
++					fIsoIn->WaitIsochronous(requestId[i]);
+ 			}
+-#endif
+-			//snooze(2000);
+ 		}
+ 	}
+ #endif
+@@ -631,6 +801,66 @@ CamDevice::_DataPumpThread(void *_this)
+ }
+ 
+ 
++int32
++CamDevice::_IsoConsumerThread(void *_this)
++{
++	CamDevice *dev = (CamDevice *)_this;
++	return dev->IsoConsumerThread();
++}
++
++
++int32
++CamDevice::IsoConsumerThread()
++{
++	int cur = 0;
++	while (true) {
++		// Told to exit by CamDevice::StopTransfer() deleting the
++		// semaphores out from under us once the producer/DataPumpThread
++		// has stopped issuing new requests -- acquire_sem() on a deleted
++		// semaphore returns an error instead of blocking forever.
++		if (acquire_sem(fIsoBufferReady[cur]) != B_OK)
++			break;
++		if (!fTransferEnabled)
++			break;
++
++		// Deliberately not taking fLocker here: fDataInput is set once,
++		// before StartTransfer() is ever called (see UVCCamDevice's
++		// constructor), and never reassigned while streaming, so it
++		// needs no protection -- and the producer thread (DataPumpThread)
++		// holds fLocker for the full duration of its blocking
++		// IsochronousTransfer() call, so contending on the same lock here
++		// would serialize this thread behind that call and defeat the
++		// entire point of pipelining the two.
++		ssize_t len = fIsoTransferLen[cur];
++		if (len > 0 && fDataInput) {
++			int bufferIndex = 0;
++			for (int i = 0; i < fIsoNumPacketDescriptors; i++) {
++				int actualLength
++					= fIsoPacketDescriptors[cur][i].actual_length;
++				if (actualLength > 0) {
++					fDataInput->Write(&fIsoBuffer[cur][bufferIndex],
++						actualLength);
++				}
++				// Each packet occupies a fixed fIsoMaxPacketSize-sized
++				// slot in fIsoBuffer[cur] -- that's the stride the host
++				// controller used when writing the DMA buffer (laid out
++				// before actual per-packet lengths are known), not the
++				// variable actualLength. Advancing by actualLength
++				// instead drifts the read offset out of sync with the
++				// real data as soon as any packet returns less than
++				// requested (routine for isochronous transfers),
++				// scrambling every packet after it.
++				bufferIndex += fIsoMaxPacketSize;
++			}
++		}
++
++		release_sem(fIsoBufferFree[cur]);
++		cur = 1 - cur;
++	}
++	return 0;
++}
++
++
+ void
+ CamDevice::DumpRegs()
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+index f4847ef8ea..4e98227daa 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+@@ -152,6 +152,34 @@ class CamDevice {
+ 		size_t			fBufferLen;
+ 		BRect			fVideoFrame;
+ 		int fDumpFD;
++
++		// Isochronous capture is double-buffered AND kept genuinely
++		// pipelined at the USB scheduling level: DataPumpThread() uses
++		// BUSBEndpoint::QueueIsochronous()/WaitIsochronous() (a non-
++		// blocking submit + a separate blocking wait) to always have the
++		// *other* buffer's transfer still queued with the host
++		// controller while it waits for one buffer's transfer to
++		// complete, and requeues that buffer again immediately -- so
++		// there's never a moment with nothing queued, which is what lets
++		// EHCI schedule each submission to start right where the
++		// previous one's ends (see EHCI::SubmitIsochronous's
++		// fNextStartingFrame chaining) instead of leaving a schedule gap
++		// that costs real captured data on every single call. A separate
++		// thread (IsoConsumerThread) does the memcpy-/deframer-logic work
++		// of splitting each completed transfer's packets out to
++		// fDataInput, so that work never delays the next submission
++		// either.
++		bool			fIsoPipelineReady;
++		thread_id		fIsoConsumerThread;
++		sem_id			fIsoBufferReady[2];
++		sem_id			fIsoBufferFree[2];
++		uint8			*fIsoBuffer[2];
++		usb_iso_packet_descriptor *fIsoPacketDescriptors[2];
++		int				fIsoNumPacketDescriptors;
++		size_t			fIsoMaxPacketSize;
++		ssize_t			fIsoTransferLen[2];
++		int32			IsoConsumerThread();
++		static int32	_IsoConsumerThread(void *_this);
+ };
+ 
+ // the addon itself, that instanciate
 diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
 index 4be0934ed6..6cfc85bbf3 100644
 --- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
@@ -1082,7 +3623,7 @@ index 4be0934ed6..6cfc85bbf3 100644
  
  ## colorspace transforms sources
 diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
-index 13987ee472..cb216cb18b 100644
+index 13987ee472..7495951e2f 100644
 --- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
 +++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
 @@ -72,6 +72,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
@@ -1093,7 +3634,15 @@ index 13987ee472..cb216cb18b 100644
  	fDeframer = new UVCDeframer(this);
  	SetDataInput(fDeframer);
  
-@@ -191,6 +192,8 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+@@ -141,6 +142,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 			}
+ 		}
+ 	}
++
+ }
+ 
+ 
+@@ -191,6 +193,8 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
  			const usbvc_format_descriptor* descriptor
  				= (const usbvc_format_descriptor*)_descriptor;
  			fUncompressedFormatIndex = descriptor->formatIndex;
@@ -1102,23 +3651,187 @@ index 13987ee472..cb216cb18b 100644
  			printf("VS_FORMAT_UNCOMPRESSED:\tbFormatIdx=%d,#frmdesc=%d,guid=",
  				descriptor->formatIndex, descriptor->numFrameDescriptors);
  			print_guid(descriptor->uncompressed.format);
-@@ -1266,8 +1269,13 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+@@ -558,8 +562,22 @@ UVCCamDevice::StartTransfer()
+ status_t
+ UVCCamDevice::StopTransfer()
+ {
++	// CamDevice::StopTransfer() must run FIRST: it's what stops
++	// DataPumpThread and, in the isochronous case, blocks until every
++	// in-flight IsochronousTransfer()/QueueIsochronous() request is fully
++	// drained (see CamDevice.cpp -- with the pipeline keeping up to 2
++	// requests genuinely outstanding at once, there's essentially always
++	// one in flight while streaming). Calling _SelectIdleAlternate() --
++	// which resets the interface and tears down/recreates the underlying
++	// isochronous pipe -- before that drain has happened tears the pipe
++	// out from under whatever request(s) are still outstanding against
++	// it, which is exactly the scenario that produced a real "USB object
++	// did not become idle!" panic in Pipe::~Pipe()'s WaitForIdle() during
++	// testing: the pipe's reference count could never reach zero because
++	// a transfer nobody was tracking anymore was still holding it.
++	status_t status = CamDevice::StopTransfer();
+ 	_SelectIdleAlternate();
+-	return CamDevice::StopTransfer();
++	return status;
+ }
+ 
+ 
+@@ -606,7 +624,26 @@ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ 		const usb_video_frame_descriptor* descriptor
+ 			= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(i);
+ 		if ((*descriptor).width == width && (*descriptor).height == height) {
+-			fUncompressedFrameIndex = i;
++			// Store the descriptor's own UVC bFrameIndex (what
++			// _ProbeCommitFormat() sends to the camera in the probe/commit
++			// request), NOT the BList position i. These are different
++			// numbering schemes: list positions start at 0 in discovery
++			// order, UVC frame indices start at 1 in descriptor order. On
++			// this camera the list is [pos 0 = frame_index 1 (640x480),
++			// pos 1 = frame_index 2 (320x240)], so storing the position
++			// (1) for the 320x240 pick made the camera commit *its*
++			// frame_index 1 -- 640x480 -- and honestly stream 614400-byte
++			// frames (dwMaxVideoFrameSize in the commit response said
++			// exactly that all along) while everything host-side decoded
++			// 153600-byte 320x240 frames. Chopping a 640-wide stream into
++			// 320-wide rows renders every real row as two half-rows
++			// (the persistent "interlaced"/vertically-stretched look),
++			// and cutting 614400-byte frames at 153600 makes the frame
++			// phase advance by a quarter frame per displayed frame (the
++			// persistent vertical scroll) -- both of which survived every
++			// fix aimed at capture/deframing/display, because the bytes
++			// themselves were never wrong, only this index.
++			fUncompressedFrameIndex = descriptor->frame_index;
+ 			SetVideoFrame(BRect(0, 0, width - 1, height - 1));
+ 			return B_OK;
+ 		}
+@@ -1245,13 +1282,29 @@ UVCCamDevice::_SetParameterValue(uint16 wValue, int8 setValue)
+ status_t
+ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ {
+-	memset(buffer->Data(), 0, buffer->SizeAvailable());
++	// Deliberately NOT clearing the buffer up front anymore: the buffers
++	// rotate through a small group, so on any path that ends up not
++	// decoding fresh pixels into this one (frame dropped by the
++	// deframer, WaitFrame timeout, ...) the display now briefly repeats
++	// slightly-older content instead of flashing a solid black frame,
++	// which is what the old unconditional memset() produced.
+ 	status_t err = fDeframer->WaitFrame(2000000);
+ 	if (err < B_OK) {
+ 		fprintf(stderr, "WaitFrame: %" B_PRIx32 "\n", err);
+ 		return err;
+ 	}
+ 
++	// Latency: the deframer queues completed frames (up to 50!) and
++	// GetFrame() hands them out oldest-first, so whenever the camera
++	// produces faster than the media pipeline consumes, a backlog builds
++	// up and the on-screen image lags further and further behind
++	// reality. Drain the queue down to the newest frame: for every
++	// additional queued frame beyond the one whose semaphore count we
++	// just consumed, drop the current oldest and consume its count too,
++	// so the GetFrame() below always returns the most recent one.
++	while (fDeframer->WaitFrame(0) == B_OK)
++		fDeframer->DropFrame();
++
+ 	CamFrame* f;
+ 	err = fDeframer->GetFrame(&f, stamp);
+ 	if (err < B_OK) {
+@@ -1262,21 +1315,74 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ 	long int w = (long)(VideoFrame().right - VideoFrame().left + 1);
+ 	long int h = (long)(VideoFrame().bottom - VideoFrame().top + 1);
+ 
+-	if (buffer->SizeAvailable() >= (size_t)w * h * 4) {
++	// _DecodeYUY2()/_DecodeColor() read a fixed w*h*2 / w*h bytes from the
++	// captured frame; a frame the deframer hands back short would make
++	// them read past the end of the frame's actual buffer (a real
++	// segfault happened this way during bring-up). The deframer only
++	// emits exact-size frames for uncompressed formats these days, but
++	// keep the size gate anyway: skipping a frame (the buffer then
++	// retains its previous contents) is far better than reading out of
++	// bounds if a short one ever slips through again.
++	size_t srcSize = f->BufferLength();
++	size_t neededSize = fIsYUY2 ? (size_t)w * h * 2 : (size_t)w * h;
++
++	if (buffer->SizeAvailable() >= (size_t)w * h * 4 && srcSize >= neededSize) {
  		// TODO: The Video Producer only outputs B_RGB32.  This is OK for most
  		// applications.  This could be leveraged if applications can
  		// consume B_YUV422.
 -		_DecodeColor((unsigned char*)buffer->Data(),
 -			(unsigned char*)f->Buffer(), w, h);
++		//
++		// dstLen/srcLen are also passed all the way into the decoders
++		// themselves (not just checked here) as a hard backstop: this
++		// check alone was not enough to prevent a real out-of-bounds
++		// access inside _DecodeYUY2 (confirmed via a kernel panic --
++		// VMCache::InsertPage -- reading or writing outside one of these
++		// two buffers despite this check passing), so the decode loops
++		// now clamp themselves to whatever actually fits rather than
++		// trusting w*h to be consistent with the buffers' real sizes.
 +		if (fIsYUY2) {
 +			_DecodeYUY2((unsigned char*)buffer->Data(),
-+				(unsigned char*)f->Buffer(), w, h);
++				(unsigned char*)f->Buffer(), w, h,
++				buffer->SizeAvailable(), srcSize);
 +		} else {
 +			_DecodeColor((unsigned char*)buffer->Data(),
-+				(unsigned char*)f->Buffer(), w, h);
++				(unsigned char*)f->Buffer(), w, h,
++				buffer->SizeAvailable(), srcSize);
 +		}
  	}
  	delete f;
  	return B_OK;
-@@ -1349,6 +1357,49 @@ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+ }
+ 
+ 
++size_t
++UVCCamDevice::MaxRawFrameSize()
++{
++	// fMaxVideoFrameSize comes from the negotiated probe/commit response
++	// (_ProbeCommitFormat()) and was meant to be exact for uncompressed
++	// formats -- but diagnostic logging caught it stuck at 614400 (a
++	// 640x480 frame) while VideoFrame() and the actual stream were at
++	// 320x240 (real frame size 153600), a 4x mismatch. Whatever the exact
++	// cause (some path where StartTransfer()/_ProbeCommitFormat() ran
++	// against a different fUncompressedFrameIndex than the one
++	// AcceptVideoFrame() later settled VideoFrame() on), trusting that
++	// stale value made the deframer's frame-boundary backstop essentially
++	// never fire at the right point -- frames came out anywhere from ~1
++	// packet to ~3x the real expected size, never landing on it.
++	// Computing directly from VideoFrame() instead -- the same source
++	// FillFrameBuffer()/_DecodeYUY2() already use -- means the backstop
++	// can never disagree with what decode itself expects, regardless of
++	// what caused fMaxVideoFrameSize to drift.
++	long int width = (long)(VideoFrame().right - VideoFrame().left + 1);
++	long int height = (long)(VideoFrame().bottom - VideoFrame().top + 1);
++	if (width <= 0 || height <= 0)
++		return 0;
++	return fIsYUY2 ? (size_t)width * height * 2 : (size_t)width * height;
++}
++
++
+ void
+ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+-	int32 width, int32 height)
++	int32 width, int32 height, size_t dstLen, size_t srcLen)
+ {
+ 	long int i;
+ 	unsigned char* rawpt, * scanpt;
+@@ -1286,6 +1392,17 @@ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+ 	scanpt = dst;
+ 	size = width*height;
+ 
++	// Clamp to whatever both buffers actually have room for: the caller's
++	// w*h-based size check has been seen to pass while the real captured
++	// (srcLen) or destination (dstLen) buffer was smaller than w*h implies
++	// -- reading/writing past that crashed the kernel (VMCache::InsertPage)
++	// rather than just corrupting this one frame's pixels. A short frame
++	// this way, not a crash.
++	if ((size_t)size > srcLen)
++		size = (long int)srcLen;
++	if ((size_t)size * 3 > dstLen)
++		size = (long int)(dstLen / 3);
++
+ 	for ( i = 0; i < size; i++ ) {
+ 	if ( (i/width) % 2 == 0 ) {
+ 		if ( (i % 2) == 0 ) {
+@@ -1349,6 +1466,67 @@ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
  }
  
  
@@ -1135,12 +3848,30 @@ index 13987ee472..cb216cb18b 100644
 +
 +void
 +UVCCamDevice::_DecodeYUY2(unsigned char* dst, unsigned char* src,
-+	int32 width, int32 height)
++	int32 width, int32 height, size_t dstLen, size_t srcLen)
 +{
 +	// YUY2/YUYV packs 2 pixels into 4 bytes: Y0 U Y1 V (4:2:2 subsampling,
 +	// chroma shared between the pixel pair). B_RGB32 stores each pixel as
 +	// B, G, R, - in memory (little endian).
 +	int32 pixelPairs = (width * height) / 2;
++
++	// Clamp to whatever both buffers actually have room for (4 src bytes
++	// and 8 dst bytes per pixel pair). The caller's w*h-based size check
++	// has been seen to pass while the real captured (srcLen) or
++	// destination (dstLen) buffer was smaller than w*h implies -- reading
++	// or writing past that crashed the kernel (VMCache::InsertPage: an
++	// out-of-bounds access here, confirmed via a real panic during
++	// sustained capture) rather than just corrupting this one frame's
++	// pixels. Decoding fewer pixel pairs leaves the rest of dst at
++	// whatever FillFrameBuffer's memset(0) put there -- a partially
++	// black frame, not a crash.
++	int32 maxPairsBySrc = (int32)(srcLen / 4);
++	int32 maxPairsByDst = (int32)(dstLen / 8);
++	if (pixelPairs > maxPairsBySrc)
++		pixelPairs = maxPairsBySrc;
++	if (pixelPairs > maxPairsByDst)
++		pixelPairs = maxPairsByDst;
++
 +	for (int32 i = 0; i < pixelPairs; i++) {
 +		int y0 = src[0];
 +		int u = src[1] - 128;
@@ -1169,20 +3900,32 @@ index 13987ee472..cb216cb18b 100644
  
  UVCCamDeviceAddon::UVCCamDeviceAddon(WebCamMediaAddOn* webcam)
 diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
-index 9b60f38bfb..4d276ba3ac 100644
+index 9b60f38bfb..1113673319 100644
 --- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
 +++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
-@@ -49,6 +49,9 @@ private:
+@@ -35,6 +35,7 @@ public:
+ 									const void *value, size_t size);
+ 	virtual status_t			FillFrameBuffer(BBuffer *buffer,
+ 									bigtime_t *stamp = NULL);
++	virtual size_t				MaxRawFrameSize();
+ 
+ private:
+ 			void				_ParseVideoControl(
+@@ -48,7 +49,12 @@ private:
+ 			status_t			_SelectIdleAlternate();
  			void 				_DecodeColor(unsigned char *dst,
  									unsigned char *src, int32 width,
- 									int32 height);
+-									int32 height);
++									int32 height, size_t dstLen,
++									size_t srcLen);
 +			void				_DecodeYUY2(unsigned char *dst,
 +									unsigned char *src, int32 width,
-+									int32 height);
++									int32 height, size_t dstLen,
++									size_t srcLen);
  
  			void				_AddProcessingParameter(BParameterGroup* group,
  									int32 index,
-@@ -93,6 +96,7 @@ private:
+@@ -93,6 +99,7 @@ private:
  			float				fGain;
  
  			bool				fBinaryBacklightCompensation;
@@ -1191,49 +3934,363 @@ index 9b60f38bfb..4d276ba3ac 100644
  			int					fWBTempAuto;
  			int					fWBCompAuto;
 diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
-index de84f3840c..0d2d206b91 100644
+index de84f3840c..4008000ec0 100644
 --- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
 +++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
-@@ -62,6 +62,16 @@ UVCDeframer::Write(const void* buffer, size_t size)
- 		fFrames.AddItem(fCurrentFrame);
- 		release_sem(fFrameSem);
- 		fCurrentFrame = NULL;
-+
-+		// BMallocIO::SetSize(0) frees the backing buffer but does NOT reset
-+		// the write position, so without also seeking back to 0 here, every
-+		// subsequent frame's payload would keep appending after all prior
-+		// frames' data instead of starting fresh -- meaning FillFrameBuffer()
-+		// would always end up decoding the very first frame ever captured
-+		// (often a dark/black frame from the sensor's power-up/auto-exposure
-+		// ramp-up) and never anything newer.
-+		fInputBuffer.SetSize(0);
-+		fInputBuffer.Seek(0, SEEK_SET);
- 	}
+@@ -19,7 +19,9 @@
+ UVCDeframer::UVCDeframer(CamDevice* device)
+ 	: CamDeframer(device),
+ 	fFrameCount(0),
+-	fID(0)
++	fID(0),
++	fLastPacketFID(-1),
++	fResyncCount(0)
+ {
+ }
  
- 	return size;
-diff --git a/src/apps/installer/WorkerThread.cpp b/src/apps/installer/WorkerThread.cpp
-index c9aa19729a..11d1ca82e6 100644
---- a/src/apps/installer/WorkerThread.cpp
-+++ b/src/apps/installer/WorkerThread.cpp
-@@ -425,6 +425,63 @@ WorkerThread::_WriteBootSector(BPath &path)
+@@ -29,39 +31,159 @@ UVCDeframer::~UVCDeframer()
  }
  
  
 +void
++UVCDeframer::_EmitCurrentFrame()
++{
++	fFrameCount++;
++	const uint8* buf = (uint8*)fInputBuffer.Buffer();
++	fCurrentFrame->Write(buf, fInputBuffer.BufferLength());
++	fFrames.AddItem(fCurrentFrame);
++	release_sem(fFrameSem);
++	fCurrentFrame = NULL;
++
++	// BMallocIO::SetSize(0) frees the backing buffer but does NOT reset
++	// the write position, so without also seeking back to 0 here, every
++	// subsequent frame's payload would keep appending after all prior
++	// frames' data instead of starting fresh -- meaning FillFrameBuffer()
++	// would always end up decoding the very first frame ever captured
++	// (often a dark/black frame from the sensor's power-up/auto-exposure
++	// ramp-up) and never anything newer.
++	fInputBuffer.SetSize(0);
++	fInputBuffer.Seek(0, SEEK_SET);
++}
++
++
+ ssize_t
+ UVCDeframer::Write(const void* buffer, size_t size)
+ {
+ 	const uint8* buf = (const uint8*)buffer;
++
++	if (size < 2 || size < (size_t)buf[0]) {
++		// Malformed packet (shorter than its own declared header length) --
++		// nothing usable in it, and indexing buf[0]/buf[1] below would be
++		// out of bounds.
++		return size;
++	}
++
+ 	int payloadSize = size - buf[0]; // total length - header length
+-	
+-	// This packet is just a header
+-	if (size == buf[0])
+-		return 0;
+-	
+-	// Allocate frame
+-	if (!fCurrentFrame) {
+-		BAutolock l(fLocker);
+-		if (fFrames.CountItems() < MAXFRAMEBUF)
+-			fCurrentFrame = AllocFrame();
+-		else {
+-			printf("Dropped %ld bytes. Too many queued frames.)\n", size);
+-			return size;
++	const uint8* payload = &buf[buf[0]];
++
++	// For fixed-size (uncompressed) formats, frame the stream on the
++	// payload header's FID bit, validated by the known exact frame size.
++	//
++	// History: FID was previously written off as unreliable and framing
++	// was done purely by byte count -- but every observation backing
++	// that verdict was made while the camera was accidentally committed
++	// to 640x480 (a frame-index numbering bug in AcceptVideoFrame())
++	// while the host assembled/decoded 320x240, so *everything* looked
++	// broken. The raw header dumps from that period actually show FID
++	// stable across 60+ consecutive packets -- i.e. behaving correctly
++	// for the large real frames the camera was sending. With the commit
++	// fixed, FID toggles at the camera's true frame boundaries, which is
++	// exactly the anchor byte-count framing lacked: with pure byte
++	// count, every byte the camera drops mid-frame (this camera flags
++	// real data loss via the header ERR bit routinely) pulls the fixed
++	// 153600-byte window into the next frame, showing up on screen as
++	// vertical jumping/drift.
++	//
++	// So: accumulate payload until FID changes; at that boundary, emit
++	// the frame ONLY if it's exactly the expected size, and silently
++	// drop it otherwise (a dropped frame just leaves the previous one on
++	// screen -- far better than displaying a vertically-shifted one).
++	// If FID turns out broken after all (never toggling, or toggling so
++	// often nothing ever gets emitted), permanently fall back to the
++	// old pure byte-count framing rather than stalling the stream.
++	size_t maxFrameSize = fDevice != NULL ? fDevice->MaxRawFrameSize() : 0;
++
++	if (maxFrameSize > 0) {
++		int32 packetFID = buf[1] & 1;
++		bool boundary = fLastPacketFID >= 0 && packetFID != fLastPacketFID;
++		fLastPacketFID = packetFID;
++
++		// Hybrid framing: emit on exact byte count, realign on FID.
++		//
++		// In the steady state each frame's packets sum to exactly
++		// maxFrameSize, the last one triggers the emit below, and the
++		// accumulator is therefore always empty again by the time the
++		// next frame's first packet arrives with its toggled FID -- so
++		// leftover bytes at a FID boundary can mean only one thing: the
++		// previous frame lost data mid-stream and is short. Its bytes
++		// are unusable (wrong row phase); drop them so the new frame
++		// starts aligned at the camera's true frame start.
++		//
++		// Framing by byte count (rather than emitting whatever
++		// accumulated at the FID boundary) is what keeps this robust
++		// against FID *itself* being unreliable: if a whole frame is
++		// lost end-to-end, the FID sequence just doesn't visibly
++		// toggle (0,1,[lost 0],1,... reads as 1->1) -- with byte-count
++		// emission that's harmless, since the next frame still starts
++		// aligned and simply fills/emits as usual. An earlier version
++		// that trusted FID as the only frame terminator concluded from
++		// exactly that situation that FID was broken and permanently
++		// downgraded itself to unanchored byte framing -- which is why
++		// the picture used to hold steady at first and then, after the
++		// first fully-lost frame (~20s in), jump to a wrong vertical
++		// offset for good.
++		if (boundary && fInputBuffer.BufferLength() > 0) {
++			size_t have = fInputBuffer.BufferLength();
++			fResyncCount++;
++			fInputBuffer.SetSize(0);
++			fInputBuffer.Seek(0, SEEK_SET);
++			if ((fResyncCount & 31) == 1) {
++				debug_printf("usb_webcam deframer: dropped %" B_PRIuSIZE
++					"-byte partial frame at FID boundary (drop #%" B_PRIu32
++					", %" B_PRId32 " good frames so far)\n", have,
++					fResyncCount, fFrameCount);
++			}
++		}
++
++		if (payloadSize > 0) {
++			if (!fCurrentFrame) {
++				BAutolock l(fLocker);
++				if (fFrames.CountItems() < MAXFRAMEBUF)
++					fCurrentFrame = AllocFrame();
++				else {
++					printf("Dropped %ld bytes. Too many queued frames.)\n",
++						size);
++					return size;
++				}
++			}
++			fInputBuffer.Write(payload, payloadSize);
++
++			if (fInputBuffer.BufferLength() == maxFrameSize) {
++				_EmitCurrentFrame();
++			} else if (fInputBuffer.BufferLength() > maxFrameSize) {
++				// Only reachable when loss desynchronized us in a way
++				// no FID boundary has caught yet; discard and let the
++				// next boundary re-anchor.
++				fResyncCount++;
++				fInputBuffer.SetSize(0);
++				fInputBuffer.Seek(0, SEEK_SET);
++			}
+ 		}
++		return size;
+ 	}
+-	
+-	// Write payload to buffer
+-	fInputBuffer.Write(&buf[buf[0]], payloadSize);
+-	
+-	// If end of frame add frame to list of frames
+-	if ((buf[1] & 2) || (buf[1] & 1) != fID) {
++
++	// Compressed/unknown-size path: FID/EOF is all there is to go on.
++	// Per the UVC spec, a header-only (zero-payload) packet with the EOF
++	// bit set is a valid way for a camera to terminate a frame -- so this
++	// check must not be skipped just because payloadSize is 0.
++	if (payloadSize > 0) {
++		if (!fCurrentFrame) {
++			BAutolock l(fLocker);
++			if (fFrames.CountItems() < MAXFRAMEBUF)
++				fCurrentFrame = AllocFrame();
++			else {
++				printf("Dropped %ld bytes. Too many queued frames.)\n", size);
++				return size;
++			}
++		}
++		fInputBuffer.Write(payload, payloadSize);
++	}
++
++	if (fCurrentFrame != NULL && ((buf[1] & 2) || (buf[1] & 1) != fID)) {
+ 		fID = buf[1] & 1;
+-		fFrameCount++;
+-		buf = (uint8*)fInputBuffer.Buffer();
+-		fCurrentFrame->Write(buf, fInputBuffer.BufferLength());
+-		fFrames.AddItem(fCurrentFrame);
+-		release_sem(fFrameSem);
+-		fCurrentFrame = NULL;
++		_EmitCurrentFrame();
+ 	}
+ 
+ 	return size;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+index f642bafdc7..0c0c988624 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+@@ -21,10 +21,16 @@ public:
+ 
+ private:
+ 	void						_PrintBuffer(const void* buffer, size_t size);
++	void						_EmitCurrentFrame();
+ 
+ 	int32						fFrameCount;
+ 	int32						fID;
+ 	BMallocIO					fInputBuffer;
++
++	// Frame-phase resynchronization state for fixed-size (uncompressed)
++	// formats -- see Write() for the full story.
++	int32						fLastPacketFID;
++	uint32						fResyncCount;
+ };
+ 
+ #endif /* _UVC_DEFRAMER_H */
+diff --git a/src/apps/codycam/VideoConsumer.cpp b/src/apps/codycam/VideoConsumer.cpp
+index 5c56f60d0b..2095d2330b 100644
+--- a/src/apps/codycam/VideoConsumer.cpp
++++ b/src/apps/codycam/VideoConsumer.cpp
+@@ -63,6 +63,7 @@ VideoConsumer::VideoConsumer(const char* name, BView* view,
+ 	fMyLatency(20000),
+ 	fWindow(NULL),
+ 	fView(view),
++	fNextOwnBitmapIndex(0),
+ 	fOurBuffers(false),
+ 	fBuffers(NULL),
+ 	fTimeToFtp(false),
+@@ -570,9 +571,26 @@ VideoConsumer::HandleEvent(const media_timed_event* event, bigtime_t lateness,
+ 						index++;
+ 
+ 				if (index == 3) {
+-					// no, buffers belong to consumer
++					// The buffer belongs to the producer, not to one of
++					// our own fBitmap[]/fBufferMap[] slots (this is the
++					// normal case for this webcam producer, which always
++					// creates and owns its own BBufferGroup -- see
++					// VideoProducer::Connect()). Rotate through our 3
++					// bitmap slots here too, the same as the "our
++					// buffers" case below effectively does by construction
++					// (BBufferGroup handing back a different slot each
++					// time). Hardcoding index=0 here instead used the
++					// exact same single bitmap for every single frame,
++					// with no synchronization between the memcpy()
++					// below overwriting it and DrawBitmap() further down
++					// still reading it for the *previous* frame -- a
++					// real tearing race, confirmed to produce a
++					// persistent, loss-independent combing/torn look
++					// that survived every capture-pipeline-level fix
++					// attempted today.
+ 					fOurBuffers = false;
+-					index = 0;
++					index = fNextOwnBitmapIndex;
++					fNextOwnBitmapIndex = (fNextOwnBitmapIndex + 1) % 3;
+ 				}
+ 
+ 				if (fFtpComplete && fTimeToFtp) {
+@@ -611,7 +629,43 @@ VideoConsumer::HandleEvent(const media_timed_event* event, bigtime_t lateness,
+ 								*p = (*p >> 3) & 0x1f1f1f1f;
+ 						}
+ 
+-						fView->DrawBitmap(fBitmap[index], fView->Bounds());
++						// DrawBitmap(bitmap, destRect) stretches the source
++						// to exactly fill destRect with no regard for
++						// its own aspect ratio. Passing fView->Bounds()
++						// directly stretched every captured frame (e.g.
++						// 320x240, 4:3) to whatever shape the view
++						// happens to be (commonly wider/narrower than
++						// 4:3), distorting the image -- most noticeably
++						// as a vertical stretch when the view is taller
++						// relative to its width than the source frame.
++						// Letterbox/pillarbox into the largest
++						// same-aspect-ratio rect centered in the view
++						// instead, so the image is scaled but never
++						// distorted.
++						BRect viewBounds = fView->Bounds();
++						BRect bitmapBounds = fBitmap[index]->Bounds();
++						float destRect_width = viewBounds.Width();
++						float destRect_height = viewBounds.Height();
++						if (bitmapBounds.Width() > 0
++							&& bitmapBounds.Height() > 0
++							&& viewBounds.Width() > 0
++							&& viewBounds.Height() > 0) {
++							float bitmapAspect = bitmapBounds.Width()
++								/ bitmapBounds.Height();
++							float viewAspect = viewBounds.Width()
++								/ viewBounds.Height();
++							if (viewAspect > bitmapAspect)
++								destRect_width = viewBounds.Height() * bitmapAspect;
++							else if (viewAspect < bitmapAspect)
++								destRect_height = viewBounds.Width() / bitmapAspect;
++						}
++						BRect destRect(0, 0, destRect_width - 1,
++							destRect_height - 1);
++						destRect.OffsetBy(
++							(viewBounds.Width() - destRect_width) / 2.0f,
++							(viewBounds.Height() - destRect_height) / 2.0f);
++
++						fView->DrawBitmap(fBitmap[index], destRect);
+ 						fWindow->Unlock();
+ 					}
+ 				}
+diff --git a/src/apps/codycam/VideoConsumer.h b/src/apps/codycam/VideoConsumer.h
+index 0416e1cd4e..67393b831d 100644
+--- a/src/apps/codycam/VideoConsumer.h
++++ b/src/apps/codycam/VideoConsumer.h
+@@ -137,6 +137,7 @@ private:
+ 			BWindow*			fWindow;
+ 			BView*				fView;
+ 			BBitmap*			fBitmap[3];
++			uint32				fNextOwnBitmapIndex;
+ 			bool				fOurBuffers;
+ 			BBufferGroup*		fBuffers;
+ 			BBuffer*			fBufferMap[3];
+diff --git a/src/apps/installer/WorkerThread.cpp b/src/apps/installer/WorkerThread.cpp
+index c9aa19729a..96c50f90bd 100644
+--- a/src/apps/installer/WorkerThread.cpp
++++ b/src/apps/installer/WorkerThread.cpp
+@@ -425,6 +425,80 @@ WorkerThread::_WriteBootSector(BPath &path)
+ }
+ 
+ 
++status_t
 +WorkerThread::_MarkPartitionActive(partition_id partitionID)
 +{
 +	BDiskDevice device;
 +	BPartition* partition;
 +	if (fDDRoster.GetPartitionWithID(partitionID, &device, &partition)
 +			!= B_OK) {
-+		return;
++		return B_ERROR;
++	}
++
++	// The disk device manager won't commit a partition-table change --
++	// including the active flag -- against a live, mounted partition. By
++	// this point in the install (called after _LaunchFinishScript(), the
++	// last thing that still needs the target mounted and writable) there's
++	// nothing left needing the mount, so drop it to actually allow this to
++	// succeed instead of silently failing every time.
++	if (partition->IsMounted()) {
++		status_t unmountStatus = partition->Unmount();
++		if (unmountStatus != B_OK) {
++			fprintf(stderr, "WorkerThread::_MarkPartitionActive(): failed "
++				"to unmount target partition: %s\n",
++				strerror(unmountStatus));
++			return unmountStatus;
++		}
 +	}
 +
 +	if (!partition->CanEditParameters())
-+		return;
++		return B_NOT_SUPPORTED;
 +
 +	if (device.PrepareModifications() != B_OK)
-+		return;
++		return B_ERROR;
 +
 +	status_t status = partition->SetParameters("active true");
 +	if (status == B_OK)
@@ -1245,6 +4302,7 @@ index c9aa19729a..11d1ca82e6 100644
 +		fprintf(stderr, "WorkerThread::_MarkPartitionActive(): failed to "
 +			"mark partition active: %s\n", strerror(status));
 +	}
++	return status;
 +}
 +
 +
@@ -1279,29 +4337,129 @@ index c9aa19729a..11d1ca82e6 100644
  status_t
  WorkerThread::_LaunchFinishScript(BPath &path)
  {
-@@ -702,6 +759,9 @@ WorkerThread::_PerformInstall(partition_id sourcePartitionID,
+@@ -706,6 +780,25 @@ WorkerThread::_PerformInstall(partition_id sourcePartitionID,
  	if (err != B_OK)
  		return _InstallationError(err);
  
-+	_MarkPartitionActive(targetPartitionID);
-+	_WriteMBRBootCode(targetPartitionID);
++	// Only overwrite the MBR boot code if the active flag actually got set
++	// on the target partition -- generic MBR code with no active partition
++	// to jump to leaves the disk completely unbootable (no boot loader ever
++	// runs, not even to show the boot options menu, since the BIOS-level
++	// MBR stage never hands off to it). _MarkPartitionActive() unmounts the
++	// target first (nothing past this point still needs it mounted) since
++	// the disk device manager won't commit a partition-table change against
++	// a live, mounted partition. If unmounting or marking active still
++	// doesn't work out, leave whatever boot setup was already on the disk
++	// alone rather than risk bricking it.
++	if (_MarkPartitionActive(targetPartitionID) == B_OK)
++		_WriteMBRBootCode(targetPartitionID);
++	else {
++		fprintf(stderr, "WorkerThread::_PerformInstall(): could not mark "
++			"the target partition active, skipping MBR boot code write -- "
++			"you may need to run `writembr` manually if the disk doesn't "
++			"boot\n");
++	}
 +
- 	err = _LaunchFinishScript(targetDirectory);
- 	if (err != B_OK)
- 		return _InstallationError(err);
+ 	fOwner.SendMessage(MSG_INSTALL_FINISHED);
+ 	return B_OK;
+ }
 diff --git a/src/apps/installer/WorkerThread.h b/src/apps/installer/WorkerThread.h
-index 6156d5ece5..8fd4ba39a6 100644
+index 6156d5ece5..6aa280af88 100644
 --- a/src/apps/installer/WorkerThread.h
 +++ b/src/apps/installer/WorkerThread.h
 @@ -42,6 +42,8 @@ public:
  
  private:
  			status_t			_WriteBootSector(BPath& path);
-+			void				_MarkPartitionActive(partition_id partitionID);
++			status_t			_MarkPartitionActive(partition_id partitionID);
 +			void				_WriteMBRBootCode(partition_id partitionID);
  			status_t			_LaunchFinishScript(BPath& path);
  
  			status_t			_PerformInstall(partition_id sourcePartitionID,
+diff --git a/src/kits/device/USBEndpoint.cpp b/src/kits/device/USBEndpoint.cpp
+index fd0d629f67..c07874ea8d 100644
+--- a/src/kits/device/USBEndpoint.cpp
++++ b/src/kits/device/USBEndpoint.cpp
+@@ -217,6 +217,61 @@ BUSBEndpoint::IsochronousTransfer(void *data, size_t length,
+ }
+ 
+ 
++int32
++BUSBEndpoint::QueueIsochronous(void *data, size_t length,
++	usb_iso_packet_descriptor *packetDescriptors, uint32 packetCount) const
++{
++	// Submits like IsochronousTransfer(), but returns immediately with a
++	// request ID instead of blocking for completion -- pair with
++	// WaitIsochronous() to actually retrieve the result later. Doing this
++	// lets a caller have two isochronous transfers genuinely outstanding
++	// with the host controller at once (queue both, then wait on each),
++	// which matters specifically for isochronous IN: the schedule gap
++	// between one blocking IsochronousTransfer() call and the next costs
++	// real captured data on every single call (see
++	// EHCI::SubmitIsochronous()'s fNextStartingFrame chaining, which only
++	// kicks in when the next request is queued before the previous one
++	// completes).
++	if (length > 0 && data == NULL)
++		return B_BAD_VALUE;
++
++	usb_raw_command command;
++	command.isochronous.interface = fInterface->Index();
++	command.isochronous.endpoint = fIndex;
++	command.isochronous.data = data;
++	command.isochronous.length = length;
++	command.isochronous.packet_descriptors = packetDescriptors;
++	command.isochronous.packet_count = packetCount;
++	command.isochronous.request_id = -1;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_QUEUE_ISOCHRONOUS, &command,
++		sizeof(command)) || command.isochronous.status != B_USB_RAW_STATUS_SUCCESS)
++		return B_ERROR;
++
++	return command.isochronous.request_id;
++}
++
++
++ssize_t
++BUSBEndpoint::WaitIsochronous(int32 requestID) const
++{
++	// Blocks for the completion of a transfer previously started with
++	// QueueIsochronous(), identified by the request ID it returned. The
++	// packet descriptors passed to that QueueIsochronous() call are
++	// updated in place with the results, exactly as IsochronousTransfer()
++	// would have updated them.
++	usb_raw_command command;
++	memset(&command, 0, sizeof(command));
++	command.isochronous.request_id = requestID;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_WAIT_ISOCHRONOUS, &command,
++		sizeof(command)) || command.isochronous.status != B_USB_RAW_STATUS_SUCCESS)
++		return B_ERROR;
++
++	return command.isochronous.length;
++}
++
++
+ bool
+ BUSBEndpoint::IsStalled() const
+ {
+diff --git a/src/kits/device/USBInterface.cpp b/src/kits/device/USBInterface.cpp
+index 229894b5bb..909e8e811d 100644
+--- a/src/kits/device/USBInterface.cpp
++++ b/src/kits/device/USBInterface.cpp
+@@ -229,6 +229,13 @@ BUSBInterface::SetAlternate(uint32 alternateIndex)
+ 		sizeof(command)) || command.alternate.status != B_USB_RAW_STATUS_SUCCESS)
+ 		return B_ERROR;
+ 
++	// _UpdateDescriptorAndEndpoints() re-fetches the descriptor/endpoint list
++	// using fAlternate, so it must reflect the alternate setting that was
++	// just actually activated on the device -- otherwise EndpointAt() keeps
++	// returning endpoints from whatever alternate this object was
++	// constructed with (typically 0, the zero-bandwidth idle setting for
++	// isochronous interfaces), even though the hardware itself did switch.
++	fAlternate = alternateIndex;
+ 	_UpdateDescriptorAndEndpoints();
+ 	return B_OK;
+ }
 diff --git a/src/kits/storage/sniffer/RPattern.cpp b/src/kits/storage/sniffer/RPattern.cpp
 index 814f369e99..fe504b2b72 100644
 --- a/src/kits/storage/sniffer/RPattern.cpp
@@ -1479,7 +4637,7 @@ index 948b9b4d6f..aa10189865 100644
  
  #endif	// AUTOCONFIG_LOOPER_H
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 68acf3f830..9bc4ca148c 100644
+index 68acf3f830..ba9f052a86 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
 @@ -379,6 +379,10 @@ smp_init_other_cpus(void)
@@ -1501,93 +4659,245 @@ index 68acf3f830..9bc4ca148c 100644
  
  		// set this stack up
  		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
-@@ -462,8 +467,20 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -422,15 +427,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+ 				/ sizeof(uint32)) - 1;
+ 		*tempStack = (uint32)entryFunc;
  
- 		// wait for pending to end
- 		TRACE(("wait for delivery\n"));
+-		// set the trampoline stack up
+-		tempStack = (uint32 *)(trampolineStack + B_PAGE_SIZE - 4);
+-		// final location of the stack
+-		*tempStack = ((uint32)finalStack) + KERNEL_STACK_SIZE
+-			+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE - sizeof(uint32);
+-		tempStack--;
+-		// page dir
+-		*tempStack = x86_read_cr3() & 0xfffff000;
+-
+ 		// put a gdt descriptor at the bottom of the stack
+ 		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT
+ 		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;
+@@ -444,78 +440,163 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+ 		set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
+ 			DPL_KERNEL);
+ 
+-		/* clear apic errors */
+-		if (gKernelArgs.arch_args.cpu_apic_version[i] & 0xf0) {
+-			apic_write(APIC_ERROR_STATUS, 0);
+-			apic_read(APIC_ERROR_STATUS);
+-		}
++		// Some APs (observed with the HT sibling of the Atom Z520, which
++		// takes no visible action on the first INIT+SIPI sequence) start
++		// only on a repeated attempt -- so instead of giving up after one
++		// shot, run the whole INIT/SIPI/wait sequence up to a few times.
++		// Every wait stays bounded, so a core that's truly unresponsive
++		// (or disabled by the firmware despite being listed in the MADT)
++		// still only costs a couple of seconds before being skipped
++		// instead of hanging the boot forever.
++		const uint32 kStartupAttempts = 3;
++		bool started = false;
++		for (uint32 attempt = 0; attempt < kStartupAttempts && !started;
++			attempt++) {
++			startupFailed = false;
++
++			// (Re)set the trampoline stack up. Rewritten on every attempt
++			// in case a previous, seemingly-failed attempt actually
++			// consumed the values just after the wait below expired.
++			tempStack = (uint32 *)(trampolineStack + B_PAGE_SIZE - 4);
++			// final location of the stack
++			*tempStack = ((uint32)finalStack) + KERNEL_STACK_SIZE
++				+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE - sizeof(uint32);
++			tempStack--;
++			// page dir
++			*tempStack = x86_read_cr3() & 0xfffff000;
++
++			/* clear apic errors */
++			if (gKernelArgs.arch_args.cpu_apic_version[i] & 0xf0) {
++				apic_write(APIC_ERROR_STATUS, 0);
++				apic_read(APIC_ERROR_STATUS);
++			}
+ 
+-		/* send (aka assert) INIT IPI */
+-		TRACE(("assert INIT\n"));
+-		config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
+-			| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
+-		apic_write(APIC_INTR_COMMAND_2, config); /* set target pe */
+-		config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
+-			| APIC_TRIGGER_MODE_LEVEL | APIC_INTR_COMMAND_1_ASSERT
+-			| APIC_DELIVERY_MODE_INIT;
+-		apic_write(APIC_INTR_COMMAND_1, config);
+-
+-		// wait for pending to end
+-		TRACE(("wait for delivery\n"));
 -		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
 -			asm volatile ("pause;");
-+		{
-+			uint32 deliveryTimeout = kIPIDeliveryTimeout;
-+			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
-+				&& --deliveryTimeout != 0) {
-+				asm volatile ("pause;");
-+			}
-+			if (deliveryTimeout == 0) {
-+				dprintf("smp: timeout sending INIT IPI to cpu %" B_PRIu32
-+					" (apic id %u), skipping it\n", i,
-+					gKernelArgs.arch_args.cpu_apic_id[i]);
-+				gKernelArgs.num_cpus = i;
-+				break;
-+			}
-+		}
- 
- 		/* deassert INIT */
- 		TRACE(("deassert INIT\n"));
-@@ -476,8 +493,20 @@ smp_boot_other_cpus(void (*entryFunc)(void))
- 
- 		// wait for pending to end
- 		TRACE(("wait for delivery\n"));
+-
+-		/* deassert INIT */
+-		TRACE(("deassert INIT\n"));
+-		config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
+-			| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
+-		apic_write(APIC_INTR_COMMAND_2, config);
+-		config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
+-			| APIC_TRIGGER_MODE_LEVEL | APIC_DELIVERY_MODE_INIT;
+-		apic_write(APIC_INTR_COMMAND_1, config);
+-
+-		// wait for pending to end
+-		TRACE(("wait for delivery\n"));
 -		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
 -			asm volatile ("pause;");
-+		{
-+			uint32 deliveryTimeout = kIPIDeliveryTimeout;
-+			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
-+				&& --deliveryTimeout != 0) {
-+				asm volatile ("pause;");
-+			}
-+			if (deliveryTimeout == 0) {
-+				dprintf("smp: timeout deasserting INIT IPI to cpu %" B_PRIu32
-+					" (apic id %u), skipping it\n", i,
-+					gKernelArgs.arch_args.cpu_apic_id[i]);
-+				gKernelArgs.num_cpus = i;
-+				break;
-+			}
-+		}
+-
+-		/* wait 10ms */
+-		spin(10000);
+-
+-		/* is this a local apic or an 82489dx ? */
+-		numStartups = (gKernelArgs.arch_args.cpu_apic_version[i] & 0xf0)
+-			? 2 : 0;
+-		TRACE(("num startups = %d\n", numStartups));
+-
+-		for (j = 0; j < numStartups; j++) {
+-			/* it's a local apic, so send STARTUP IPIs */
+-			TRACE(("send STARTUP\n"));
+-			apic_write(APIC_ERROR_STATUS, 0);
+-
+-			/* set target pe */
++			/* send (aka assert) INIT IPI */
++			TRACE(("assert INIT\n"));
+ 			config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
+ 				| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
+-			apic_write(APIC_INTR_COMMAND_2, config);
+-
+-			/* send the IPI */
+-			config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff0f800)
+-				| APIC_DELIVERY_MODE_STARTUP | (trampolineCode >> 12);
++			apic_write(APIC_INTR_COMMAND_2, config); /* set target pe */
++			config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
++				| APIC_TRIGGER_MODE_LEVEL | APIC_INTR_COMMAND_1_ASSERT
++				| APIC_DELIVERY_MODE_INIT;
+ 			apic_write(APIC_INTR_COMMAND_1, config);
  
- 		/* wait 10ms */
- 		spin(10000);
-@@ -506,16 +535,41 @@ smp_boot_other_cpus(void (*entryFunc)(void))
- 			spin(200);
+-			/* wait */
+-			spin(200);
++			// wait for pending to end
++			TRACE(("wait for delivery\n"));
++			{
++				uint32 deliveryTimeout = kIPIDeliveryTimeout;
++				while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS)
++						!= 0 && --deliveryTimeout != 0) {
++					asm volatile ("pause;");
++				}
++				if (deliveryTimeout == 0) {
++					dprintf("smp: timeout sending INIT IPI to cpu %" B_PRIu32
++						" (apic id %u), attempt %" B_PRIu32 "\n", i,
++						gKernelArgs.arch_args.cpu_apic_id[i], attempt + 1);
++					startupFailed = true;
++					continue;
++				}
++			}
  
++			/* deassert INIT */
++			TRACE(("deassert INIT\n"));
++			config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
++				| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
++			apic_write(APIC_INTR_COMMAND_2, config);
++			config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
++				| APIC_TRIGGER_MODE_LEVEL | APIC_DELIVERY_MODE_INIT;
++			apic_write(APIC_INTR_COMMAND_1, config);
++
++			// wait for pending to end
  			TRACE(("wait for delivery\n"));
 -			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
-+			uint32 deliveryTimeout = kIPIDeliveryTimeout;
-+			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
-+				&& --deliveryTimeout != 0) {
- 				asm volatile ("pause;");
+-				asm volatile ("pause;");
++			{
++				uint32 deliveryTimeout = kIPIDeliveryTimeout;
++				while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS)
++						!= 0 && --deliveryTimeout != 0) {
++					asm volatile ("pause;");
++				}
++				if (deliveryTimeout == 0) {
++					dprintf("smp: timeout deasserting INIT IPI to cpu %"
++						B_PRIu32 " (apic id %u), attempt %" B_PRIu32 "\n", i,
++						gKernelArgs.arch_args.cpu_apic_id[i], attempt + 1);
++					startupFailed = true;
++					continue;
++				}
 +			}
-+			if (deliveryTimeout == 0) {
-+				dprintf("smp: timeout sending STARTUP IPI to cpu %" B_PRIu32
-+					" (apic id %u), skipping it\n", i,
-+					gKernelArgs.arch_args.cpu_apic_id[i]);
-+				startupFailed = true;
-+				break;
-+			}
-+		}
 +
-+		if (startupFailed) {
-+			gKernelArgs.num_cpus = i;
-+			break;
++			/* wait 10ms */
++			spin(10000);
++
++			/* is this a local apic or an 82489dx ? */
++			numStartups = (gKernelArgs.arch_args.cpu_apic_version[i] & 0xf0)
++				? 2 : 0;
++			TRACE(("num startups = %d\n", numStartups));
++
++			for (j = 0; j < numStartups; j++) {
++				/* it's a local apic, so send STARTUP IPIs */
++				TRACE(("send STARTUP\n"));
++				apic_write(APIC_ERROR_STATUS, 0);
++
++				/* set target pe */
++				config = (apic_read(APIC_INTR_COMMAND_2)
++						& APIC_INTR_COMMAND_2_MASK)
++					| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
++				apic_write(APIC_INTR_COMMAND_2, config);
++
++				/* send the IPI */
++				config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff0f800)
++					| APIC_DELIVERY_MODE_STARTUP | (trampolineCode >> 12);
++				apic_write(APIC_INTR_COMMAND_1, config);
++
++				/* wait */
++				spin(200);
++
++				TRACE(("wait for delivery\n"));
++				uint32 deliveryTimeout = kIPIDeliveryTimeout;
++				while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS)
++						!= 0 && --deliveryTimeout != 0) {
++					asm volatile ("pause;");
++				}
++				if (deliveryTimeout == 0) {
++					dprintf("smp: timeout sending STARTUP IPI to cpu %"
++						B_PRIu32 " (apic id %u), attempt %" B_PRIu32 "\n", i,
++						gKernelArgs.arch_args.cpu_apic_id[i], attempt + 1);
++					startupFailed = true;
++					break;
++				}
++			}
++
++			if (startupFailed)
++				continue;
++
++			// Wait for the trampoline code to clear the final stack
++			// location. This serves as a notification for us that it has
++			// loaded the address and it is safe for us to overwrite it to
++			// trampoline the next CPU.
++			tempStack++;
++			{
++				uint32 startupTimeoutMs = kApStartupTimeoutMs;
++				while (*tempStack != 0 && --startupTimeoutMs != 0)
++					spin(1000);
++				if (startupTimeoutMs == 0) {
++					dprintf("smp: cpu %" B_PRIu32 " (apic id %u) did not "
++						"respond within %" B_PRIu32 " ms (attempt %" B_PRIu32
++						" of %" B_PRIu32 ")\n", i,
++						gKernelArgs.arch_args.cpu_apic_id[i],
++						kApStartupTimeoutMs, attempt + 1, kStartupAttempts);
++					startupFailed = true;
++				} else
++					started = true;
++			}
  		}
  
- 		// Wait for the trampoline code to clear the final stack location.
- 		// This serves as a notification for us that it has loaded the address
- 		// and it is safe for us to overwrite it to trampoline the next CPU.
- 		tempStack++;
+-		// Wait for the trampoline code to clear the final stack location.
+-		// This serves as a notification for us that it has loaded the address
+-		// and it is safe for us to overwrite it to trampoline the next CPU.
+-		tempStack++;
 -		while (*tempStack != 0)
 -			spin(1000);
-+		{
-+			uint32 startupTimeoutMs = kApStartupTimeoutMs;
-+			while (*tempStack != 0 && --startupTimeoutMs != 0)
-+				spin(1000);
-+			if (startupTimeoutMs == 0) {
-+				dprintf("smp: cpu %" B_PRIu32 " (apic id %u) did not respond "
-+					"within %" B_PRIu32 " ms, skipping it\n", i,
-+					gKernelArgs.arch_args.cpu_apic_id[i], kApStartupTimeoutMs);
-+				gKernelArgs.num_cpus = i;
-+				break;
-+			}
++		if (!started) {
++			dprintf("smp: cpu %" B_PRIu32 " (apic id %u) failed to start "
++				"after %" B_PRIu32 " attempts, skipping it\n", i,
++				gKernelArgs.arch_args.cpu_apic_id[i], kStartupAttempts);
++			gKernelArgs.num_cpus = i;
++			break;
 +		}
  	}
  
