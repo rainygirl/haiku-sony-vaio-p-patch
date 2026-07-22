@@ -1,5 +1,5 @@
 diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
-index f558fb184c..f1a8e54a47 100644
+index 4d35b2958e..4e153059ca 100644
 --- a/build/jam/DefaultBuildProfiles
 +++ b/build/jam/DefaultBuildProfiles
 @@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
@@ -85,6 +85,24 @@ index ae768e4be9..66a8159c6e 100644
  	;
  
  if $(TARGET_ARCH) = x86 || $(TARGET_ARCH) = x86_64 {
+diff --git a/data/launch/user b/data/launch/user
+index d15a4d19e3..7aa9e8f44d 100644
+--- a/data/launch/user
++++ b/data/launch/user
+@@ -32,6 +32,13 @@ target desktop {
+ 		no_safemode
+ 	}
+ 
++	service x-vnd.Haiku-bluetooth_server {
++		launch /system/servers/bluetooth_server
++		no_safemode
++		on initial_volumes_mounted
++		requires x-vnd.Be-TSKB
++	}
++
+ 	job user-bootscript {
+ 		launch /bin/sh ~/config/settings/boot/UserBootscript
+ 	}
 diff --git a/data/system/data/firmware/intel-ucode/06-1c-02 b/data/system/data/firmware/intel-ucode/06-1c-02
 new file mode 100644
 index 0000000000..db30b527ac
@@ -113,6 +131,28 @@ index 1e82f83f5a..2a7e7e556b 100644
  		// These are convenience methods for getting and clearing the halt
  		// state of an endpoint. They use the control pipe of the device to
  		// send the corresponding requests.
+diff --git a/headers/private/kernel/kernel.h b/headers/private/kernel/kernel.h
+index 0a48f79d48..1e53afc3a0 100644
+--- a/headers/private/kernel/kernel.h
++++ b/headers/private/kernel/kernel.h
+@@ -89,8 +89,15 @@ is_user_address_range(const void* addr, size_t size)
+ 
+ 
+ #define CHECK_BIT(a, b) ((a) & (1 << (b)))
+-#define SET_BIT(a, b) ((a) | (1 << (b)))
+-#define CLEAR_BIT(a, b) ((a) & (~(1 << (b))))
++// SET_BIT/CLEAR_BIT take a bitmask in `b` (not a bit index), matching
++// GET_BIT/TOGGLE_BIT below -- their only caller (the h2 Bluetooth USB
++// transport driver) passes pre-shifted bt_transport_status_t constants
++// like RUNNING = (1<<1). The previous "(1 << (b))" definitions silently
++// shifted an already-shifted mask a second time, so e.g. SET_BIT(state,
++// RUNNING) set bit 0x4 while GET_BIT(state, RUNNING) checked bit 0x2 --
++// the RUNNING flag could never be observed as set once it was "set".
++#define SET_BIT(a, b) ((a) | (b))
++#define CLEAR_BIT(a, b) ((a) & (~(b)))
+ #define GET_BIT(a, b) ((a & b) != 0)
+ #define TOGGLE_BIT(a, b) (a ^= b)
+ 
 diff --git a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
 index d3ceae1c5d..c1dc30408c 100644
 --- a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
@@ -446,10 +486,10 @@ index bc264e8aa1..853ef490ce 100644
  		result = defaultPipe->SendRequest(
  			USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_OUT,	// type
 diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
-index e335e09054..40735fa886 100644
+index e335e09054..1d481b8865 100644
 --- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
 +++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
-@@ -15,6 +15,23 @@
+@@ -15,6 +15,39 @@
  #include <algorithm>
  
  
@@ -469,11 +509,27 @@ index e335e09054..40735fa886 100644
 +// power-good delays).
 +static const uint8 kMaxPortPowerCycleAttempts = 2;
 +
++// After a port exhausts every retry and power-cycle attempt, it isn't
++// written off forever right away: a *fresh* connection event arriving after
++// this cooldown earns it another full round of attempts, up to
++// kMaxPortRearms times. Rationale (observed on the Sony VAIO P): an
++// internal device can be electrically present but unresponsive early in
++// boot simply because the EC hasn't powered its logic yet -- the port then
++// burns through all its attempts and, if ignored permanently, the device
++// never gets another chance even though it connects perfectly fine once
++// its power request goes through seconds later. The cooldown plus the
++// fresh-connection requirement keeps the original pathology (a dead device
++// bouncing several times a second, flooding the bus with doomed resets)
++// bounded: at worst one re-arm per cooldown window, permanently quiet
++// after kMaxPortRearms.
++static const bigtime_t kPortIgnoreCooldown = 5000000;
++static const uint8 kMaxPortRearms = 3;
++
 +
  Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
  	usb_device_descriptor &desc, int8 deviceAddress, usb_speed speed,
  	bool isRootHub, void *controllerCookie)
-@@ -25,8 +42,12 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
+@@ -25,8 +58,13 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
  	TRACE("creating hub\n");
  
  	memset(&fHubDescriptor, 0, sizeof(fHubDescriptor));
@@ -482,12 +538,13 @@ index e335e09054..40735fa886 100644
  		fChildren[i] = NULL;
 +		fFailedAttempts[i] = 0;
 +		fPowerCycleAttempts[i] = 0;
-+		fPermanentlyIgnored[i] = false;
++		fIgnoredUntil[i] = 0;
++		fRearmCount[i] = 0;
 +	}
  
  	if (!fInitOK) {
  		TRACE_ERROR("device failed to initialize\n");
-@@ -195,11 +216,43 @@ Hub::DisablePort(uint8 index)
+@@ -195,11 +233,67 @@ Hub::DisablePort(uint8 index)
  }
  
  
@@ -525,13 +582,37 @@ index e335e09054..40735fa886 100644
  Hub::Explore(change_item **changeList)
  {
  	for (int32 i = 0; i < fHubDescriptor.num_ports; i++) {
-+		if (fPermanentlyIgnored[i])
-+			continue;
++		if (fIgnoredUntil[i] != 0) {
++			if (fIgnoredUntil[i] == B_INFINITE_TIMEOUT
++					|| system_time() < fIgnoredUntil[i]) {
++				continue;
++			}
++
++			// The cooldown has expired. Only a fresh connection event --
++			// something actually changed electrically since we gave up,
++			// e.g. an EC power request finally bringing an internal
++			// device properly alive -- earns the port another chance; a
++			// stale "still connected, still broken" state does not.
++			// (Reading the status doesn't clear change bits, so falling
++			// through to the normal handling below still sees them.)
++			if (UpdatePortStatus(i) < B_OK
++					|| (fPortStatus[i].change & PORT_STATUS_CONNECTION) == 0) {
++				continue;
++			}
++
++			fRearmCount[i]++;
++			fIgnoredUntil[i] = 0;
++			fFailedAttempts[i] = 0;
++			fPowerCycleAttempts[i] = 0;
++			TRACE_ALWAYS("port %" B_PRId32 ": new connection event after "
++				"cooldown, giving the port another chance (%u of %u)\n", i,
++				fRearmCount[i], kMaxPortRearms);
++		}
 +
  		status_t result = UpdatePortStatus(i);
  		if (result < B_OK)
  			continue;
-@@ -214,7 +267,9 @@ Hub::Explore(change_item **changeList)
+@@ -214,7 +308,9 @@ Hub::Explore(change_item **changeList)
  		}
  #endif
  
@@ -542,7 +623,7 @@ index e335e09054..40735fa886 100644
  				|| ((fPortStatus[i].status & PORT_STATUS_CONNECTION)
  					&& fChildren[i] == NULL)) {
  			// clear status change
-@@ -222,7 +277,22 @@ Hub::Explore(change_item **changeList)
+@@ -222,7 +318,22 @@ Hub::Explore(change_item **changeList)
  				USB_REQUEST_CLEAR_FEATURE, C_PORT_CONNECTION, i + 1,
  				0, NULL, 0, NULL);
  
@@ -566,7 +647,7 @@ index e335e09054..40735fa886 100644
  				// new device attached!
  				TRACE_ALWAYS("port %" B_PRId32 ": new device connected\n", i);
  
-@@ -299,6 +369,8 @@ Hub::Explore(change_item **changeList)
+@@ -299,6 +410,8 @@ Hub::Explore(change_item **changeList)
  					if (newDevice) {
  						newDevice->Changed(changeList, true);
  						fChildren[i] = newDevice;
@@ -575,7 +656,7 @@ index e335e09054..40735fa886 100644
  						break;
  					} else {
  						// the device failed to setup correctly, disable the
-@@ -307,6 +379,45 @@ Hub::Explore(change_item **changeList)
+@@ -307,6 +420,53 @@ Hub::Explore(change_item **changeList)
  						DisablePort(i);
  					}
  				}
@@ -601,17 +682,25 @@ index e335e09054..40735fa886 100644
 +								"failures, power-cycled the port (attempt "
 +								"%u), retrying\n", i,
 +								fPowerCycleAttempts[i]);
++						} else if (fRearmCount[i] < kMaxPortRearms) {
++							// Stop touching this port instead of re-arming
++							// on every physical bounce (which keeps
++							// costing boot time and disrupting other
++							// USB/PCI traffic for a recovery that hasn't
++							// worked) -- but leave the door open: a fresh
++							// connection event after the cooldown earns it
++							// another chance. See kPortIgnoreCooldown
++							// above for why (devices whose power arrives
++							// only after the first enumeration attempts
++							// have already failed and been given up on).
++							fIgnoredUntil[i] = system_time()
++								+ kPortIgnoreCooldown;
++							TRACE_ALWAYS("port %" B_PRId32 ": giving up "
++								"after repeated setup failures, ignoring "
++								"until a new connection event after "
++								"cooldown\n", i);
 +						} else {
-+							// VAIO P personal quirk: this unit has an
-+							// internal device on this port that has never,
-+							// across many boots, gotten past address
-+							// assignment -- not even a power cycle helps.
-+							// Stop touching this port for the rest of this
-+							// boot instead of re-arming on every physical
-+							// bounce, which otherwise keeps costing boot
-+							// time and disrupting other USB/PCI traffic for
-+							// a recovery that's never once worked.
-+							fPermanentlyIgnored[i] = true;
++							fIgnoredUntil[i] = B_INFINITE_TIMEOUT;
 +							TRACE_ALWAYS("port %" B_PRId32 ": giving up after "
 +								"repeated setup failures, ignoring for the "
 +								"rest of this boot\n", i);
@@ -621,7 +710,7 @@ index e335e09054..40735fa886 100644
  			} else {
  				// Device removed...
  				TRACE_ALWAYS("port %" B_PRId32 ": device removed\n", i);
-@@ -315,6 +426,14 @@ Hub::Explore(change_item **changeList)
+@@ -315,6 +475,15 @@ Hub::Explore(change_item **changeList)
  					fChildren[i]->Changed(changeList, false);
  					fChildren[i] = NULL;
  				}
@@ -633,11 +722,12 @@ index e335e09054..40735fa886 100644
 +				// give a previously given-up port a fresh start here.
 +				fFailedAttempts[i] = 0;
 +				fPowerCycleAttempts[i] = 0;
++				fRearmCount[i] = 0;
  			}
  		}
  
 diff --git a/src/add-ons/kernel/bus_managers/usb/usb_private.h b/src/add-ons/kernel/bus_managers/usb/usb_private.h
-index 81f5137c83..d7a74d11f2 100644
+index 81f5137c83..a2cca2eff2 100644
 --- a/src/add-ons/kernel/bus_managers/usb/usb_private.h
 +++ b/src/add-ons/kernel/bus_managers/usb/usb_private.h
 @@ -657,6 +657,7 @@ virtual	status_t						GetDescriptor(uint8 descriptorType,
@@ -648,13 +738,14 @@ index 81f5137c83..d7a74d11f2 100644
  
  		void							Explore(change_item **changeList);
  static	void							InterruptCallback(void *cookie,
-@@ -683,6 +684,9 @@ private:
+@@ -683,6 +684,10 @@ private:
  		usb_port_status					fInterruptStatus[USB_MAX_PORT_COUNT];
  		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];
  		Device *						fChildren[USB_MAX_PORT_COUNT];
 +		uint8							fFailedAttempts[USB_MAX_PORT_COUNT];
 +		uint8							fPowerCycleAttempts[USB_MAX_PORT_COUNT];
-+		bool							fPermanentlyIgnored[USB_MAX_PORT_COUNT];
++		bigtime_t						fIgnoredUntil[USB_MAX_PORT_COUNT];
++		uint8							fRearmCount[USB_MAX_PORT_COUNT];
  };
  
  
@@ -861,10 +952,10 @@ index a5eea1f28f..270a2d649c 100644
  
  
 diff --git a/src/add-ons/kernel/busses/usb/uhci.cpp b/src/add-ons/kernel/busses/usb/uhci.cpp
-index 227cac1c87..93d13ee93b 100644
+index 227cac1c87..bdf70c14d4 100644
 --- a/src/add-ons/kernel/busses/usb/uhci.cpp
 +++ b/src/add-ons/kernel/busses/usb/uhci.cpp
-@@ -508,8 +508,13 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+@@ -508,8 +508,14 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  		fDevice(device),
  		fStack(stack),
  		fEnabledInterrupts(0),
@@ -872,13 +963,37 @@ index 227cac1c87..93d13ee93b 100644
 +		fControllerGaveUpOnHalts(false),
 +		fLastHaltTime(0),
 +		fHaltRecoveryCount(0),
++		fLateRecoveryCount(0),
  		fFrameArea(-1),
  		fFrameList(NULL),
 +		fFrameListPhysical(0),
  		fFrameBandwidth(NULL),
  		fFirstIsochronousDescriptor(NULL),
  		fLastIsochronousDescriptor(NULL),
-@@ -585,6 +590,8 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+@@ -565,8 +571,20 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 	WriteReg16(UHCI_USBINTR, 0);
+ 
+ 	// make sure we gain control of the UHCI controller instead of the BIOS
+-	fPci->write_pci_config(fDevice, PCI_LEGSUP, 2, PCI_LEGSUP_USBPIRQDEN
+-		| PCI_LEGSUP_CLEAR_SMI);
++	// -- except on Intel SCH (Poulsbo/US15W) companions: they don't
++	// implement the USBLEGSUP config register at 0xC0 at all, and writing
++	// there corrupts the controller's transfer engine in bizarre ways --
++	// schedules run but TDs execute wrong (ActLen stuck at 0x7ff, transfers
++	// trampling memory past their buffers) and no device ever enumerates.
++	// The coreboot/SeaBIOS port to this chipset hit the exact same thing:
++	// https://www.seabios.org/pipermail/seabios/2012-August/004327.html
++	// There's no USB legacy support to take over there anyway.
++	bool isPoulsbo = fPCIInfo->vendor_id == 0x8086
++		&& fPCIInfo->device_id >= 0x8114 && fPCIInfo->device_id <= 0x8116;
++	if (!isPoulsbo) {
++		fPci->write_pci_config(fDevice, PCI_LEGSUP, 2, PCI_LEGSUP_USBPIRQDEN
++			| PCI_LEGSUP_CLEAR_SMI);
++	}
+ 
+ 	// do a global and host reset
+ 	GlobalReset();
+@@ -585,6 +603,8 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  		return;
  	}
  
@@ -887,7 +1002,62 @@ index 227cac1c87..93d13ee93b 100644
  	// Set base pointer and reset frame number
  	WriteReg32(UHCI_FRBASEADD, (uint32)physicalAddress);
  	WriteReg16(UHCI_FRNUM, 0);
-@@ -1495,6 +1502,44 @@ UHCI::FinishTransfers()
+@@ -778,8 +798,16 @@ UHCI::Start()
+ 	TRACE("usbcmd reg 0x%04x, usbsts reg 0x%04x\n",
+ 		ReadReg16(UHCI_USBCMD), ReadReg16(UHCI_USBSTS));
+ 
+-	// Set the run bit in the command register
+-	WriteReg16(UHCI_USBCMD, ReadReg16(UHCI_USBCMD) | UHCI_USBCMD_RS);
++	// Set the run bit in the command register. Also set the Configure Flag
++	// and 64-byte reclamation packet size, matching what Linux's uhci-hcd
++	// programs on every start: CF is nominally informational per the UHCI
++	// spec, but this driver's schedule was observed never being fetched at
++	// all on Intel SCH (Poulsbo) companions -- frame counter running, bus
++	// mastering enabled, zero memory cycles issued -- and CF is one of the
++	// few programming differences from a known-working driver on that
++	// hardware.
++	WriteReg16(UHCI_USBCMD, ReadReg16(UHCI_USBCMD) | UHCI_USBCMD_RS
++		| UHCI_USBCMD_CF | UHCI_USBCMD_MAXP);
+ 
+ 	bool running = false;
+ 	for (int32 i = 0; i < 10; i++) {
+@@ -1486,7 +1514,34 @@ void
+ UHCI::FinishTransfers()
+ {
+ 	while (!fStopThreads) {
+-		if (acquire_sem(fFinishTransfersSem) < B_OK)
++		if (fControllerGaveUpOnHalts && fLateRecoveryCount < 3) {
++			// The controller was given up on after re-halting in a tight
++			// loop -- but that loop can be caused by interaction with a
++			// device that simply wasn't powered yet (observed on the Sony
++			// VAIO P: its EC powers the internal Bluetooth module only
++			// ~10 seconds into the boot, and enumeration attempts against
++			// the half-powered module are what halted the controller in
++			// the first place). Interrupts are off in this state, so no
++			// sem will ever arrive on its own; instead wait out a
++			// cooldown and then grant the controller one more recovery.
++			// If it immediately re-halts, the tight-loop counter above
++			// puts it right back here -- at most 3 late retries total.
++			status_t status = acquire_sem_etc(fFinishTransfersSem, 1,
++				B_RELATIVE_TIMEOUT, 5000000);
++			if (status == B_TIMED_OUT) {
++				fLateRecoveryCount++;
++				fControllerGaveUpOnHalts = false;
++				fControllerHalted = false;
++				fHaltRecoveryCount = 0;
++				TRACE_ALWAYS("halt recovery: giving the given-up "
++					"controller another chance after cooldown (late "
++					"attempt %" B_PRId32 " of 3)\n", fLateRecoveryCount);
++				RecoverFromHalt();
++				continue;
++			}
++			if (status < B_OK)
++				continue;
++		} else if (acquire_sem(fFinishTransfersSem) < B_OK)
+ 			continue;
+ 
+ 		// eat up sems that have been released by multiple interrupts
+@@ -1495,6 +1550,44 @@ UHCI::FinishTransfers()
  		if (semCount > 0)
  			acquire_sem_etc(fFinishTransfersSem, semCount, B_RELATIVE_TIMEOUT, 0);
  
@@ -932,7 +1102,7 @@ index 227cac1c87..93d13ee93b 100644
  		if (!Lock())
  			continue;
  
-@@ -1862,6 +1907,91 @@ UHCI::ControllerReset()
+@@ -1862,6 +1955,91 @@ UHCI::ControllerReset()
  }
  
  
@@ -1024,7 +1194,7 @@ index 227cac1c87..93d13ee93b 100644
  status_t
  UHCI::GetPortStatus(uint8 index, usb_port_status *status)
  {
-@@ -2059,10 +2189,15 @@ UHCI::Interrupt()
+@@ -2059,10 +2237,15 @@ UHCI::Interrupt()
  
  	if (status & UHCI_USBSTS_HCHALT) {
  		TRACE_MODULE_ERROR("host controller halted\n");
@@ -1043,7 +1213,7 @@ index 227cac1c87..93d13ee93b 100644
  	}
  
 diff --git a/src/add-ons/kernel/busses/usb/uhci.h b/src/add-ons/kernel/busses/usb/uhci.h
-index a6db03bb30..52b1baa508 100644
+index a6db03bb30..1338a653e1 100644
 --- a/src/add-ons/kernel/busses/usb/uhci.h
 +++ b/src/add-ons/kernel/busses/usb/uhci.h
 @@ -122,6 +122,7 @@ private:
@@ -1054,7 +1224,7 @@ index a6db03bb30..52b1baa508 100644
  
  		// Interrupt functions
  static	int32						InterruptHandler(void *data);
-@@ -212,10 +213,15 @@ inline	uint32						ReadReg32(uint32 reg);
+@@ -212,10 +213,16 @@ inline	uint32						ReadReg32(uint32 reg);
  		pci_device*					fDevice;
  		Stack *						fStack;
  		uint32						fEnabledInterrupts;
@@ -1062,6 +1232,7 @@ index a6db03bb30..52b1baa508 100644
 +		bool						fControllerGaveUpOnHalts;
 +		bigtime_t					fLastHaltTime;
 +		int32						fHaltRecoveryCount;
++		int32						fLateRecoveryCount;
  
  		// Frame list memory
  		area_id						fFrameArea;
@@ -4253,10 +4424,18 @@ index 0416e1cd4e..67393b831d 100644
  			BBufferGroup*		fBuffers;
  			BBuffer*			fBufferMap[3];
 diff --git a/src/apps/installer/WorkerThread.cpp b/src/apps/installer/WorkerThread.cpp
-index c9aa19729a..96c50f90bd 100644
+index c9aa19729a..bbc7ca1fca 100644
 --- a/src/apps/installer/WorkerThread.cpp
 +++ b/src/apps/installer/WorkerThread.cpp
-@@ -425,6 +425,80 @@ WorkerThread::_WriteBootSector(BPath &path)
+@@ -8,6 +8,7 @@
+ 
+ #include <errno.h>
+ #include <stdio.h>
++#include <unistd.h>
+ 
+ #include <set>
+ #include <string>
+@@ -425,6 +426,95 @@ WorkerThread::_WriteBootSector(BPath &path)
  }
  
  
@@ -4301,7 +4480,16 @@ index c9aa19729a..96c50f90bd 100644
 +	if (status != B_OK) {
 +		fprintf(stderr, "WorkerThread::_MarkPartitionActive(): failed to "
 +			"mark partition active: %s\n", strerror(status));
++		return status;
 +	}
++
++	// _WriteMBRBootCode() opens the same raw device again right after this
++	// and does its own read-modify-write of the MBR sector through a
++	// completely separate path (an external `writembr` process, bypassing
++	// the disk device manager entirely) -- flush the active-flag write
++	// through to the physical device first so that read can't observe a
++	// stale copy of the sector.
++	sync();
 +	return status;
 +}
 +
@@ -4331,13 +4519,19 @@ index c9aa19729a..96c50f90bd 100644
 +		fprintf(stderr, "WorkerThread::_WriteMBRBootCode(): failed to write "
 +			"MBR boot code on %s\n", devicePath.Path());
 +	}
++
++	// Make sure this write is durable on disk before the installer reports
++	// success and the user restarts -- a hard power-off between here and
++	// some later, unrelated flush shouldn't be able to leave the MBR
++	// half-written.
++	sync();
 +}
 +
 +
  status_t
  WorkerThread::_LaunchFinishScript(BPath &path)
  {
-@@ -706,6 +780,25 @@ WorkerThread::_PerformInstall(partition_id sourcePartitionID,
+@@ -706,6 +796,25 @@ WorkerThread::_PerformInstall(partition_id sourcePartitionID,
  	if (err != B_OK)
  		return _InstallationError(err);
  
@@ -4504,6 +4698,267 @@ index 529552d371..ffa95d38a0 100644
  	/* NB: unlocked read should be ok */
  	if (TAILQ_FIRST(&st->st_entry) == NULL) {
  		IEEE80211_DPRINTF(vap, IEEE80211_MSG_SCAN,
+diff --git a/src/preferences/bluetooth/BluetoothMain.cpp b/src/preferences/bluetooth/BluetoothMain.cpp
+index 1c5457cbdd..8dfff1f211 100644
+--- a/src/preferences/bluetooth/BluetoothMain.cpp
++++ b/src/preferences/bluetooth/BluetoothMain.cpp
+@@ -10,17 +10,36 @@
+ #include <Roster.h>
+ #include <private/interface/AboutWindow.h>
+ 
++#include <bluetooth/LocalDevice.h>
++
+ #include "BluetoothMain.h"
+ #include "BluetoothWindow.h"
+ #include "defs.h"
+ 
++using namespace Bluetooth;
++
++// bluetooth_server registering as "running" with the app roster only means
++// its team exists -- it says nothing about whether ReadyToRun() has
++// actually finished its (fully async, message-queue-driven)
++// StartMonitoringDevice() device discovery and populated its local device
++// list yet. Opening the main window the instant IsRunning() flips true
++// races that discovery: click "Add" fast enough after "Launch now" and
++// LocalDevice::GetLocalDevice() comes back NULL even though the server
++// would have found the (perfectly healthy) local device a moment later.
++// Keep retrying until a device actually shows up, not just until the team
++// exists, but give up after a bounded number of tries so a machine that
++// genuinely has no Bluetooth hardware doesn't hang here forever -- it
++// still gets the existing "no support" message once the window opens.
++static const int32 kMaxReadyRetries = 10;
++
+ 
+ #undef B_TRANSLATION_CONTEXT
+ #define B_TRANSLATION_CONTEXT "main"
+ 
+ BluetoothApplication::BluetoothApplication()
+ 	:
+-	BApplication(BLUETOOTH_APP_SIGNATURE)
++	BApplication(BLUETOOTH_APP_SIGNATURE),
++	fReadyRetries(0)
+ {
+ }
+ 
+@@ -74,15 +93,29 @@ BluetoothApplication::MessageReceived(BMessage* message)
+ 			break;
+ 
+ 		case 'Xtmp':
++		{
++			uint32 deviceCount = LocalDevice::GetLocalDeviceCount();
++
+ 			if (!be_roster->IsRunning(BLUETOOTH_SIGNATURE)) {
+ 				// Give another chance
+ 				BMessageRunner::StartSending(be_app_messenger,
+ 					new BMessage('Xtmp'), 2 * 1000000, 1);
++			} else if (deviceCount == 0
++					&& fReadyRetries < kMaxReadyRetries) {
++				// The server team exists, but it hasn't necessarily
++				// finished its own async device discovery yet (see the
++				// comment above kMaxReadyRetries) -- keep waiting for an
++				// actual local device rather than opening the window on
++				// nothing but the team's existence.
++				fReadyRetries++;
++				BMessageRunner::StartSending(be_app_messenger,
++					new BMessage('Xtmp'), 2 * 1000000, 1);
+ 			} else {
+ 				fWindow = new BluetoothWindow(BRect(100, 100, 750, 420));
+ 				fWindow->Show();
+ 			}
+ 			break;
++		}
+ 
+ 		default:
+ 			BApplication::MessageReceived(message);
+diff --git a/src/preferences/bluetooth/BluetoothMain.h b/src/preferences/bluetooth/BluetoothMain.h
+index 5d76dd4fdc..fb8caf8850 100644
+--- a/src/preferences/bluetooth/BluetoothMain.h
++++ b/src/preferences/bluetooth/BluetoothMain.h
+@@ -19,6 +19,7 @@ public:
+ 
+ private:
+ 	BluetoothWindow*	fWindow;
++	int32				fReadyRetries;
+ };
+ 
+ #endif
+diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
+index fbe3763a06..9b8f95e2b5 100644
+--- a/src/servers/bluetooth/BluetoothServer.cpp
++++ b/src/servers/bluetooth/BluetoothServer.cpp
+@@ -150,6 +150,11 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 					lDeviceImpl->GetID());
+ 			} else {
+ 				TRACE_BT("BluetoothServer: Adding LocalDevice hci id invalid\n");
++				// Never added to fLocalDevicesList, so nothing will ever
++				// delete it either -- and calling Launch() on a delegate
++				// that never got a usable file descriptor is pointless.
++				delete lDeviceImpl;
++				break;
+ 			}
+ 
+ 			status = B_WOULD_BLOCK;
+@@ -458,9 +463,8 @@ status_t
+ BluetoothServer::HandleSimpleRequest(BMessage* message, BMessage* reply)
+ {
+ 	LocalDeviceImpl* lDeviceImpl = LocateDelegateFromMessage(message);
+-	if (lDeviceImpl == NULL) {
++	if (lDeviceImpl == NULL)
+ 		return B_ERROR;
+-	}
+ 
+ 	const char* propertyRequested;
+ 
+@@ -477,11 +481,13 @@ BluetoothServer::HandleSimpleRequest(BMessage* message, BMessage* reply)
+ 	// we are gonna need issue the command ...
+ 	if (lDeviceImpl->ProcessSimpleRequest(DetachCurrentMessage()) == B_OK)
+ 		return B_WOULD_BLOCK;
+-	else {
+-		lDeviceImpl->Unregister();
+-		return B_ERROR;
+-	}
+ 
++	// A single failed HCI command used to permanently Unregister() (and
++	// delete) this local device -- disproportionate, since LocalDevice's
++	// constructor fires six of these back to back right after
++	// acquisition, so one transient failure wiped the device for good.
++	// Fail just this one request; leave the device registered.
++	return B_ERROR;
+ }
+ 
+ 
+diff --git a/src/servers/bluetooth/HCITransportAccessor.cpp b/src/servers/bluetooth/HCITransportAccessor.cpp
+index 19c4fdd9ff..9952c73f2f 100644
+--- a/src/servers/bluetooth/HCITransportAccessor.cpp
++++ b/src/servers/bluetooth/HCITransportAccessor.cpp
+@@ -4,25 +4,34 @@
+  */
+ 
+ 
++#include <errno.h>
++
+ #include <String.h>
+ 
+ #include "BluetoothServer.h"
+ #include "HCITransportAccessor.h"
+ 
+ 
+-HCITransportAccessor::HCITransportAccessor(BPath* path) : HCIDelegate(path)
++HCITransportAccessor::HCITransportAccessor(BPath* path)
++	:
++	HCIDelegate(path),
++	fPath(*path)
+ {
+ 	status_t status;
+ 
+ 	fDescriptor = open (path->Path(), O_RDWR);
+-	if (fDescriptor > 0) {
++	// debug_printf(), not printf() -- bluetooth_server is a GUI app with
++	// no controlling terminal, so printf() never reaches syslog.
++	if (fDescriptor >= 0) {
+ 		// find out which ID was assigned
+ 		status = ioctl(fDescriptor, GET_HCI_ID, &fIdentifier, 0);
+-		printf("%s: hid retrieved %" B_PRIx32 " status=%" B_PRId32 "\n",
+-			__FUNCTION__, fIdentifier, status);
++		debug_printf("%s: opened %s fd=%d, hid retrieved %" B_PRIx32
++			" status=%" B_PRId32 "\n", __FUNCTION__, path->Path(),
++			fDescriptor, fIdentifier, status);
+ 	} else {
+-		printf("%s: Device driver %s could not be opened %" B_PRId32 "\n",
+-			__FUNCTION__, path->Path(), fIdentifier);
++		debug_printf("%s: Device driver %s could not be opened, errno=%"
++			B_PRId32 " (%s)\n", __FUNCTION__, path->Path(), (int32)errno,
++			strerror(errno));
+ 		fIdentifier = B_ERROR;
+ 	}
+ 
+@@ -31,7 +40,7 @@ HCITransportAccessor::HCITransportAccessor(BPath* path) : HCIDelegate(path)
+ 
+ HCITransportAccessor::~HCITransportAccessor()
+ {
+-	if (fDescriptor > 0) {
++	if (fDescriptor >= 0) {
+ 		close(fDescriptor);
+ 		fDescriptor = -1;
+ 		fIdentifier = B_ERROR;
+@@ -39,6 +48,41 @@ HCITransportAccessor::~HCITransportAccessor()
+ }
+ 
+ 
++status_t
++HCITransportAccessor::_Reopen()
++{
++	// An EC-driven wireless kill switch (e.g. the VAIO P's) can disable
++	// the USB port the Bluetooth module hangs off, killing the fd opened
++	// at BT_MSG_ADD_DEVICE time -- IssueCommand() then fails with EBADF
++	// forever, even after the switch flips back and the device
++	// reattaches, since nothing otherwise reopens the node. Retry against
++	// the same devfs path and bring the transport back up with BT_UP,
++	// since device_open() resets driver state to not-running.
++	if (fDescriptor >= 0) {
++		close(fDescriptor);
++		fDescriptor = -1;
++	}
++
++	fDescriptor = open(fPath.Path(), O_RDWR);
++	if (fDescriptor < 0) {
++		debug_printf("%s: reopen of %s failed, errno=%d (%s)\n", __FUNCTION__,
++			fPath.Path(), errno, strerror(errno));
++		fIdentifier = B_ERROR;
++		return B_ERROR;
++	}
++
++	status_t status = ioctl(fDescriptor, GET_HCI_ID, &fIdentifier, 0);
++	debug_printf("%s: reopened %s fd=%d hid=%" B_PRIx32 " status=%" B_PRId32
++		"\n", __FUNCTION__, fPath.Path(), fDescriptor, fIdentifier, status);
++	if (status != B_OK) {
++		fIdentifier = B_ERROR;
++		return B_ERROR;
++	}
++
++	return Launch();
++}
++
++
+ status_t
+ HCITransportAccessor::IssueCommand(raw_command rc, size_t size)
+ {
+@@ -52,7 +96,12 @@ for (uint16 index = 0 ; index < size; index++ ) {
+ printf("### \n");
+ */
+ 
+-	return ioctl(fDescriptor, ISSUE_BT_COMMAND, rc, size);
++	status_t result = ioctl(fDescriptor, ISSUE_BT_COMMAND, rc, size);
++
++	if (result < 0 && errno == EBADF && _Reopen() == B_OK)
++		result = ioctl(fDescriptor, ISSUE_BT_COMMAND, rc, size);
++
++	return result;
+ }
+ 
+ 
+@@ -61,5 +110,4 @@ HCITransportAccessor::Launch() {
+ 
+ 	uint32 dummy;
+ 	return ioctl(fDescriptor, BT_UP, &dummy, sizeof(uint32));
+-
+ }
+diff --git a/src/servers/bluetooth/HCITransportAccessor.h b/src/servers/bluetooth/HCITransportAccessor.h
+index 3d8d3b9c49..c8059de8ec 100644
+--- a/src/servers/bluetooth/HCITransportAccessor.h
++++ b/src/servers/bluetooth/HCITransportAccessor.h
+@@ -20,7 +20,10 @@ class HCITransportAccessor : public HCIDelegate {
+ 		status_t IssueCommand(raw_command rc, size_t size);
+ 		status_t Launch();
+ 	private:
+-		int fDescriptor;		
++		status_t _Reopen();
++
++		BPath fPath;
++		int fDescriptor;
+ };
+ 
+ #endif
 diff --git a/src/servers/launch/Job.cpp b/src/servers/launch/Job.cpp
 index b696c48674..c28656d18e 100644
 --- a/src/servers/launch/Job.cpp
@@ -5028,15 +5483,23 @@ index 5fab87c231..60fabc372d 100644
  		return;
  
 diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
-index 45e7fb785a..a8044f3faa 100644
+index 45e7fb785a..277f055149 100644
 --- a/src/system/kernel/fs/vfs_boot.cpp
 +++ b/src/system/kernel/fs/vfs_boot.cpp
-@@ -477,6 +477,17 @@ vfs_mount_boot_file_system(kernel_args* args)
+@@ -477,6 +477,25 @@ vfs_mount_boot_file_system(kernel_args* args)
  	if (status < B_OK) {
  		panic("get_boot_partitions failed!");
  	}
 +
-+	const int32 kBootPartitionRetries = 40;
++	// 10 seconds wasn't always enough on hardware whose USB host controller
++	// needs multiple halt/recovery cycles (each with its own settle delays)
++	// before the boot device's own enumeration gets a chance to complete --
++	// e.g. an unrelated device sharing the same controller repeatedly
++	// halting it during early boot, with each recovery attempt, port
++	// power-cycle, and cooldown-based rearm adding several more seconds on
++	// top of each other. Give it up to a minute before concluding the boot
++	// device really isn't going to show up.
++	const int32 kBootPartitionRetries = 240;
 +	const bigtime_t kBootPartitionRetryInterval = 250000;
 +	for (int32 i = 0; partitions.IsEmpty() && i < kBootPartitionRetries; i++) {
 +		snooze(kBootPartitionRetryInterval);
