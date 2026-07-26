@@ -32,18 +32,32 @@ index 4d35b2958e..4e153059ca 100644
  			AddHaikuImageSourcePackages
  				nano
 diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
-index 05d216de78..f9870064e4 100644
+index cb649a080c..5974d85d23 100644
 --- a/build/jam/images/definitions/regular
 +++ b/build/jam/images/definitions/regular
-@@ -336,6 +336,7 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
+@@ -336,6 +336,21 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
  
  SYSTEM_ADD_ONS_DRIVERS_POWER += [ FFilterByBuildFeatures
  	acpi_battery@x86,x86_64
++	# VAIO P: acpi_ac and acpi_lid are built (their Jamfiles are
++	# SubIncluded, and `jam acpi_ac`/`jam acpi_lid` compile them fine) but
++	# were never actually part of the standard nightly image -- neither
++	# was in this list upstream. Confirmed via a diagnostic build: this
++	# unit's DSDT has a completely ordinary \_SB.AC (HID ACPI0003) right
++	# next to \_SB.BAT0, discovered identically by the ACPI namespace walk
++	# (both showed up in the enumeration log with correct HIDs), but
++	# acpi_ac_support() itself was never once called -- not a device-
++	# manager matching bug, just the driver add-on not being in the image
++	# at all. Added here alongside battery/lid so AC-adapter and lid-
++	# switch status are actually available (e.g. to PowerStatus, or to a
++	# future auto power-saving-on-battery policy).
++	acpi_ac@x86,x86_64
++	acpi_lid@x86,x86_64
 +	sony_ec@x86,x86_64
  ] ;
  
  SYSTEM_ADD_ONS_FILE_SYSTEMS +=
-@@ -385,3 +386,14 @@ AddDirectoryToHaikuImage home config settings touchpad ;
+@@ -385,3 +400,14 @@ AddDirectoryToHaikuImage home config settings touchpad ;
  local shortcutsSettingsFile = <settings>shortcuts_settings ;
  SEARCH on $(shortcutsSettingsFile) = [ FDirName $(HAIKU_TOP) data settings ] ;
  AddFilesToHaikuImage home config settings : $(shortcutsSettingsFile) ;
@@ -59,7 +73,7 @@ index 05d216de78..f9870064e4 100644
 +AddFilesToHaikuImage system non-packaged data firmware intel-ucode
 +	: $(vaioPUcodeFile) ;
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index ae768e4be9..66a8159c6e 100644
+index 46fcc37cca..1f9c747248 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
 @@ -102,10 +102,22 @@ AddFilesToPackage add-ons kernel interrupt_controllers :
@@ -105,8 +119,294 @@ index d15a4d19e3..7aa9e8f44d 100644
  	}
 diff --git a/data/system/data/firmware/intel-ucode/06-1c-02 b/data/system/data/firmware/intel-ucode/06-1c-02
 new file mode 100644
-index 0000000000..db30b527ac
-Binary files /dev/null and b/data/system/data/firmware/intel-ucode/06-1c-02 differ
+index 0000000000000000000000000000000000000000..db30b527acac77bd773d7b83acbf60c82743debc
+GIT binary patch
+literal 15360
+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
+
+literal 0
+HcmV?d00001
+
 diff --git a/headers/os/device/USBKit.h b/headers/os/device/USBKit.h
 index 1e82f83f5a..2a7e7e556b 100644
 --- a/headers/os/device/USBKit.h
@@ -216,10 +516,10 @@ index ab68836056..f88332b1a0 100644
      return_ACPI_STATUS (Status);
  }
 diff --git a/src/add-ons/kernel/bus_managers/pci/pci.cpp b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-index 5bfe169d68..00b660976a 100644
+index c966e6d934..215e94198c 100644
 --- a/src/add-ons/kernel/bus_managers/pci/pci.cpp
 +++ b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-@@ -1564,13 +1564,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1616,13 +1616,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -253,7 +553,7 @@ index 5bfe169d68..00b660976a 100644
  	status_t status = (*info->controller->read_pci_config)(info->controller_cookie,
  		bus, device, function, offset, size, value);
  	if (status != B_OK) {
-@@ -1617,13 +1635,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1669,13 +1687,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -1881,10 +2181,10 @@ index 0000000000..f7d6080a04
 +	;
 diff --git a/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
 new file mode 100644
-index 0000000000..9ef318eb3e
+index 0000000000..9f09cf5af2
 --- /dev/null
 +++ b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,722 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All rights reserved.
 + * Distributed under the terms of the MIT License.
@@ -1928,6 +2228,8 @@ index 0000000000..9ef318eb3e
 +
 +
 +#include <ACPI.h>
++#include <PCI.h>
++#include <bus/PCI.h>
 +
 +#include <KernelExport.h>
 +#include <stdio.h>
@@ -1951,6 +2253,37 @@ index 0000000000..9ef318eb3e
 +
 +static device_manager_info *sDeviceManager;
 +static struct acpi_module_info *sAcpi;
++static pci_module_info *sPci;
++
++// SBRT (see below) only ever gets as far as the SNC's own scratch register
++// (LCDB/BCLP) and a "backlight changed" notification (ASLE) meant for the
++// Intel graphics driver to act on; nothing acts on it without that driver,
++// which Haiku doesn't have for this PowerVR SGX-based Poulsbo/GMA500 chip
++// (see the "graphics acceleration" entry in the VAIO P README). This was
++// first attempted by guessing the classic Intel mobile "BLC_PWM_CTL" MMIO
++// register (bits 31:16 period, bits 15:0 duty) -- it visibly changed the
++// backlight, proving *some* register in that guessed offset affects it,
++// but the perceived brightness order across levels 0-8 was scrambled, not
++// monotonic, even though the computed duty cycle written was confirmed
++// monotonic via readback. That's consistent with having hit the wrong
++// register/offset for this chip's actual display-block layout (Poulsbo's
++// SCH-integrated GPU isn't guaranteed to match mainline i915's memory
++// map) rather than a real duty-cycle-vs-perception mismatch.
++//
++// The Intel SCH US15W datasheet (doc 319537, Graphics/Video/Display D2:F0
++// section) documents the real mechanism instead: the "LBB" (Legacy
++// Backlight Brightness) register at PCI config offset 0xF4, bits 7:0 --
++// a plain 0 (dimmest) - 255 (brightest) value, no period/duty math
++// needed. The datasheet explicitly notes that writing only the low byte
++// (not a 16- or 32-bit access touching the upper "scratch trigger" bits
++// at 0xF5-0xF7) avoids generating a display event interrupt, so this
++// writes exactly one byte.
++#define POULSBO_GFX_VENDOR_ID	0x8086
++#define POULSBO_GFX_DEVICE_ID	0x8108
++#define LBB_REGISTER_OFFSET		0xF4
++
++static bool sGfxFound;
++static uint8 sGfxBus, sGfxDevice, sGfxFunction;
 +
 +
 +typedef struct {
@@ -1963,6 +2296,9 @@ index 0000000000..9ef318eb3e
 +} sony_ec_device_info;
 +
 +static sony_ec_device_info *sSonyEcDevice;
++
++static status_t sony_ec_set_brightness(sony_ec_device_info *device,
++	uint32 level);
 +
 +
 +static status_t
@@ -2146,6 +2482,55 @@ index 0000000000..9ef318eb3e
 +		TRACE("wireless switch toggled: requesting BT power on: %s, "
 +			"readback (sub-function 5): %s, value 0x%04" B_PRIx32 "\n",
 +			strerror(btPowerStatus), strerror(btStateStatus), btStateResult);
++	} else if (device->capabilities[offset] == 0x0100) {
++		// Per this model's DSDT: handle 0x0100 is a shared notify for every
++		// Fn+Fn-row key (F1-F12 all funnel into the same EC query numbers,
++		// _Q0A/_Q0B, and the same SNNE(0x0100) call) -- unlike 0x0124, it
++		// does NOT identify which key by itself. Immediately before firing
++		// the notify, the DSDT stashes the actual key code from
++		// H8EC.HKCD into SNC.ECR; F100's sub-function 2 (BUF1 = 2) reads
++		// that back as BUF0. Log the raw code here -- undocumented outside
++		// this table, and deliberately not guessed from Linux's
++		// sony-laptop.c (see the file header) -- so a real Fn+F1..F12 press
++		// can be matched key-by-key to its code before wiring up actual
++		// actions (brightness, volume, etc.).
++		uint32 hotkeyResult = 0;
++		status_t hotkeyStatus = sony_ec_call_handle(device, 0x0100, 0x0200,
++			&hotkeyResult);
++		// SNCF() returns the whole 4-byte BUFF reinterpreted as a Dword --
++		// F100's sub-function 2 only overwrites BUF0 (the low byte) with
++		// ECR, so BUF1 (the sub-function selector we sent, 0x02) is still
++		// sitting in the next byte up. Only BUF0 is the actual key code.
++		uint32 hotkeyCode = hotkeyResult & 0xFF;
++		TRACE("hotkey (handle 0x0100): read code %s, value 0x%02" B_PRIx32
++			"\n", strerror(hotkeyStatus), hotkeyCode);
++
++		// Empirically matched on real hardware by pressing Fn+F5 and
++		// Fn+F6 in isolation (an earlier guess, matching these codes to
++		// F2-F7 by the order all twelve Fn+Fn-row keys fired in, put
++		// brightness at 0x09/0x0a -- wrong, confirmed by this direct
++		// test): Fn+F5 -> 0x05/0x85, Fn+F6 -> 0x06/0x86. Which half of
++		// each pair is press vs. release isn't confirmed -- acting on the
++		// 0x80-clear code only, to fire once per key rather than twice.
++		// Direction (F5=down vs. up) isn't confirmed either; swap the two
++		// branches below if it turns out backwards.
++		//
++		// Volume and any display-output toggle keys have no equivalent
++		// ACPI method on this model -- nothing in the DSDT reads back or
++		// sets them the way GBRT/SBRT do for brightness -- so wiring
++		// those up would mean synthesizing input events for the
++		// input_server/media mixer, a materially bigger change than this
++		// driver's scope.
++		if (hotkeyCode == 0x05 && device->brightness > 0)
++			sony_ec_set_brightness(device, device->brightness - 1);
++		else if (hotkeyCode == 0x06)
++			sony_ec_set_brightness(device, device->brightness + 1);
++	} else {
++		// Handles other than 0x0124/0x0100 aren't acted on yet. Log which
++		// handle each one is so it can be matched to a real Fn-key press
++		// from syslog before wiring up a handler.
++		TRACE("unhandled notify event, handle 0x%04x\n",
++			device->capabilities[offset]);
 +	}
 +}
 +
@@ -2205,26 +2590,53 @@ index 0000000000..9ef318eb3e
 +}
 +
 +
-+static status_t
-+sony_ec_write(void *_cookie, off_t position, const void *buffer,
-+	size_t *numBytes)
++static void
++sony_ec_init_backlight(void)
 +{
-+	sony_ec_device_info *device = (sony_ec_device_info *)_cookie;
++	pci_info info;
++	for (long i = 0; sPci->get_nth_pci_info(i, &info) == B_OK; i++) {
++		if (info.vendor_id != POULSBO_GFX_VENDOR_ID
++			|| info.device_id != POULSBO_GFX_DEVICE_ID) {
++			continue;
++		}
 +
-+	// Accept a brightness level as an ASCII decimal string (e.g. "5"), so
-+	// it's directly testable from a shell with something like
-+	// `echo 5 > /dev/power/sony_ec/0`, without needing a dedicated tool.
-+	char text[8];
-+	size_t length = *numBytes;
-+	if (length >= sizeof(text))
-+		length = sizeof(text) - 1;
-+	if (user_memcpy(text, buffer, length) < B_OK)
-+		return B_BAD_ADDRESS;
-+	text[length] = '\0';
++		sGfxBus = info.bus;
++		sGfxDevice = info.device;
++		sGfxFunction = info.function;
++		sGfxFound = true;
 +
-+	uint32 level = (uint32)strtoul(text, NULL, 10);
++		uint32 initial = sPci->read_pci_config(sGfxBus, sGfxDevice,
++			sGfxFunction, LBB_REGISTER_OFFSET, 1);
++		TRACE("backlight: found graphics controller at %u:%u:%u, "
++			"LBB=%" B_PRIu32 "\n", sGfxBus, sGfxDevice, sGfxFunction,
++			initial);
++		return;
++	}
++
++	TRACE("backlight: no Poulsbo graphics controller found\n");
++}
++
++
++static void
++sony_ec_set_backlight_lbb(uint32 level)
++{
++	if (!sGfxFound)
++		return;
++
++	uint32 value = (255 * level) / 8;
++	sPci->write_pci_config(sGfxBus, sGfxDevice, sGfxFunction,
++		LBB_REGISTER_OFFSET, 1, value);
++	TRACE("backlight: LBB set to %" B_PRIu32 "/255\n", value);
++}
++
++
++static status_t
++sony_ec_set_brightness(sony_ec_device_info *device, uint32 level)
++{
 +	if (level > 8)
 +		level = 8;
++
++	sony_ec_set_backlight_lbb(level);
 +
 +	uint32 result = 0;
 +	status_t status = sony_ec_call_int(device, "SBRT", true, level, &result);
@@ -2246,6 +2658,30 @@ index 0000000000..9ef318eb3e
 +		&readBack);
 +	TRACE("brightness read-back after SBRT: status %s, value %" B_PRIu32
 +		"\n", strerror(readStatus), readBack);
++
++	return status;
++}
++
++
++static status_t
++sony_ec_write(void *_cookie, off_t position, const void *buffer,
++	size_t *numBytes)
++{
++	sony_ec_device_info *device = (sony_ec_device_info *)_cookie;
++
++	// Accept a brightness level as an ASCII decimal string (e.g. "5"), so
++	// it's directly testable from a shell with something like
++	// `echo 5 > /dev/power/sony_ec/0`, without needing a dedicated tool.
++	char text[8];
++	size_t length = *numBytes;
++	if (length >= sizeof(text))
++		length = sizeof(text) - 1;
++	if (user_memcpy(text, buffer, length) < B_OK)
++		return B_BAD_ADDRESS;
++	text[length] = '\0';
++
++	uint32 level = (uint32)strtoul(text, NULL, 10);
++	status_t status = sony_ec_set_brightness(device, level);
 +
 +	*numBytes = length;
 +	return status;
@@ -2395,6 +2831,7 @@ index 0000000000..9ef318eb3e
 +	}
 +
 +	sony_ec_probe_capabilities(device);
++	sony_ec_init_backlight();
 +
 +	sSonyEcDevice = device;
 +
@@ -2421,6 +2858,7 @@ index 0000000000..9ef318eb3e
 +module_dependency module_dependencies[] = {
 +	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info **)&sDeviceManager },
 +	{ B_ACPI_MODULE_NAME, (module_info **)&sAcpi },
++	{ B_PCI_MODULE_NAME, (module_info **)&sPci },
 +	{}
 +};
 +
@@ -3097,7 +3535,7 @@ index 0000000000..442fd236a9
 +	{}
 +};
 diff --git a/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp b/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
-index fda337add7..98288463d0 100644
+index fda337add7..aa347ddbd7 100644
 --- a/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
 +++ b/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
 @@ -234,6 +234,11 @@ acpi_cstate_set_scheduler_mode(scheduler_mode mode)
@@ -3138,34 +3576,7 @@ index fda337add7..98288463d0 100644
  			goto C3_out;
  
  		thread->post_interrupt_callback = NULL;
-@@ -450,6 +465,26 @@ acpi_cstate_quirks(acpi_cpuidle_driver_info *device)
- 		return;
- 	if (cpu->arch.family > 0xf || (cpu->arch.family == 6 && model >= 0xf))
- 		device->flags &= ~ACPI_FLAG_C_ARB;
-+
-+	// First-generation Atom (Bonnell/Silverthorne, model 0x1c -- e.g. the
-+	// Z520 in the Sony VAIO P) hard-hangs the machine -- no panic, no
-+	// debugger, no keyboard input, freeze point different every boot --
-+	// confirmed on real hardware once both logical CPUs actually use this
-+	// driver's idle path (they didn't before both got a working _CST
-+	// mapping). Downgrading FFH (MONITOR/MWAIT) to plain HALT alone did
-+	// not stop the hangs, which points at acpi_cstate_bm_check() instead:
-+	// unlike C-state entry itself, it runs on *every* idle entry on *both*
-+	// CPUs and hits the ACPI bus manager's bus-master-status bit register,
-+	// which apparently isn't safe against concurrent access from two
-+	// logical CPUs on this old chipset. Skip it entirely here, and
-+	// downgrade FFH to HALT as a second precaution.
-+	if (cpu->arch.family == 6 && model == 0x1c) {
-+		for (int32 i = 0; i < device->state_count; i++) {
-+			if (device->states[i].method == ACPI_CSTATE_FFH)
-+				device->states[i].method = ACPI_CSTATE_HALT;
-+			device->states[i].skip_bm_sts = 1;
-+		}
-+	}
- }
- 
- 
-@@ -514,7 +549,7 @@ acpi_cpuidle_setup(acpi_cpuidle_driver_info *device)
+@@ -514,7 +529,7 @@ acpi_cpuidle_setup(acpi_cpuidle_driver_info *device)
  
  
  static status_t
@@ -3174,7 +3585,7 @@ index fda337add7..98288463d0 100644
  {
  	// get the CPU index
  	acpi_data buffer;
-@@ -528,30 +563,9 @@ acpi_processor_init(acpi_cpuidle_driver_info *device)
+@@ -528,30 +543,9 @@ acpi_processor_init(acpi_cpuidle_driver_info *device)
  	}
  
  	acpi_object_type *tmpObject = (acpi_object_type *)buffer.pointer;
@@ -3207,22 +3618,43 @@ index fda337add7..98288463d0 100644
  }
  
  
-@@ -575,10 +589,35 @@ acpi_cpuidle_init()
+@@ -575,10 +569,56 @@ acpi_cpuidle_init()
  	if (x86_check_feature(IA32_FEATURE_EXT_HYPERVISOR, FEATURE_EXT))
  		return B_ERROR;
  
 +	// This driver hard-hangs the machine on the first-generation Atom
-+	// (Bonnell/Silverthorne, model 0x1c -- e.g. the Z520 in the Sony VAIO
-+	// P) once both logical CPUs actually use its idle path -- confirmed
-+	// on real hardware across several independent attempted fixes
-+	// (skipping the redundant per-CPU _CST re-evaluation, downgrading
-+	// MWAIT to HLT, skipping the per-idle bus-master-status register
-+	// check). The freeze point moves around from boot to boot, consistent
-+	// with a genuine SMP deadlock somewhere below this driver (ACPICA or
-+	// the chipset itself) that isn't safe to keep chasing blind without a
-+	// working kernel debugger entry point on the affected machine. Refuse
-+	// to claim this CPU model outright; the machine is known to boot
-+	// reliably without cpuidle.
++	// (Bonnell/Silverthorne, model 0x1c stepping 2 / "C0" -- e.g. the Z520
++	// in the Sony VAIO P) once both logical CPUs actually use its idle
++	// path -- confirmed on real hardware across several independent
++	// attempted fixes (skipping the redundant per-CPU _CST re-evaluation,
++	// downgrading MWAIT to HLT, skipping the per-idle bus-master-status
++	// register check, and -- the last attempt -- dropping C2/C3 from the
++	// state table entirely so only plain-HALT C1 is ever reachable, which
++	// still hung).
++	//
++	// Confirmed root cause, not a driver bug: Intel's own Atom Z5xx
++	// Series Specification Update (errata document 319536, stepping C0 --
++	// this CPU's only stepping) lists three separate silicon errata, all
++	// Status "No Fix", that between them cover every C-state configuration
++	// this driver can produce on this chip:
++	//   AAE31 -- the instruction cache stops responding to snoops once
++	//     *both* logical processors on the core are simultaneously
++	//     inactive (HLT or MWAIT), risking stale-instruction execution on
++	//     wake -- hit by C1-only just as much as C2/C3, since HT means
++	//     both logical CPUs going idle together is the normal case, not
++	//     an edge case.
++	//   AAE34 -- the processor may fail to wake from an inactive state at
++	//     all if an Enhanced SpeedStep (EIST) P-state transition is
++	//     pending at the same time, requiring a hard reset to recover --
++	//     directly implicated here since this machine's cpufreq driver
++	//     (intel_est) is in active use alongside cpuidle.
++	//   AAE2 -- C2 and higher can hang the system via a stray xTPR update
++	//     transaction issued after the Stop-Grant cycle.
++	// With "No Fix" status on this CPU's one and only stepping, none of
++	// these are workaroundable by this driver; refuse to claim this CPU
++	// model outright. The machine is known to boot and run reliably
++	// without cpuidle (idle still uses plain HLT via the generic
++	// arch_cpu_idle() path, just never MWAIT/C-states through ACPI).
 +	{
 +		cpu_ent* cpu = get_cpu_struct();
 +		uint32 model = (cpu->arch.extended_model << 4) + cpu->arch.model;
@@ -3244,7 +3676,7 @@ index fda337add7..98288463d0 100644
  	device_node* processor = NULL;
  	while (true) {
  		device_attr acpiAttrs[] = {
-@@ -602,29 +641,113 @@ acpi_cpuidle_init()
+@@ -602,29 +642,113 @@ acpi_cpuidle_init()
  		sDeviceManager->get_driver(processor, (driver_module_info **)&device->acpi,
  			(void **)&device->acpi_cookie);
  
@@ -5391,7 +5823,7 @@ index 9435811872..64064e554c 100644
  
  		delete link;
 diff --git a/src/system/kernel/arch/x86/ioapic.cpp b/src/system/kernel/arch/x86/ioapic.cpp
-index 5fab87c231..60fabc372d 100644
+index e8815d3513..ebfba8f957 100644
 --- a/src/system/kernel/arch/x86/ioapic.cpp
 +++ b/src/system/kernel/arch/x86/ioapic.cpp
 @@ -5,6 +5,7 @@
@@ -5409,8 +5841,8 @@ index 5fab87c231..60fabc372d 100644
 +#include <stdlib.h>
  #include <string.h>
  #include <stdio.h>
- 
-@@ -189,6 +191,58 @@ ioapic_write_64(struct ioapic& ioapic, uint8 registerSelect, uint64 value,
+ #include <cpu.h>
+@@ -190,6 +192,58 @@ ioapic_write_64(struct ioapic& ioapic, uint8 registerSelect, uint64 value,
  }
  
  
@@ -5469,7 +5901,7 @@ index 5fab87c231..60fabc372d 100644
  static void
  ioapic_configure_pin(struct ioapic& ioapic, uint8 pin, uint8 vector,
  	uint8 triggerPolarity, uint16 deliveryMode)
-@@ -690,6 +744,12 @@ ioapic_init(kernel_args* args)
+@@ -691,6 +745,12 @@ ioapic_init(kernel_args* args)
  		&ioapic_assign_interrupt_to_cpu,
  	};
  
