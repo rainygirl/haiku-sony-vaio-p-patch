@@ -86,6 +86,10 @@ cd tools/vaio-p
 
 Check `git apply --check tools/vaio-p/vaio-p-patches.diff` for the exact hunk that failed, then look at the file at that location: if the same fix is already present upstream (likely for the "generic correctness" items listed under "Patch baseline"), skip that hunk; if the surrounding code has just shifted, re-derive that one file's hunk with `git diff` against a manually re-applied change rather than regenerating the whole patch.
 
+### ACPI lid driver note
+
+The `acpi_lid` driver keeps its update state until the consumer reads the status. `power_daemon` keeps one descriptor open and reads it once per notification, so its file position advances. The patch removes the old `position > 0` EOF check: returning zero bytes after the first notification left the select pool permanently signalled and made `power_daemon` spin at 100% CPU after the first lid-open event.
+
 ## After building
 
 A successful build only verifies the source compiles — real verification requires the actual hardware: boot from USB with ACPI on and no Safe Mode, install to the internal disk (create an Intel partition map + BFS partition in DriveSetup first, then install), then confirm it survives a reboot.

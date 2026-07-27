@@ -86,6 +86,10 @@ cd tools/vaio-p
 
 `git apply --check tools/vaio-p/vaio-p-patches.diff`로 정확히 어느 hunk가 실패했는지 확인한 뒤 해당 위치의 코드를 살펴보세요. "패치 기준 시점"에 나열한 범용 정합성 버그처럼 이미 공식 소스에 같은 수정이 들어가 있다면 그 hunk는 건너뛰면 되고, 주변 코드만 약간 밀린 경우라면 패치 전체를 다시 생성하지 말고 해당 파일 하나만 수동으로 다시 반영한 뒤 `git diff`로 그 hunk만 재생성하세요.
 
+### ACPI 뚜껑 드라이버 참고
+
+`acpi_lid` 드라이버는 OS가 상태를 읽을 때까지 update 상태를 유지합니다. `power_daemon`은 디스크립터 하나를 계속 열어두고 알림마다 읽으므로 파일 위치가 증가합니다. 패치에서는 기존 `position > 0` EOF 처리를 제거했습니다. 첫 번째 알림 이후 0바이트를 반환하면 select pool이 계속 signal 상태로 남아 첫 뚜껑 열림 뒤 `power_daemon`이 CPU 100%로 회전하기 때문입니다.
+
 ## 빌드 후 확인
 
 빌드 자체는 소스 검증일 뿐이며, 실제 검증은 실기기에서만 가능합니다: USB로 ACPI를 켜고 Safe Mode 없이 부팅 -> 내장 디스크에 설치 (DriveSetup으로 Intel 파티션 맵 + BFS 파티션을 먼저 만든 뒤 설치) -> 재부팅까지 확인해야 합니다.
