@@ -1,5 +1,5 @@
 diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
-index 4d35b2958e..a600d60e82 100644
+index 4d35b2958e..ba07fa95f8 100644
 --- a/build/jam/DefaultBuildProfiles
 +++ b/build/jam/DefaultBuildProfiles
 @@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
@@ -14,40 +14,9 @@ index 4d35b2958e..a600d60e82 100644
  				}
  			}
  
-@@ -159,8 +164,46 @@ rule DefineDefaultBuildProfiles
- 				gcc2 @{
- 					nano_x86@secondary_x86
+@@ -161,6 +166,16 @@ rule DefineDefaultBuildProfiles
  					p7zip_x86@secondary_x86
--					xz_utils_x86@secondary_x86
-+					# Personal additions: dependencies for the vim_x86 and
-+					# python3.14_x86 packages injected below as plain files
-+					# into /system/packages (those two are newer than the
-+					# pinned build-packages snapshot, so they can't come in
-+					# through the normal repository path). Checked ALL of
-+					# vim_x86's and python3.14_x86's `requires:` lines
-+					# against what the pinned snapshot actually provides
-+					# (via `package list -i`) up front, rather than
-+					# discovering mismatches one boot at a time: of the
-+					# combined dependency set, four -- xz_utils_x86,
-+					# expat_x86, gettext_x86_libintl, zlib_x86 -- were
-+					# stale enough in the pinned snapshot to fail with
-+					# "nothing provides" at boot (their SONAME/ABI
-+					# compat baseline had moved on since the snapshot was
-+					# last synced), so those four are NOT listed here;
-+					# current versions of each are injected as plain
-+					# files below instead, alongside vim_x86/python3.14_x86
-+					# themselves. Everything else below already satisfies
-+					# both packages' requirements as pinned.
-+					file
-+					bzip2_x86@secondary_x86
-+					gcc_x86_syslibs@secondary_x86
-+					libedit_x86@secondary_x86
-+					libffi_x86@secondary_x86
-+					libiconv_x86@secondary_x86
-+					ncurses6_x86@secondary_x86
-+					openssl3_x86@secondary_x86
-+					sqlite_x86@secondary_x86
-+					zstd_x86@secondary_x86
+ 					xz_utils_x86@secondary_x86
  				}@
 +				# harfbuzz isn't in the default nightly image, so gcc2's
 +				# libfreetype -- which was linked against it -- logs
@@ -62,34 +31,10 @@ index 4d35b2958e..a600d60e82 100644
  				;
  			AddHaikuImageSourcePackages
  				nano
-@@ -169,6 +212,31 @@ rule DefineDefaultBuildProfiles
+@@ -169,6 +184,7 @@ rule DefineDefaultBuildProfiles
  
  			AddOptionalHaikuImagePackages Development Git ;
  
-+			# Personal additions: vim and python3.14 are newer than the
-+			# pinned build-packages snapshot (their .hpkg files were
-+			# fetched by hand from the live HaikuPorts repository), so
-+			# drop them into /system/packages as plain files; with no
-+			# packages activation file on a fresh image, packagefs
-+			# activates everything found in that directory at boot. Their
-+			# library/command dependencies are pulled in through the
-+			# regular repository path above.
-+			local vaioPExtraPackages =
-+				vim_x86-9.1.1618-1-x86_gcc2.hpkg
-+				python3.14_x86-3.14.6-2-x86_gcc2.hpkg
-+				expat_x86-2.8.2-1-x86_gcc2.hpkg
-+				gettext_x86_libintl-1.0-1-x86_gcc2.hpkg
-+				xz_utils_x86-5.8.3-1-x86_gcc2.hpkg
-+				zlib_x86-1.3.2-1-x86_gcc2.hpkg
-+				# zlib_x86_devel-1.3.1-4 is pulled in transitively by the
-+				# Development optional package group and requires
-+				# EXACTLY zlib_x86==1.3.1 -- so bumping zlib_x86 above to
-+				# 1.3.2 to satisfy python3.14_x86 broke it the other way.
-+				# Bring in the matching 1.3.2 devel package too so both
-+				# halves agree.
-+				zlib_x86_devel-1.3.2-1-x86_gcc2.hpkg ;
-+			SEARCH on $(vaioPExtraPackages) = /haiku-build/vaio-p-packages ;
-+			AddFilesToHaikuImage system packages : $(vaioPExtraPackages) ;
 +
  			# WebPositive can only built for x86_gcc2, x86 and x86_64
  			if $(HAIKU_PACKAGING_ARCHS) in x86_gcc2 x86 x86_64 {
@@ -494,6 +439,55 @@ index 1e82f83f5a..2a7e7e556b 100644
  		// These are convenience methods for getting and clearing the halt
  		// state of an endpoint. They use the control pipe of the device to
  		// send the corresponding requests.
+diff --git a/headers/private/drivers/backlight.h b/headers/private/drivers/backlight.h
+new file mode 100644
+index 0000000000..5b5572699c
+--- /dev/null
++++ b/headers/private/drivers/backlight.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2026, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _BACKLIGHT_MODULE_H
++#define _BACKLIGHT_MODULE_H
++
++
++#include <module.h>
++
++
++/*!	Optional panel-backlight control, published by whatever machine-specific
++	driver actually owns the backlight on a given system.
++
++	This exists because on some laptops the backlight is not reachable through
++	the graphics driver at all. Poulsbo (Intel SCH) is the motivating case: its
++	panel brightness lives in a chipset register that the VESA BIOS DPMS call
++	does not touch, so blanking the screen leaves the backlight fully lit and
++	the panel merely displaying black -- most of the power still burned, which
++	on a netbook is the single biggest battery lever there is.
++
++	A graphics driver that blanks the display can look this module up with
++	get_module() and, if it is present, ask for the backlight to follow. It is
++	deliberately optional: get_module() simply fails on machines where nothing
++	publishes it, and the graphics driver carries on exactly as before.
++*/
++
++#define BACKLIGHT_MODULE_NAME "generic/backlight/v1"
++
++
++typedef struct backlight_module_info {
++	module_info info;
++
++	/*!	Switches the panel backlight off, or restores it to the level it was
++		at when it was last switched off. Implementations are expected to be
++		idempotent: turning it off twice, or on when it is already on, must
++		not lose the saved level.
++	*/
++	status_t (*set_power)(bool on);
++} backlight_module_info;
++
++
++#endif	/* _BACKLIGHT_MODULE_H */
 diff --git a/headers/private/kernel/kernel.h b/headers/private/kernel/kernel.h
 index 0a48f79d48..1e53afc3a0 100644
 --- a/headers/private/kernel/kernel.h
@@ -2151,6 +2145,44 @@ index 9968fa825e..0122e5a55e 100644
  	} isochronous;
  } usb_raw_command;
  
+diff --git a/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp b/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp
+index edeba186d9..bfd203eea2 100644
+--- a/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp
++++ b/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp
+@@ -5,6 +5,8 @@
+ 
+ 
+ #include "vesa_private.h"
++
++#include <drivers/backlight.h>
+ #include "vesa.h"
+ 
+ #include <boot_item.h>
+@@ -570,6 +572,24 @@ out:
+ status_t
+ vesa_set_dpms_mode(vesa_info& info, uint32 mode)
+ {
++	// Drive the panel backlight alongside the BIOS DPMS call, if some
++	// machine-specific driver published the optional backlight module.
++	//
++	// This matters on hardware where the VBE DPMS call does not actually
++	// reach the backlight -- Poulsbo/SCH being the case this was written for,
++	// where brightness lives in a chipset register the BIOS call never
++	// touches, so a "blanked" screen kept its backlight at full power. The
++	// lookup is best-effort: on machines where nothing publishes the module
++	// this is a no-op and behaviour is unchanged.
++	{
++		backlight_module_info* backlight;
++		if (get_module(BACKLIGHT_MODULE_NAME, (module_info**)&backlight)
++				== B_OK) {
++			backlight->set_power(mode == B_DPMS_ON);
++			put_module(BACKLIGHT_MODULE_NAME);
++		}
++	}
++
+ 	// Only let supported modes through
+ 	mode &= info.shared_info->dpms_capabilities;
+ 
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 index 3f3670c14f..e5d3177dab 100644
 --- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
@@ -2267,10 +2299,10 @@ index 0000000000..f7d6080a04
 +	;
 diff --git a/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
 new file mode 100644
-index 0000000000..9f09cf5af2
+index 0000000000..8e2760c67c
 --- /dev/null
 +++ b/src/add-ons/kernel/drivers/power/sony_ec/sony_ec.cpp
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,776 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All rights reserved.
 + * Distributed under the terms of the MIT License.
@@ -2316,6 +2348,7 @@ index 0000000000..9f09cf5af2
 +#include <ACPI.h>
 +#include <PCI.h>
 +#include <bus/PCI.h>
++#include <drivers/backlight.h>
 +
 +#include <KernelExport.h>
 +#include <stdio.h>
@@ -2716,6 +2749,58 @@ index 0000000000..9f09cf5af2
 +}
 +
 +
++// Panel backlight power, exposed to the graphics driver through the optional
++// generic/backlight module. The VESA BIOS DPMS call cannot reach this panel's
++// backlight (it lives in an SCH chipset register), so without this, blanking
++// the screen leaves the backlight fully lit and only the image goes black --
++// which wastes almost all of the power the blank was supposed to save.
++//
++// The level is deliberately not pushed through SBRT here: this is a transient
++// power state, not a user brightness change, so the EC's notion of the current
++// brightness is left untouched and the panel comes back exactly as the user
++// had it.
++static uint32 sBacklightSavedLevel;
++static bool sBacklightOff;
++
++
++static status_t
++sony_ec_backlight_set_power(bool on)
++{
++	if (!sGfxFound)
++		return B_NOT_SUPPORTED;
++
++	if (on) {
++		if (!sBacklightOff)
++			return B_OK;
++		sBacklightOff = false;
++		sony_ec_set_backlight_lbb(sBacklightSavedLevel);
++		TRACE("backlight: restored to %" B_PRIu32 "\n", sBacklightSavedLevel);
++	} else {
++		if (sBacklightOff)
++			return B_OK;
++		sBacklightSavedLevel = sSonyEcDevice != NULL
++			? sSonyEcDevice->brightness : 8;
++		sBacklightOff = true;
++		sony_ec_set_backlight_lbb(0);
++		TRACE("backlight: off (saved level %" B_PRIu32 ")\n",
++			sBacklightSavedLevel);
++	}
++
++	return B_OK;
++}
++
++
++static backlight_module_info sSonyEcBacklightModule = {
++	{
++		BACKLIGHT_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	sony_ec_backlight_set_power
++};
++
++
 +static status_t
 +sony_ec_set_brightness(sony_ec_device_info *device, uint32 level)
 +{
@@ -2991,6 +3076,7 @@ index 0000000000..9f09cf5af2
 +module_info *modules[] = {
 +	(module_info *)&sony_ec_driver_module,
 +	(module_info *)&sony_ec_device_module,
++	(module_info *)&sSonyEcBacklightModule,
 +	NULL
 +};
 diff --git a/src/add-ons/kernel/power/cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/Jamfile
