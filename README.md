@@ -104,7 +104,7 @@ Check `git apply --check tools/vaio-p/vaio-p-patches.diff` for the exact hunk th
 
 A successful build only verifies the source compiles — real verification requires the actual hardware: boot from USB with ACPI on and no Safe Mode, install to the internal disk (create an Intel partition map + BFS partition in DriveSetup first, then install), then confirm it survives a reboot.
 
-## AI disclaim
+## AI disclaimer
 
 These patches were produced by a human working with Claude. The work was driven by measurements taken on the actual machine -- syslogs, KDL sessions, disassembled DSDT, direct reads of PCI config space and physical memory, and vendor errata documents -- and every fix described here was verified on the real hardware before being written down. Several conclusions in earlier drafts were wrong and were corrected only because the measurements contradicted them; a few open questions are still marked as unresolved rather than papered over.
 
