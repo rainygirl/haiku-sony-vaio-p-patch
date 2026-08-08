@@ -10,7 +10,19 @@ English version: [`README.md`](README.md).
 
 ## 패치 기준 시점
 
-이 패치들은 **2026년 7월 21일** 기준 Haiku OS 소스를 기준으로 작성되었습니다. 일부 버그(ACPICA Global Lock 초기화 순서 문제, ACPI IRQ 트리거/극성, PCI 미정렬 config 접근, PS/2 멀티플렉서 포트 프로브 타임아웃, USBKit `SetAlternate()` 버그, UHCI halt 복구 미구현, EHCI isochronous 버그 일체, UVC frame index 버그, SMP AP 기동 재시도 등)는 VAIO P 전용이 아닌 범용 정합성 버그라서, 새 체크아웃을 받을 시점에는 이미 공식 소스에서 고쳐져 있을 수 있습니다. 패치가 적용되지 않으면 먼저 이미 수정됐는지 확인한 뒤 다시 작성해 주세요.
+이 패치들은 **`master` 기준이며 `056fed280f`(hrev99002+115, 2026년 8월 8일)에서 검증**했습니다 — `build-vaio-p-iso.sh`가 새 클론에서 체크아웃하는 바로 그 브랜치입니다. 최초 작성은 2026년 7월 21일 소스 기준이었고, `r1beta6` 기준의 이전 diff는 이 파일의 git 히스토리에 남아 있습니다.
+
+일부 버그(ACPICA Global Lock 초기화 순서 문제, ACPI IRQ 트리거/극성, PCI 미정렬 config 접근, PS/2 멀티플렉서 포트 프로브 타임아웃, USBKit `SetAlternate()` 버그, UHCI halt 복구 미구현, EHCI isochronous 버그 일체, UVC frame index 버그, SMP AP 기동 재시도 등)는 VAIO P 전용이 아닌 범용 정합성 버그라서, 새 체크아웃을 받을 시점에는 이미 공식 소스에서 고쳐져 있을 수 있습니다. 패치가 적용되지 않으면 먼저 이미 수정됐는지 확인한 뒤 다시 작성해 주세요.
+
+실제로 세 건이 그렇게 되어 이제 diff에서 빠졌습니다:
+
+| 패치했던 곳 | 업스트림 수정 커밋 | 비고 |
+| --- | --- | --- |
+| `headers/private/kernel/kernel.h` (`SET_BIT`/`CLEAR_BIT`의 마스크 해석) | `0dc37ccfb5` | 매크로 자체가 삭제되고 h2 드라이버 세 곳의 호출부가 평범한 비트 연산으로 바뀌었습니다. |
+| `acpi_lid.cpp` (`power_daemon`을 100% CPU로 돌게 만든 `position > 0` 조기 반환) | `15c199f8fd` | 같은 제거, 같은 이유입니다. |
+| `ehci.cpp` (12비트 `TLENGTH`가 status 비트를 침범하던 문제) | `051bb37f50` | 새 `EHCI_ITD_TLENGTH(x)` 매크로가 `0x0fff`로 직접 마스킹합니다. 나머지 EHCI isochronous 수정 세 건(프레임 체이닝, 모든 iTD 언링크, 시작 프레임 경쟁)은 여전히 필요하며 diff에 남아 있습니다. |
+
+대상이 계속 움직이는 브랜치이므로 `build-vaio-p-iso.sh`는 `git apply -3`로 적용합니다. 주변 코드만 밀린 hunk는 자동으로 병합되고, 진짜 충돌이 날 때만 중단됩니다.
 
 ## 무엇을 고치는가
 
@@ -135,9 +147,13 @@ cd tools/vaio-p
 - `HAIKU_GIT_REF` : 체크아웃할 haiku.git의 브랜치/태그/커밋입니다. 기본값은 현재 체크아웃 상태를 유지합니다 (새로 클론 시 `master`).
 - `JOBS` : `configure`/`jam` 병렬 작업 수입니다. 기본값은 `nproc`입니다.
 
+### `configure --distro-compatibility official`을 주는 이유
+
+이 옵션이 없으면 `HAIKU_DISTRO_COMPATIBILITY`가 `default`가 되고, `headers/private/kernel/boot/images.h`가 상표 없는 스플래시 세트인 `images-sans-tm.h`를 포함합니다. 그런데 이 파일의 372x96 로고 이미지는 **빈 이미지**입니다. 부트 아이콘은 같은 헤더에서 오지만 실제 이미지라서, 증상은 "아이콘 줄만 나오고 그 위 Haiku 로고가 없는 부팅 화면"으로 나타납니다. `official`을 주면 업스트림 나이틀리가 쓰는 `images-tm-development.h`가 선택됩니다. 이 define을 참조하는 나머지 코드는 About, Deskbar 잎 메뉴, Installer, 첫 부팅 프롬프트뿐이며 전부 외형에만 영향을 줍니다.
+
 ## 패치가 적용되지 않을 때
 
-`git apply --check tools/vaio-p/vaio-p-patches.diff`로 정확히 어느 hunk가 실패했는지 확인한 뒤 해당 위치의 코드를 살펴보세요. "패치 기준 시점"에 나열한 범용 정합성 버그처럼 이미 공식 소스에 같은 수정이 들어가 있다면 그 hunk는 건너뛰면 되고, 주변 코드만 약간 밀린 경우라면 패치 전체를 다시 생성하지 말고 해당 파일 하나만 수동으로 다시 반영한 뒤 `git diff`로 그 hunk만 재생성하세요.
+빌드 스크립트가 이미 3-way 병합으로 재시도하므로, 여기까지 오는 건 진짜 충돌일 때뿐입니다. 체크아웃에서 `git apply -3 tools/vaio-p/vaio-p-patches.diff`를 실행해 충돌 표시를 확인한 뒤 각각을 살펴보세요. "패치 기준 시점"에 나열한 범용 정합성 버그처럼 이미 공식 소스에 같은 수정이 들어가 있다면(이미 세 건이 그렇게 됐습니다) 업스트림 쪽을 남기고 해당 hunk를 버리면 되고, 아니면 다시 작성하세요. 이후 `git diff HEAD --binary`로 diff 전체를 재생성합니다 — Intel 마이크로코드 바이너리가 들어 있으므로 `--binary`가 필요합니다.
 
 ## 재설치 없이 수정 적용하기
 

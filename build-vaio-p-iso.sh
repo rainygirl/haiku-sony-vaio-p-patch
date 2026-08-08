@@ -103,15 +103,22 @@ PATCH_FILE="$SCRIPT_DIR/vaio-p-patches.diff"
 if git -C haiku apply --check --reverse "$PATCH_FILE" >/dev/null 2>&1; then
 	log "Patches already applied, skipping"
 else
-	if ! git -C haiku apply --check "$PATCH_FILE" 2>/tmp/vaio-p-apply-check.log; then
-		cat /tmp/vaio-p-apply-check.log >&2
-		die "patch no longer applies cleanly against this Haiku revision." \
-			"See README.VAIO-P-PATCHES.md at the repo root (in the patch" \
-			"file's own history / your checkout of this tooling) for what" \
-			"each patch does, and re-derive the failing hunk(s) by hand" \
-			"against the current source before re-running this script."
+	# -3 (three-way) rather than a plain apply: the patch targets `master`,
+	# which moves daily, so hunks whose surrounding code merely shifted
+	# should merge on their own instead of failing the whole build. It only
+	# leaves conflict markers when a hunk genuinely disagrees with upstream
+	# -- usually because upstream fixed the same bug, in which case the hunk
+	# should be dropped, not re-derived. See "Patch baseline" in README.md.
+	if ! git -C haiku apply -3 "$PATCH_FILE" 2>/tmp/vaio-p-apply.log; then
+		cat /tmp/vaio-p-apply.log >&2
+		git -C haiku diff --name-only --diff-filter=U >&2 || true
+		die "patch does not apply against this Haiku revision, even with a" \
+			"three-way merge. The conflicting files are listed above (also" \
+			"left in the working tree with conflict markers). See \"Patch" \
+			"baseline\" in README.md next to this script: check whether" \
+			"upstream already carries the same fix -- if so drop the hunk," \
+			"otherwise re-derive it -- then regenerate the diff."
 	fi
-	git -C haiku apply "$PATCH_FILE"
 fi
 
 # ---------------------------------------------------------------------------
@@ -135,6 +142,7 @@ else
 			--build-cross-tools x86_gcc2 \
 			--build-cross-tools x86 \
 			--cross-tools-source "$WORK_DIR/buildtools" \
+			--distro-compatibility official \
 			--use-gcc-pipe -j"$JOBS"
 	)
 fi

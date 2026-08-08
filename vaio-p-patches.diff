@@ -1,5 +1,5 @@
 diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
-index 4d35b2958e..4e153059ca 100644
+index d074e1decb..41ec00fa51 100644
 --- a/build/jam/DefaultBuildProfiles
 +++ b/build/jam/DefaultBuildProfiles
 @@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
@@ -73,7 +73,7 @@ index cb649a080c..5974d85d23 100644
 +AddFilesToHaikuImage system non-packaged data firmware intel-ucode
 +	: $(vaioPUcodeFile) ;
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index 46fcc37cca..1f9c747248 100644
+index 4dcf6c7209..880f07d2e0 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
 @@ -102,10 +102,22 @@ AddFilesToPackage add-ons kernel interrupt_controllers :
@@ -480,28 +480,6 @@ index 0000000000..5b5572699c
 +
 +
 +#endif	/* _BACKLIGHT_MODULE_H */
-diff --git a/headers/private/kernel/kernel.h b/headers/private/kernel/kernel.h
-index 0a48f79d48..1e53afc3a0 100644
---- a/headers/private/kernel/kernel.h
-+++ b/headers/private/kernel/kernel.h
-@@ -89,8 +89,15 @@ is_user_address_range(const void* addr, size_t size)
- 
- 
- #define CHECK_BIT(a, b) ((a) & (1 << (b)))
--#define SET_BIT(a, b) ((a) | (1 << (b)))
--#define CLEAR_BIT(a, b) ((a) & (~(1 << (b))))
-+// SET_BIT/CLEAR_BIT take a bitmask in `b` (not a bit index), matching
-+// GET_BIT/TOGGLE_BIT below -- their only caller (the h2 Bluetooth USB
-+// transport driver) passes pre-shifted bt_transport_status_t constants
-+// like RUNNING = (1<<1). The previous "(1 << (b))" definitions silently
-+// shifted an already-shifted mask a second time, so e.g. SET_BIT(state,
-+// RUNNING) set bit 0x4 while GET_BIT(state, RUNNING) checked bit 0x2 --
-+// the RUNNING flag could never be observed as set once it was "set".
-+#define SET_BIT(a, b) ((a) | (b))
-+#define CLEAR_BIT(a, b) ((a) & (~(b)))
- #define GET_BIT(a, b) ((a & b) != 0)
- #define TOGGLE_BIT(a, b) (a ^= b)
- 
 diff --git a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
 index d3ceae1c5d..c1dc30408c 100644
 --- a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
@@ -565,10 +543,10 @@ index ab68836056..f88332b1a0 100644
      return_ACPI_STATUS (Status);
  }
 diff --git a/src/add-ons/kernel/bus_managers/pci/pci.cpp b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-index c966e6d934..215e94198c 100644
+index f3da703e64..23b213b357 100644
 --- a/src/add-ons/kernel/bus_managers/pci/pci.cpp
 +++ b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-@@ -1616,13 +1616,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1620,13 +1620,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -602,7 +580,7 @@ index c966e6d934..215e94198c 100644
  	status_t status = (*info->controller->read_pci_config)(info->controller_cookie,
  		bus, device, function, offset, size, value);
  	if (status != B_OK) {
-@@ -1669,13 +1687,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1676,13 +1694,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -1099,7 +1077,7 @@ index 81f5137c83..a2cca2eff2 100644
  
  
 diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
-index c6c5372065..f7f443275d 100644
+index 45feb64bc9..bdda437c06 100644
 --- a/src/add-ons/kernel/busses/usb/ehci.cpp
 +++ b/src/add-ons/kernel/busses/usb/ehci.cpp
 @@ -1204,6 +1204,33 @@ EHCI::SubmitIsochronous(Transfer *transfer)
@@ -1156,22 +1134,7 @@ index c6c5372065..f7f443275d 100644
  	while (dataLength > 0) {
  		ehci_itd* itd = CreateItdDescriptor();
  		isoRequest[itdIndex++] = itd;
-@@ -1256,8 +1289,13 @@ EHCI::SubmitIsochronous(Transfer *transfer)
- 			"\n", currentPhy);
- 		for (int32 i = 0; i < 8 && dataLength > 0; i++) {
- 			size_t length = min_c(dataLength, packetSize);
-+			// A length that doesn't fit the 12-bit TLENGTH field would
-+			// silently bleed into the adjacent status bits (shifted right
-+			// next to it) instead of being truncated, corrupting the
-+			// descriptor's status before the transaction even runs.
- 			itd->token[i] = (EHCI_ITD_STATUS_ACTIVE << EHCI_ITD_STATUS_SHIFT)
--				| (length << EHCI_ITD_TLENGTH_SHIFT) | (pg << EHCI_ITD_PG_SHIFT)
-+				| ((length & EHCI_ITD_TLENGTH_MASK) << EHCI_ITD_TLENGTH_SHIFT)
-+				| (pg << EHCI_ITD_PG_SHIFT)
- 				| (offset << EHCI_ITD_TOFFSET_SHIFT);
- 			itd->last_token = i;
- 			TRACE("isochronous filled slot %" B_PRId32 " 0x%" B_PRIx32 "\n", i,
-@@ -1303,7 +1341,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+@@ -1299,7 +1332,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
  
  	// Add transfer to the list
  	result = AddPendingIsochronousTransfer(transfer, isoRequest,
@@ -1180,7 +1143,7 @@ index c6c5372065..f7f443275d 100644
  		transfer->DataLength());
  	if (result != B_OK) {
  		TRACE_ERROR("failed to add pending isochronous transfer\n");
-@@ -1315,7 +1353,12 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+@@ -1311,7 +1344,12 @@ EHCI::SubmitIsochronous(Transfer *transfer)
  
  	TRACE("appended isochronous transfer by starting at frame number %d\n",
  		currentFrame);
@@ -1194,7 +1157,7 @@ index c6c5372065..f7f443275d 100644
  
  	// Wake up the isochronous finisher thread
  	release_sem_etc(fFinishIsochronousTransfersSem, 1 /*frameCount*/,
-@@ -1698,8 +1741,8 @@ EHCI::AddPendingTransfer(Transfer *transfer, ehci_qh *queueHead,
+@@ -1694,8 +1732,8 @@ EHCI::AddPendingTransfer(Transfer *transfer, ehci_qh *queueHead,
  
  status_t
  EHCI::AddPendingIsochronousTransfer(Transfer *transfer, ehci_itd **isoRequest,
@@ -1205,7 +1168,7 @@ index c6c5372065..f7f443275d 100644
  {
  	if (!transfer || !isoRequest)
  		return B_BAD_VALUE;
-@@ -1712,6 +1755,7 @@ EHCI::AddPendingIsochronousTransfer(Transfer *transfer, ehci_itd **isoRequest,
+@@ -1708,6 +1746,7 @@ EHCI::AddPendingIsochronousTransfer(Transfer *transfer, ehci_itd **isoRequest,
  	data->transfer = transfer;
  	data->descriptors = isoRequest;
  	data->last_to_process = lastIndex;
@@ -1213,7 +1176,7 @@ index c6c5372065..f7f443275d 100644
  	data->incoming = directionIn;
  	data->is_active = true;
  	data->link = NULL;
-@@ -2212,6 +2256,27 @@ EHCI::FinishIsochronousTransfers()
+@@ -2208,6 +2247,27 @@ EHCI::FinishIsochronousTransfers()
  
  					itd = itd->prev;
  
@@ -1241,7 +1204,7 @@ index c6c5372065..f7f443275d 100644
  					for (uint32 i = 0; i <= transfer->last_to_process; i++)
  						FreeDescriptor(transfer->descriptors[i]);
  
-@@ -2238,6 +2303,27 @@ EHCI::FinishIsochronousTransfers()
+@@ -2234,6 +2294,27 @@ EHCI::FinishIsochronousTransfers()
  			fFrameBandwidth[currentFrame] = MAX_AVAILABLE_BANDWIDTH;
  			currentFrame = (currentFrame + 1) % EHCI_VFRAMELIST_ENTRIES_COUNT;
  		}
@@ -2499,29 +2462,6 @@ index b929cd9759..b3bf398fce 100644
  SubInclude HAIKU_TOP src add-ons kernel drivers power amd_thermal ;
  SubInclude HAIKU_TOP src add-ons kernel drivers power pch_thermal ;
 +SubInclude HAIKU_TOP src add-ons kernel drivers power sony_ec ;
-diff --git a/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp b/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp
-index 4d824d4cfe..e53eb9140a 100644
---- a/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp
-+++ b/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp
-@@ -118,11 +118,13 @@ acpi_lid_read(void* _cookie, off_t position, void *buf, size_t* num_bytes)
- 	if (*num_bytes < 1)
- 		return B_IO_ERROR;
- 
--	if (position > 0) {
--		*num_bytes = 0;
--		return B_OK;
--	}
--
-+	// Note: deliberately no "position > 0 means EOF" check here. The consumer
-+	// (power_daemon's LidMonitor) keeps a single descriptor open and reads
-+	// from it once per notification, so its file position keeps advancing.
-+	// With an EOF check, every read after the first one returned 0 bytes
-+	// without ever clearing "updated" below -- leaving the select pool
-+	// permanently signalled, which spun power_daemon at 100% CPU from the
-+	// first lid-open onwards. acpi_button has always worked this way.
- 	if (user_memcpy(buf, &device->last_status, sizeof(uint8)) < B_OK)
- 		return B_BAD_ADDRESS;
- 
 diff --git a/src/add-ons/kernel/drivers/power/sony_ec/Jamfile b/src/add-ons/kernel/drivers/power/sony_ec/Jamfile
 new file mode 100644
 index 0000000000..f7d6080a04
@@ -5772,10 +5712,10 @@ index 5d76dd4fdc..fb8caf8850 100644
  
  #endif
 diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
-index fbe3763a06..9b8f95e2b5 100644
+index 1ce2a85128..584f41b79e 100644
 --- a/src/servers/bluetooth/BluetoothServer.cpp
 +++ b/src/servers/bluetooth/BluetoothServer.cpp
-@@ -150,6 +150,11 @@ void BluetoothServer::MessageReceived(BMessage* message)
+@@ -151,6 +151,11 @@ void BluetoothServer::MessageReceived(BMessage* message)
  					lDeviceImpl->GetID());
  			} else {
  				TRACE_BT("BluetoothServer: Adding LocalDevice hci id invalid\n");
@@ -5787,7 +5727,7 @@ index fbe3763a06..9b8f95e2b5 100644
  			}
  
  			status = B_WOULD_BLOCK;
-@@ -458,9 +463,8 @@ status_t
+@@ -489,9 +494,8 @@ status_t
  BluetoothServer::HandleSimpleRequest(BMessage* message, BMessage* reply)
  {
  	LocalDeviceImpl* lDeviceImpl = LocateDelegateFromMessage(message);
@@ -5798,7 +5738,7 @@ index fbe3763a06..9b8f95e2b5 100644
  
  	const char* propertyRequested;
  
-@@ -477,11 +481,13 @@ BluetoothServer::HandleSimpleRequest(BMessage* message, BMessage* reply)
+@@ -508,11 +512,13 @@ BluetoothServer::HandleSimpleRequest(BMessage* message, BMessage* reply)
  	// we are gonna need issue the command ...
  	if (lDeviceImpl->ProcessSimpleRequest(DetachCurrentMessage()) == B_OK)
  		return B_WOULD_BLOCK;
@@ -6380,7 +6320,7 @@ index 9435811872..64064e554c 100644
  
  		delete link;
 diff --git a/src/system/kernel/arch/x86/ioapic.cpp b/src/system/kernel/arch/x86/ioapic.cpp
-index e8815d3513..ebfba8f957 100644
+index 576d492921..cf242a82ba 100644
 --- a/src/system/kernel/arch/x86/ioapic.cpp
 +++ b/src/system/kernel/arch/x86/ioapic.cpp
 @@ -5,6 +5,7 @@
@@ -6399,7 +6339,7 @@ index e8815d3513..ebfba8f957 100644
  #include <string.h>
  #include <stdio.h>
  #include <cpu.h>
-@@ -190,6 +192,58 @@ ioapic_write_64(struct ioapic& ioapic, uint8 registerSelect, uint64 value,
+@@ -192,6 +194,58 @@ ioapic_write_64(struct ioapic& ioapic, uint8 registerSelect, uint64 value,
  }
  
  
@@ -6458,7 +6398,7 @@ index e8815d3513..ebfba8f957 100644
  static void
  ioapic_configure_pin(struct ioapic& ioapic, uint8 pin, uint8 vector,
  	uint8 triggerPolarity, uint16 deliveryMode)
-@@ -691,6 +745,12 @@ ioapic_init(kernel_args* args)
+@@ -698,6 +752,12 @@ ioapic_init(kernel_args* args)
  		&ioapic_assign_interrupt_to_cpu,
  	};
  

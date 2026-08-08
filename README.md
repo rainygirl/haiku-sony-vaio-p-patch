@@ -10,7 +10,19 @@ This folder contains the scripts that apply the Sony VAIO P (VGN-P70H_G) boot/in
 
 ## Patch baseline
 
-These patches were derived against the Haiku OS source as of **2026-07-21**. Some of the underlying bugs (e.g. the ACPICA Global Lock init race, ACPI IRQ trigger/polarity, PCI unaligned config access, the PS/2 multiplexer port-probing timeout, the USBKit `SetAlternate()` bug, the UHCI halt-recovery gap, all of the EHCI isochronous fixes, the UVC frame-index bug, and the SMP AP bring-up retry) are generic correctness issues, not VAIO-P-specific — they may already be fixed upstream by the time you apply this against a newer checkout. If a patch fails to apply, check whether it's already fixed before re-deriving it.
+These patches are derived against **`master`, verified at `056fed280f` (hrev99002+115, 2026-08-08)** — the branch `build-vaio-p-iso.sh` checks out on a fresh clone. They were originally written against the 2026-07-21 source; the earlier `r1beta6`-based version of the diff is in this file's git history.
+
+Some of the underlying bugs (e.g. the ACPICA Global Lock init race, ACPI IRQ trigger/polarity, PCI unaligned config access, the PS/2 multiplexer port-probing timeout, the USBKit `SetAlternate()` bug, the UHCI halt-recovery gap, all of the EHCI isochronous fixes, the UVC frame-index bug, and the SMP AP bring-up retry) are generic correctness issues, not VAIO-P-specific — they may already be fixed upstream by the time you apply this against a newer checkout. If a patch fails to apply, check whether it's already fixed before re-deriving it.
+
+Three of them already were, and their hunks are consequently no longer in the diff:
+
+| Was patched | Fixed upstream by | Notes |
+| --- | --- | --- |
+| `headers/private/kernel/kernel.h` (`SET_BIT`/`CLEAR_BIT` mask semantics) | `0dc37ccfb5` | The macros were deleted outright and their three h2-driver call sites written as plain bit operations. |
+| `acpi_lid.cpp` (the `position > 0` early return that spun `power_daemon`) | `15c199f8fd` | Same removal, same reason. |
+| `ehci.cpp` (12-bit `TLENGTH` overflowing into the status bits) | `051bb37f50` | The new `EHCI_ITD_TLENGTH(x)` macro masks to `0x0fff` itself. The other three EHCI isochronous fixes (frame chaining, unlinking every iTD, and the starting-frame race) are still needed and still in the diff. |
+
+Since the target is a moving branch, `build-vaio-p-iso.sh` applies the diff with `git apply -3`, so hunks whose surrounding code merely shifted are merged automatically; it only stops if a hunk genuinely conflicts.
 
 ## What's patched
 
@@ -138,9 +150,13 @@ cd tools/vaio-p
 - `HAIKU_GIT_REF` : Branch/tag/commit of haiku.git to check out. Defaults to whatever is currently checked out (or `master` on a fresh clone).
 - `JOBS` : Parallelism for `configure`/`jam`. Defaults to `nproc`.
 
+### Why `configure --distro-compatibility official`
+
+Without it, `HAIKU_DISTRO_COMPATIBILITY` defaults to `default`, which makes `headers/private/kernel/boot/images.h` pull in `images-sans-tm.h` — the trademark-free splash set, whose 372x96 logo image is *blank*. The boot icons come from the same header and are real, so the symptom is a boot screen with the row of icons and no Haiku logo above it. `official` selects `images-tm-development.h` (what upstream's own nightlies use) instead. The define is otherwise only read by About, Deskbar's leaf menu, Installer, and the first-boot prompt, all cosmetic.
+
 ## If a patch fails to apply
 
-Check `git apply --check tools/vaio-p/vaio-p-patches.diff` for the exact hunk that failed, then look at the file at that location: if the same fix is already present upstream (likely for the "generic correctness" items listed under "Patch baseline"), skip that hunk; if the surrounding code has just shifted, re-derive that one file's hunk with `git diff` against a manually re-applied change rather than regenerating the whole patch.
+The build script already retries with a three-way merge, so this only happens on a real conflict. Run `git apply -3 tools/vaio-p/vaio-p-patches.diff` in the checkout to get the conflict markers, then look at each one: if upstream already carries the same fix (likely for the "generic correctness" items listed under "Patch baseline" — three of them have already gone that way), keep upstream's side and drop the hunk; otherwise re-derive it. Regenerate the whole diff with `git diff HEAD --binary` afterwards — `--binary` matters, the Intel microcode blob is in there.
 
 ## Applying a fix without reinstalling
 
