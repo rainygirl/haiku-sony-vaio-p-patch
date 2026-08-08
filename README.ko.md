@@ -36,6 +36,8 @@ English version: [`README.md`](README.md).
 - **usb_raw + USBKit: 중첩 isochronous 전송** — `usb_raw.cpp`/`.h`, `USBEndpoint.cpp`, `USBKit.h`: 기존의 블로킹 isochronous ioctl을 논블로킹 제출 + 별도 대기로 분리한 신규 `B_USB_RAW_COMMAND_QUEUE_ISOCHRONOUS`/`WAIT_ISOCHRONOUS` ioctl(그리고 대응하는 `BUSBEndpoint::QueueIsochronous()`/`WaitIsochronous()` 공개 API)을 추가했습니다. 요청별 완료 상태를 분리해 전송 2개를 동시에 진행할 수 있습니다. 이게 없으면 모든 캡처 루프가 전송 완료와 다음 제출 사이에 스케줄 공백을 필연적으로 만들고, isochronous IN 장치는 그 공백에도 계속 전송하므로 매 호출마다 데이터가 유실됩니다. 기존 블로킹 ioctl은 그대로 유지됩니다.
 - **USBKit `SetAlternate()` 버그** — `USBInterface.cpp`: `BUSBInterface::SetAlternate()`가 실제 장치의 alternate setting은 정상적으로 전환시키면서도 자기 자신의 `fAlternate` 멤버는 갱신하지 않아서, 그 직후 같은 객체에서 `EndpointAt()`을 호출하면 방금 선택한 alternate가 아니라 객체 생성 당시의 alternate(보통 대역폭 0인 유휴 상태)의 엔드포인트를 계속 돌려줬습니다. 실질적으로 USB 웹캠이 isochronous 데이터를 전혀 받지 못했던 첫 번째 원인입니다.
 - **웹캠 (UVC)** — `UVCCamDevice.cpp`/`.h`, `UVCDeframer.cpp`/`.h`, `CamDevice.cpp`/`.h`: 최대 원인은 `AcceptVideoFrame()`이 선택한 해상도의 *목록 위치*(0부터)를 저장해놓고 그걸 카메라에 UVC *frame index*(1부터)로 보낸 버그였습니다 — 320x240을 골랐는데 실제로는 카메라에 640x480이 커밋되어, 호스트가 614400바이트 프레임을 153600바이트 320x240으로 잘라 디코드하면서 빗살무늬("인터레이스처럼 보임"), 세로 늘어남, 끝없는 세로 스크롤이 생겼고, 캡처 경로를 아무리 고쳐도 사라지지 않았습니다. 그 위에 얹힌 수정들: YUY2 디코딩(이 카메라는 Bayer가 아니라 YUY2) + 디코더 양쪽에 하드 바운드 클램프(짧은 프레임이 버퍼 밖을 읽고 써서 실제 세그폴트/커널 패닉 발생했음); 하이밴드위드 `wMaxPacketSize` 디코딩(단순 바이트 수가 아니라 기본크기 x microframe당 전송수); 고정 stride 패킷 버퍼 워킹(DMA 버퍼는 `actual_length`가 아니라 `maxPacketSize` 간격으로 배치됨); 신규 Queue/Wait API + 별도 소비 스레드를 쓰는 더블 버퍼 캡처(항상 전송 1개가 컨트롤러에 걸려 있도록); 정확한 바이트 카운트로 프레임을 내보내되 카메라 FID 토글에서 위상을 재고정하고 손실 프레임은 밀린 채 표시하는 대신 조용히 버리는 하이브리드 디프레이밍; 최신 프레임만 표시하는 큐 드레인(지연 감소); 드롭된 프레임에서 검은 화면 대신 직전 프레임 유지; `StopTransfer()`가 스트리밍 인터페이스를 내리기 *전에* 진행 중 전송을 먼저 비우도록 순서 수정(기존엔 실제 "USB object did not become idle" 패닉 발생).
+  뒤늦게 발견한 후속 수정: `CamDeframer`의 프레임 목록은 미디어 스레드가 `fLocker` 잠금 아래에서 읽고 비우는데, USB 전송 스레드에서 도는 `UVCDeframer::_EmitCurrentFrame()`은 **잠금 없이** `fFrames.AddItem()`을 호출하고 있었습니다. 두 스레드가 `BList`를 동시에 건드리면 내부 배열이 깨지고, 그 결과가 나중에 `DropFrame()` 안에서 `double free`로 터집니다. 그러면 `media_addon_server`가 죽고, 모든 미디어 애드온이 이 프로세스를 공유하므로 오디오 믹서까지 함께 사라집니다. 경합 자체는 업스트림 것이지만, 위의 오래된 프레임 비우기가 호출마다 여러 프레임을 제거하면서 드물던 창을 잦은 것으로 만들었습니다. 이제 추가 쪽에도 잠금을 겁니다.
+
 - **CodyCam** — `VideoConsumer.cpp`/`.h`: 표시 쪽 수정 2건: 비트맵을 뷰 모양에 강제로 늘리는 대신 화면비를 유지하며 레터박스/필러박스로 그리고, 프로듀서 소유 버퍼일 때 슬롯 0 하나만 쓰지 않고 비트맵 3개를 순환합니다 — 기존 코드는 뷰가 아직 그리는 중인 비트맵 하나를 매 프레임 덮어써서 실제 티어링 레이스가 있었습니다.
 - **부팅 화면** — `video.cpp`: 이 하드웨어의 VESA BIOS는 DDC/EDID를 아예 지원하지 않아 네이티브 해상도(1600x768)를 자동 감지할 방법이 없습니다. VESA 모드 목록에 해당 해상도가 있으면 부트로더가 직접 골라 씁니다.
 - **부팅 속도/견고성 (범용)** — `smp.cpp`(부트로더): 이 개체의 두 번째 논리 CPU는 기동하지 않는데, 업스트림의 대기 루프에는 타임아웃이 아예 없어서 `smp_boot_other_cpus()`가 그 자리에서 영원히 멈췄고 결국 부팅 자체가 되지 않았습니다. 이제 모든 대기에 상한을 두고, AP마다 INIT/SIPI/SIPI 전체 시퀀스(트램폴린 스택 재설정 포함)를 최대 3회까지 재시도한 뒤 포기하고 실제로 응답한 CPU 수만으로 부팅을 계속합니다. **이는 수정이 아니라 회피이며 CPU는 단일 스레드로 남습니다 — 이 기기에서는 그게 올바른 결과입니다. 아래 "두 번째 논리 CPU" 항목을 보세요.** `evglock.c`: 핸들러 설치 도중 Global Lock SCI가 동기적으로 발생할 때 필요한 락이 아직 없어서 터지는 ACPICA 레이스를 수정. `pci.cpp`: 정렬 안 된 32비트 config 공간 접근을 그냥 거부하지 않고 16비트 접근 두 번으로 쪼갬. `acpi_irq_routing_table.cpp`: 잘못됐을 수 있는 ACPI 서술자를 그대로 믿는 대신 IRQ 극성/트리거 모드를 고정값으로 보정. `vfs_boot.cpp`: 부팅 파티션 탐색을 즉시 패닉하지 않고 최대 60초까지 재시도 — 열거가 느린 USB 부팅 매체에 더해, 부팅 초기 USB halt/복구 사이클(각각의 안정화 지연, 포트 파워사이클, 쿨다운 재무장이 겹겹이 쌓임)이 부팅 장치의 열거를 이전 버전의 10초 한도 너머로 밀어내면서 실기에서 "did not find any boot partitions" 패닉으로 나타났습니다.
@@ -136,6 +138,26 @@ cd tools/vaio-p
 ## 패치가 적용되지 않을 때
 
 `git apply --check tools/vaio-p/vaio-p-patches.diff`로 정확히 어느 hunk가 실패했는지 확인한 뒤 해당 위치의 코드를 살펴보세요. "패치 기준 시점"에 나열한 범용 정합성 버그처럼 이미 공식 소스에 같은 수정이 들어가 있다면 그 hunk는 건너뛰면 되고, 주변 코드만 약간 밀린 경우라면 패치 전체를 다시 생성하지 말고 해당 파일 하나만 수동으로 다시 반영한 뒤 `git diff`로 그 hunk만 재생성하세요.
+
+## 재설치 없이 수정 적용하기
+
+커널 드라이버와 미디어 애드온은 동작 방식이 다릅니다. 여기서 틀리면 장치가 죽거나 재설치를 하게 됩니다.
+
+**커널 드라이버**는 이름으로 대체됩니다. 빌드한 드라이버를 `~/config/non-packaged/add-ons/kernel/drivers/bin/`에 넣으면 다음 부팅부터 패키지 사본을 가립니다.
+
+**미디어 애드온은 그렇지 않습니다.** `non-packaged/add-ons/media`에 넣으면 패키지 사본과 **둘 다** 로드되고, 같은 장치를 두고 경쟁해 결국 어느 쪽도 동작하지 않습니다. 교체하려면 `/boot/system/settings/packages`에 차단 목록을 만들어 패키지 파일을 먼저 가려야 합니다.
+
+```
+Package haiku {
+	BlockedEntries {
+		add-ons/media/usb_webcam.media_addon
+	}
+}
+```
+
+그 다음 빌드한 애드온을 `/boot/system/non-packaged/add-ons/media/`에 넣고 재부팅합니다. `ls /boot/system/add-ons/media/`에서 해당 파일이 사라졌으면 적용된 것입니다.
+
+실패처럼 보이지만 아닌 경우가 하나 있습니다. 기본 비디오 노드가 지정되지 않으면 카메라가 이미 열거되어 프레임을 내보내고 있어도 `BMediaRoster::GetVideoInput()`은 `B_NAME_NOT_FOUND`를 반환합니다. 이 기본값을 자동으로 지정해 주는 것은 없습니다. 애드온이 로드되지 않았다고 단정하기 전에 syslog에서 `usb_webcam deframer` 줄을 확인하세요.
 
 ## 빌드 후 확인
 
