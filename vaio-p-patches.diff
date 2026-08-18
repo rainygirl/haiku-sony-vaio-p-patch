@@ -1,5 +1,5 @@
 diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
-index d074e1decb..41ec00fa51 100644
+index 873b97c49a..6203e94160 100644
 --- a/build/jam/DefaultBuildProfiles
 +++ b/build/jam/DefaultBuildProfiles
 @@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
@@ -73,7 +73,7 @@ index cb649a080c..5974d85d23 100644
 +AddFilesToHaikuImage system non-packaged data firmware intel-ucode
 +	: $(vaioPUcodeFile) ;
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index 4dcf6c7209..880f07d2e0 100644
+index 8195ada16b..ba9e21fb77 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
 @@ -102,10 +102,22 @@ AddFilesToPackage add-ons kernel interrupt_controllers :
@@ -99,24 +99,6 @@ index 4dcf6c7209..880f07d2e0 100644
  	;
  
  if $(TARGET_ARCH) = x86 || $(TARGET_ARCH) = x86_64 {
-diff --git a/data/launch/user b/data/launch/user
-index d15a4d19e3..7aa9e8f44d 100644
---- a/data/launch/user
-+++ b/data/launch/user
-@@ -32,6 +32,13 @@ target desktop {
- 		no_safemode
- 	}
- 
-+	service x-vnd.Haiku-bluetooth_server {
-+		launch /system/servers/bluetooth_server
-+		no_safemode
-+		on initial_volumes_mounted
-+		requires x-vnd.Be-TSKB
-+	}
-+
- 	job user-bootscript {
- 		launch /bin/sh ~/config/settings/boot/UserBootscript
- 	}
 diff --git a/data/system/data/firmware/intel-ucode/06-1c-02 b/data/system/data/firmware/intel-ucode/06-1c-02
 new file mode 100644
 index 0000000000000000000000000000000000000000..db30b527acac77bd773d7b83acbf60c82743debc
@@ -480,6 +462,62 @@ index 0000000000..5b5572699c
 +
 +
 +#endif	/* _BACKLIGHT_MODULE_H */
+diff --git a/headers/private/kernel/arch/x86/arch_kernel_args.h b/headers/private/kernel/arch/x86/arch_kernel_args.h
+index 694ef851a2..91be4cd561 100644
+--- a/headers/private/kernel/arch/x86/arch_kernel_args.h
++++ b/headers/private/kernel/arch/x86/arch_kernel_args.h
+@@ -20,8 +20,8 @@
+ // kernel args
+ typedef struct {
+ 	// architecture specific
+-	uint32	_unused1; // previously: system_time_cv_factor
+-	uint64	_unused2; // previously: cpu_clock_speed
++	uint32	system_time_cv_factor;
++	uint64	cpu_clock_speed;
+ 	uint32	phys_pgdir;
+ 	uint64	vir_pgdir;
+ 	uint32	num_pgtables;
+diff --git a/headers/private/kernel/arch/x86/timer.h b/headers/private/kernel/arch/x86/timer.h
+index 7c4d340804..9219f9ef7b 100644
+--- a/headers/private/kernel/arch/x86/timer.h
++++ b/headers/private/kernel/arch/x86/timer.h
+@@ -1,17 +1,13 @@
+-/*
+- * Copyright 2026, Haiku, Inc. All rights reserved.
+- * Distributed under the terms of the MIT License.
+- */
++/* 
++** Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
++** Distributed under the terms of the NewOS License.
++*/
+ #ifndef _KERNEL_ARCH_X86_TIMER
+ #define _KERNEL_ARCH_X86_TIMER
+ 
+-
+-extern uint32 gSystemTimeConversionFactor;
+-extern int64 gCPUClockSpeed;
+-
+-
+-void x86_init_tsc(kernel_args* args);
+-
++#define ISA_TIMER_MODULE_NAME "timers/x86/isa/v1"
++#define APIC_TIMER_MODULE_NAME "timers/x86/apic/v1"
++#define HPET_TIMER_MODULE_NAME "timers/x86/hpet/v1"
+ 
+ #endif
+ 
+diff --git a/headers/private/kernel/boot/arch/x86/arch_cpu.h b/headers/private/kernel/boot/arch/x86/arch_cpu.h
+index 25fd7c1102..62e1c88c45 100644
+--- a/headers/private/kernel/boot/arch/x86/arch_cpu.h
++++ b/headers/private/kernel/boot/arch/x86/arch_cpu.h
+@@ -17,6 +17,7 @@ extern "C" {
+ #endif
+ 
+ 
++void determine_cpu_conversion_factor(uint8 channel);
+ status_t boot_arch_cpu_init(void);
+ void arch_ucode_load(BootVolume& volume);
+ 
 diff --git a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
 index d3ceae1c5d..c1dc30408c 100644
 --- a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
@@ -5219,7 +5257,7 @@ index 0416e1cd4e..67393b831d 100644
  			BBufferGroup*		fBuffers;
  			BBuffer*			fBufferMap[3];
 diff --git a/src/apps/installer/WorkerThread.cpp b/src/apps/installer/WorkerThread.cpp
-index c9aa19729a..bbc7ca1fca 100644
+index 69997a7750..cf4d18e972 100644
 --- a/src/apps/installer/WorkerThread.cpp
 +++ b/src/apps/installer/WorkerThread.cpp
 @@ -8,6 +8,7 @@
@@ -5230,7 +5268,7 @@ index c9aa19729a..bbc7ca1fca 100644
  
  #include <set>
  #include <string>
-@@ -425,6 +426,95 @@ WorkerThread::_WriteBootSector(BPath &path)
+@@ -427,6 +428,95 @@ WorkerThread::_WriteBootSector(BPath &path)
  }
  
  
@@ -5326,7 +5364,7 @@ index c9aa19729a..bbc7ca1fca 100644
  status_t
  WorkerThread::_LaunchFinishScript(BPath &path)
  {
-@@ -706,6 +796,25 @@ WorkerThread::_PerformInstall(partition_id sourcePartitionID,
+@@ -708,6 +798,25 @@ WorkerThread::_PerformInstall(partition_id sourcePartitionID,
  	if (err != B_OK)
  		return _InstallationError(err);
  
@@ -6020,11 +6058,480 @@ index 948b9b4d6f..aa10189865 100644
  };
  
  #endif	// AUTOCONFIG_LOOPER_H
+diff --git a/src/system/boot/arch/arm64/arch_cpu.cpp b/src/system/boot/arch/arm64/arch_cpu.cpp
+index 90ab3c7f60..d2d9a11059 100644
+--- a/src/system/boot/arch/arm64/arch_cpu.cpp
++++ b/src/system/boot/arch/arm64/arch_cpu.cpp
+@@ -28,3 +28,31 @@ arch_ucode_load(BootVolume& volume)
+ {
+ 	// Yes, we have no bananas!
+ }
++
++
++extern "C" bigtime_t
++system_time()
++{
++
++	#warning Implement system_time in ARM64 bootloader!
++	//https://en.wikipedia.org/wiki/Time_Stamp_Counter
++	// read system time register:  cntpct_el0 / cntvct_el0
++	// frequency of the system timer can be discovered by reading cntfrq_el0
++	// https://wiki.osdev.org/ARMv7_Generic_Timers#CNTPCT
++
++	uint64_t ticks;
++	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(ticks));
++	//conversion factor stuff
++	return ticks;
++	//return u64_mul_u64_fp32_64(ticks, ns_per_cntpct);
++}
++
++
++extern "C" void
++spin(bigtime_t microseconds)
++{
++	auto time = system_time();
++
++	while ((system_time() - time) < microseconds)
++		asm volatile ("yield;");
++}
+diff --git a/src/system/boot/arch/riscv64/arch_cpu.cpp b/src/system/boot/arch/riscv64/arch_cpu.cpp
+index ab1518c90e..89eb07bff5 100644
+--- a/src/system/boot/arch/riscv64/arch_cpu.cpp
++++ b/src/system/boot/arch/riscv64/arch_cpu.cpp
+@@ -54,3 +54,20 @@ arch_ucode_load(BootVolume& volume)
+ {
+ 	// NOP on riscv currently
+ }
++
++
++extern "C" bigtime_t
++system_time()
++{
++	// TODO: units conversion
++	return CpuTime();
++}
++
++
++extern "C" void
++spin(bigtime_t microseconds)
++{
++	bigtime_t time = system_time();
++	while ((system_time() - time) < microseconds)
++		asm volatile ("nop;");
++}
+diff --git a/src/system/boot/arch/x86/arch_cpu.cpp b/src/system/boot/arch/x86/arch_cpu.cpp
+index 2e30916043..a130843372 100644
+--- a/src/system/boot/arch/x86/arch_cpu.cpp
++++ b/src/system/boot/arch/x86/arch_cpu.cpp
+@@ -23,6 +23,351 @@
+ 
+ #include <string.h>
+ 
++#include <x86intrin.h>
++
++
++uint32 gTimeConversionFactor;
++
++// PIT definitions
++#define TIMER_CLKNUM_HZ					(14318180 / 12)
++
++// PIT IO Ports
++#define PIT_CHANNEL_PORT_BASE			0x40
++#define PIT_CONTROL						0x43
++
++// Channel selection
++#define PIT_SELECT_CHANNEL_SHIFT		6
++
++// Access mode
++#define PIT_ACCESS_LATCH_COUNTER		(0 << 4)
++#define PIT_ACCESS_LOW_BYTE_ONLY		(1 << 4)
++#define PIT_ACCESS_HIGH_BYTE_ONLY		(2 << 4)
++#define PIT_ACCESS_LOW_THEN_HIGH_BYTE	(3 << 4)
++
++// Operating modes
++#define PIT_MODE_INTERRUPT_ON_0			(0 << 1)
++#define PIT_MODE_HARDWARE_COUNTDOWN		(1 << 1)
++#define PIT_MODE_RATE_GENERATOR			(2 << 1)
++#define PIT_MODE_SQUARE_WAVE_GENERATOR	(3 << 1)
++#define PIT_MODE_SOFTWARE_STROBE		(4 << 1)
++#define PIT_MODE_HARDWARE_STROBE		(5 << 1)
++
++// BCD/Binary mode
++#define PIT_BINARY_MODE					0
++#define PIT_BCD_MODE					1
++
++// Channel 2 control (speaker)
++#define PIT_CHANNEL_2_CONTROL			0x61
++#define PIT_CHANNEL_2_GATE_HIGH			0x01
++#define PIT_CHANNEL_2_SPEAKER_OFF_MASK	~0x02
++
++// Maximum values
++#define MAX_QUICK_SAMPLES				20
++#define MAX_SLOW_SAMPLES				20
++	// TODO: These are arbitrary. They are here to avoid spinning indefinitely
++	// if the TSC just isn't stable and we can't get our desired error range.
++
++
++#ifdef __SIZEOF_INT128__
++typedef unsigned __int128 uint128;
++#else
++struct uint128 {
++	uint128(uint64 low, uint64 high = 0)
++		:
++		low(low),
++		high(high)
++	{
++	}
++
++	bool operator<(const uint128& other) const
++	{
++		return high < other.high || (high == other.high && low < other.low);
++	}
++
++	bool operator<=(const uint128& other) const
++	{
++		return !(other < *this);
++	}
++
++	uint128 operator<<(int count) const
++	{
++		if (count == 0)
++			return *this;
++
++		if (count >= 128)
++			return 0;
++
++		if (count >= 64)
++			return uint128(0, low << (count - 64));
++
++		return uint128(low << count, (high << count) | (low >> (64 - count)));
++	}
++
++	uint128 operator>>(int count) const
++	{
++		if (count == 0)
++			return *this;
++
++		if (count >= 128)
++			return 0;
++
++		if (count >= 64)
++			return uint128(high >> (count - 64), 0);
++
++		return uint128((low >> count) | (high << (64 - count)), high >> count);
++	}
++
++	uint128 operator+(const uint128& other) const
++	{
++		uint64 resultLow = low + other.low;
++		return uint128(resultLow,
++			high + other.high + (resultLow < low ? 1 : 0));
++	}
++
++	uint128 operator-(const uint128& other) const
++	{
++		uint64 resultLow = low - other.low;
++		return uint128(resultLow,
++			high - other.high - (resultLow > low ? 1 : 0));
++	}
++
++	uint128 operator*(uint32 other) const
++	{
++		uint64 resultMid = (low >> 32) * other;
++		uint64 resultLow = (low & 0xffffffff) * other + (resultMid << 32);
++		return uint128(resultLow,
++			high * other + (resultMid >> 32)
++				+ (resultLow < resultMid << 32 ? 1 : 0));
++	}
++
++	uint128 operator/(const uint128& other) const
++	{
++		int shift = 0;
++		uint128 shiftedDivider = other;
++		while (shiftedDivider.high >> 63 == 0 && shiftedDivider < *this) {
++			shiftedDivider = shiftedDivider << 1;
++			shift++;
++		}
++
++		uint128 result = 0;
++		uint128 temp = *this;
++		for (; shift >= 0; shift--, shiftedDivider = shiftedDivider >> 1) {
++			if (shiftedDivider <= temp) {
++				result = result + (uint128(1) << shift);
++				temp = temp - shiftedDivider;
++			}
++		}
++
++		return result;
++	}
++
++	operator uint64() const
++	{
++		return low;
++	}
++
++private:
++	uint64	low;
++	uint64	high;
++};
++#endif
++
++
++static inline uint64_t
++rdtsc_fenced()
++{
++	// RDTSC is not serializing, nor does it drain the instruction stream.
++	// RDTSCP does, but is not available everywhere. Other OSes seem to use
++	// "CPUID" rather than MFENCE/LFENCE for serializing here during boot.
++	asm volatile ("cpuid" : : : "eax", "ebx", "ecx", "edx");
++
++	return __rdtsc();
++}
++
++
++static inline void
++calibration_loop(uint8 desiredHighByte, uint8 channel, uint64& tscDelta,
++	double& conversionFactor, uint16& expired)
++{
++	uint8 select = channel << PIT_SELECT_CHANNEL_SHIFT;
++	out8(select | PIT_ACCESS_LOW_THEN_HIGH_BYTE | PIT_MODE_INTERRUPT_ON_0
++		| PIT_BINARY_MODE, PIT_CONTROL);
++
++	// Fill in count of 0xffff, low then high byte
++	uint8 channelPort = PIT_CHANNEL_PORT_BASE + channel;
++	out8(0xff, channelPort);
++	out8(0xff, channelPort);
++
++	// Read the count back once to delay the start. This ensures that we've
++	// waited long enough for the counter to actually start counting down, as
++	// this only happens on the next clock cycle after reload.
++	in8(channelPort);
++	in8(channelPort);
++
++	// We're expecting the PIT to be at the starting position (high byte 0xff)
++	// as we just programmed it, but if it isn't we wait for it to wrap.
++	uint8 startLow;
++	uint8 startHigh;
++	do {
++		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
++		startLow = in8(channelPort);
++		startHigh = in8(channelPort);
++	} while (startHigh != 255);
++
++	// Read in the first TSC value
++	uint64 startTSC = rdtsc_fenced();
++
++	// Wait for the PIT to count down to our desired value
++	uint8 endLow;
++	uint8 endHigh;
++	do {
++		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
++		endLow = in8(channelPort);
++		endHigh = in8(channelPort);
++	} while (endHigh > desiredHighByte);
++
++	// And read the second TSC value
++	uint64 endTSC = rdtsc_fenced();
++
++	tscDelta = endTSC - startTSC;
++	expired = ((startHigh << 8) | startLow) - ((endHigh << 8) | endLow);
++	conversionFactor = (double)tscDelta / (double)expired;
++}
++
++
++static void
++calculate_cpu_conversion_factor(uint8 channel)
++{
++	// When using channel 2, enable the input and disable the speaker.
++	if (channel == 2) {
++		uint8 control = in8(PIT_CHANNEL_2_CONTROL);
++		control &= PIT_CHANNEL_2_SPEAKER_OFF_MASK;
++		control |= PIT_CHANNEL_2_GATE_HIGH;
++		out8(control, PIT_CHANNEL_2_CONTROL);
++	}
++
++	uint64 tscDeltaQuick, tscDeltaSlower, tscDeltaSlow;
++	double conversionFactorQuick, conversionFactorSlower, conversionFactorSlow;
++	uint16 expired;
++
++	uint32 quickSampleCount = 1;
++	uint32 slowSampleCount = 1;
++
++quick_sample:
++	calibration_loop(224, channel, tscDeltaQuick, conversionFactorQuick,
++		expired);
++
++slower_sample:
++	calibration_loop(192, channel, tscDeltaSlower, conversionFactorSlower,
++		expired);
++
++	double deviation = conversionFactorQuick / conversionFactorSlower;
++	if (deviation < 0.99 || deviation > 1.01) {
++		// We might have been hit by a SMI or were otherwise stalled
++		if (quickSampleCount++ < MAX_QUICK_SAMPLES)
++			goto quick_sample;
++	}
++
++	// Slow sample
++	calibration_loop(128, channel, tscDeltaSlow, conversionFactorSlow,
++		expired);
++
++	deviation = conversionFactorSlower / conversionFactorSlow;
++	if (deviation < 0.99 || deviation > 1.01) {
++		// We might have been hit by a SMI or were otherwise stalled
++		if (slowSampleCount++ < MAX_SLOW_SAMPLES)
++			goto slower_sample;
++	}
++
++	// Scale the TSC delta to timer units
++	tscDeltaSlow *= TIMER_CLKNUM_HZ;
++
++	uint64 clockSpeed = tscDeltaSlow / expired;
++	gTimeConversionFactor = ((uint128(expired) * uint32(1000000)) << 32)
++		/ uint128(tscDeltaSlow);
++
++#ifdef TRACE_CPU
++	if (clockSpeed > 1000000000LL) {
++		dprintf("CPU at %lld.%03Ld GHz\n", clockSpeed / 1000000000LL,
++			(clockSpeed % 1000000000LL) / 1000000LL);
++	} else {
++		dprintf("CPU at %lld.%03Ld MHz\n", clockSpeed / 1000000LL,
++			(clockSpeed % 1000000LL) / 1000LL);
++	}
++#endif
++
++	gKernelArgs.arch_args.system_time_cv_factor = gTimeConversionFactor;
++	gKernelArgs.arch_args.cpu_clock_speed = clockSpeed;
++	//dprintf("factors: %lu %llu\n", gTimeConversionFactor, clockSpeed);
++
++	if (quickSampleCount > 1) {
++		dprintf("needed %" B_PRIu32 " quick samples for TSC calibration\n",
++			quickSampleCount);
++	}
++
++	if (slowSampleCount > 1) {
++		dprintf("needed %" B_PRIu32 " slow samples for TSC calibration\n",
++			slowSampleCount);
++	}
++
++	if (channel == 2) {
++		// Set the gate low again
++		out8(in8(PIT_CHANNEL_2_CONTROL) & ~PIT_CHANNEL_2_GATE_HIGH,
++			PIT_CHANNEL_2_CONTROL);
++	}
++}
++
++
++void
++determine_cpu_conversion_factor(uint8 channel)
++{
++	// Before using the calibration loop, check if we are on a hypervisor.
++	cpuid_info info;
++	if (get_current_cpuid(&info, 1, 0) == B_OK
++			&& (info.regs.ecx & IA32_FEATURE_EXT_HYPERVISOR) != 0) {
++		get_current_cpuid(&info, 0x40000000, 0);
++		const uint32 maxVMM = info.regs.eax;
++
++		if (maxVMM >= 0x40000010) {
++			get_current_cpuid(&info, 0x40000010, 0);
++
++			uint64 clockSpeed = uint64(info.regs.eax) * 1000;
++			gTimeConversionFactor = (uint64(1000) << 32) / info.regs.eax;
++
++			gKernelArgs.arch_args.system_time_cv_factor = gTimeConversionFactor;
++			gKernelArgs.arch_args.cpu_clock_speed = clockSpeed;
++
++			dprintf("TSC frequency read from hypervisor CPUID leaf\n");
++			return;
++		}
++
++		if (maxVMM >= 0x40000003) {
++			// Hyper-V does not implement the standard hypervisor timing interface
++			// "Hv#1" here indicates Hyper-V
++			get_current_cpuid(&info, 0x40000001, 0);
++			if (info.regs.eax == 0x31237648) {
++				// Check for HV_X64_MSR_TSC_FREQUENCY presence
++				// TSC frequency is represented in Hz
++				get_current_cpuid(&info, 0x40000003, 0);
++				if ((info.regs.eax & (1 << 11)) != 0) {
++					uint64 clockSpeed = x86_read_msr(0x40000022);
++					if (clockSpeed > 0) {
++						gTimeConversionFactor = (uint64(1000000) << 32) / clockSpeed;
++
++						gKernelArgs.arch_args.system_time_cv_factor = gTimeConversionFactor;
++						gKernelArgs.arch_args.cpu_clock_speed = clockSpeed;
++
++						dprintf("TSC frequency read from Hyper-V MSR\n");
++						return;
++					}
++				}
++			}
++		}
++	}
++
++	calculate_cpu_conversion_factor(channel);
++}
++
+ 
+ void
+ ucode_load(BootVolume& volume)
+@@ -90,6 +435,26 @@ ucode_load(BootVolume& volume)
+ }
+ 
+ 
++extern "C" bigtime_t
++system_time()
++{
++	uint64 tsc = rdtsc_fenced();
++	uint64 lo = (uint32)tsc;
++	uint64 hi = tsc >> 32;
++	return ((lo * gTimeConversionFactor) >> 32) + hi * gTimeConversionFactor;
++}
++
++
++extern "C" void
++spin(bigtime_t microseconds)
++{
++	bigtime_t time = system_time();
++
++	while ((system_time() - time) < microseconds)
++		asm volatile ("pause;");
++}
++
++
+ extern "C" status_t
+ boot_arch_cpu_init()
+ {
+diff --git a/src/system/boot/platform/bios_ia32/Jamfile b/src/system/boot/platform/bios_ia32/Jamfile
+index c8893e4372..ca0a16c793 100644
+--- a/src/system/boot/platform/bios_ia32/Jamfile
++++ b/src/system/boot/platform/bios_ia32/Jamfile
+@@ -39,7 +39,6 @@ for platform in [ MultiBootSubDirSetup bios_ia32 ] {
+ 			smp.cpp
+ 			smp_trampoline.S
+ 			support.S
+-			timer.cpp
+ 			video.cpp
+ 			apm.cpp
+ 			interrupts.cpp
+diff --git a/src/system/boot/platform/bios_ia32/cpu.cpp b/src/system/boot/platform/bios_ia32/cpu.cpp
+index 4bcb0acf55..8185a62023 100644
+--- a/src/system/boot/platform/bios_ia32/cpu.cpp
++++ b/src/system/boot/platform/bios_ia32/cpu.cpp
+@@ -65,6 +65,8 @@ cpu_init()
+ 	if (check_cpu_features() != B_OK)
+ 		panic("You need a Pentium or higher in order to boot!\n");
+ 
++	determine_cpu_conversion_factor(0);
++
+ 	gKernelArgs.num_cpus = 1;
+ 		// this will eventually be corrected later on
+ }
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 68acf3f830..ba9f052a86 100644
+index 68acf3f830..681756d037 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
-@@ -379,6 +379,10 @@ smp_init_other_cpus(void)
+@@ -379,6 +379,157 @@ smp_init_other_cpus(void)
  }
  
  
@@ -6032,10 +6539,176 @@ index 68acf3f830..ba9f052a86 100644
 +static const uint32 kApStartupTimeoutMs = 500;
 +
 +
++#ifdef _PXE_ENV
++static const uint32 kTrampolineCode  = 0x8b000;
++static const uint32 kTrampolineStack = 0x8c000;
++#else
++static const uint32 kTrampolineCode  = 0x9f000;
++static const uint32 kTrampolineStack = 0x9e000;
++#endif
++
++// Written by the trampoline once it reaches 32-bit protected mode; lets the
++// BSP tell "already parked, just hand over the page directory" from "never
++// started, run the whole INIT/SIPI sequence".
++static const uint32 kApParkedMarker = 0x9e804;
++
++
++/*!	Copies the trampoline into place and builds the gdt it loads. Contents are
++	static, so this can run before the kernel is loaded.
++*/
++static void
++smp_setup_trampoline(void)
++{
++	memcpy((char *)kTrampolineCode, (const void*)&smp_trampoline,
++		(uint32)&smp_trampoline_end - (uint32)&smp_trampoline);
++
++	// gdt descriptor at the bottom of the stack page, gdt right behind it
++	*((uint16 *)kTrampolineStack) = 0x18 - 1;
++	*((uint32 *)(kTrampolineStack + 2)) = kTrampolineStack + 8;
++
++	segment_descriptor* tempGDT
++		= (segment_descriptor*)&((uint32 *)kTrampolineStack)[2];
++	clear_segment_descriptor(&tempGDT[0]);
++	set_segment_descriptor(&tempGDT[1], 0, 0xffffffff, DT_CODE_READABLE,
++		DPL_KERNEL);
++	set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
++		DPL_KERNEL);
++}
++
++
++/*!	One INIT assert/de-assert plus the startup IPIs, with every wait bounded.
++	Returns false if a send never completed.
++*/
++static bool
++smp_send_init_sipi(uint32 cpu)
++{
++	uint32 apicID = gKernelArgs.arch_args.cpu_apic_id[cpu];
++	uint32 config;
++
++	if (gKernelArgs.arch_args.cpu_apic_version[cpu] & 0xf0) {
++		apic_write(APIC_ERROR_STATUS, 0);
++		apic_read(APIC_ERROR_STATUS);
++	}
++
++	// INIT, asserted then de-asserted
++	for (int32 phase = 0; phase < 2; phase++) {
++		config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
++			| (apicID << 24);
++		apic_write(APIC_INTR_COMMAND_2, config);
++
++		config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
++			| APIC_TRIGGER_MODE_LEVEL | APIC_DELIVERY_MODE_INIT
++			| (phase == 0 ? APIC_INTR_COMMAND_1_ASSERT : 0);
++		apic_write(APIC_INTR_COMMAND_1, config);
++
++		uint32 timeout = kIPIDeliveryTimeout;
++		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
++				&& --timeout != 0) {
++			asm volatile ("pause;");
++		}
++		if (timeout == 0)
++			return false;
++	}
++
++	spin(10000);
++
++	uint32 numStartups
++		= (gKernelArgs.arch_args.cpu_apic_version[cpu] & 0xf0) ? 2 : 0;
++	for (uint32 j = 0; j < numStartups; j++) {
++		apic_write(APIC_ERROR_STATUS, 0);
++
++		config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
++			| (apicID << 24);
++		apic_write(APIC_INTR_COMMAND_2, config);
++
++		config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff0f800)
++			| APIC_DELIVERY_MODE_STARTUP | (kTrampolineCode >> 12);
++		apic_write(APIC_INTR_COMMAND_1, config);
++
++		spin(200);
++
++		uint32 timeout = kIPIDeliveryTimeout;
++		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
++				&& --timeout != 0) {
++			asm volatile ("pause;");
++		}
++		if (timeout == 0)
++			return false;
++	}
++
++	return true;
++}
++
++
++/*!	Wakes the application processors as early as possible and parks them in the
++	trampoline, waiting for the page directory the BSP will publish later.
++
++	On the Sony VAIO P the window in which an AP can be started at all is only
++	a few seconds wide from power-on: measured on hardware, inserting a one
++	second delay before the SIPI still works while five seconds does not, and
++	after that the AP stops responding to INIT and SIPI entirely -- no error,
++	no execution, ten retries make no difference. Normal bring-up happens after
++	the kernel, its add-ons and (with load_symbols, which Haiku enables by
++	default) their symbols have all been read off the disk, which on this
++	machine lands well outside that window and silently costs the second CPU.
++
++	Waking them here instead only needs the gdt, whose contents are static, so
++	it can run long before the kernel exists. The AP reaches 32-bit protected
++	mode and then spins on the page directory slot; smp_boot_other_cpus() fills
++	that in later exactly as before, and the AP carries on. If this did not
++	take, that function still performs the full INIT/SIPI sequence itself, so
++	nothing depends on it having worked.
++*/
++void
++smp_wake_other_cpus_early(void)
++{
++	if (gKernelArgs.arch_args.apic_phys == 0 || gKernelArgs.num_cpus < 2)
++		return;
++
++	if (gKernelArgs.arch_args.apic == NULL) {
++		gKernelArgs.arch_args.apic = (void *)mmu_map_physical_memory(
++			gKernelArgs.arch_args.apic_phys, B_PAGE_SIZE, kDefaultPageFlags);
++	}
++
++	smp_setup_trampoline();
++
++	// Both handover slots must read zero: the AP waits on the page directory
++	// one, and the BSP later waits for the other to be cleared.
++	*(volatile uint32 *)(kTrampolineStack + B_PAGE_SIZE - 8) = 0;
++	*(volatile uint32 *)(kTrampolineStack + B_PAGE_SIZE - 4) = 0;
++	*(volatile uint32 *)kApParkedMarker = 0;
++
++	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++)
++		smp_send_init_sipi(i);
++
++	dprintf("smp: early wake sent to %" B_PRIu32 " ap(s)\n",
++		gKernelArgs.num_cpus - 1);
++}
++
++
  void
  smp_boot_other_cpus(void (*entryFunc)(void))
  {
-@@ -412,6 +416,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -401,10 +552,17 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+ 	uint32 trampolineStack = 0x9e000;
+ #endif
+ 
++	const uint32 trampolineSize
++		= (uint32)&smp_trampoline_end - (uint32)&smp_trampoline;
++
+ 	// copy the trampoline code over
+ 	memcpy((char *)trampolineCode, (const void*)&smp_trampoline,
+-		(uint32)&smp_trampoline_end - (uint32)&smp_trampoline);
++		trampolineSize);
+ 
++	// Where the low-memory regions actually ended up this boot. The
++	// trampoline sits at a fixed address with the page-table region directly
++	// below it, so if loading symbols pushes anything into that window this
++	// is where it shows.
+ 	// boot the cpus
+ 	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
+ 		uint32 *finalStack;
+@@ -412,6 +570,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		uint32 config;
  		uint32 numStartups;
  		uint32 j;
@@ -6043,7 +6716,7 @@ index 68acf3f830..ba9f052a86 100644
  
  		// set this stack up
  		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
-@@ -422,15 +427,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -422,15 +581,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  				/ sizeof(uint32)) - 1;
  		*tempStack = (uint32)entryFunc;
  
@@ -6059,7 +6732,7 @@ index 68acf3f830..ba9f052a86 100644
  		// put a gdt descriptor at the bottom of the stack
  		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT
  		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;
-@@ -444,78 +440,163 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -444,78 +594,191 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
  			DPL_KERNEL);
  
@@ -6068,37 +6741,7 @@ index 68acf3f830..ba9f052a86 100644
 -			apic_write(APIC_ERROR_STATUS, 0);
 -			apic_read(APIC_ERROR_STATUS);
 -		}
-+		// Some APs (observed with the HT sibling of the Atom Z520, which
-+		// takes no visible action on the first INIT+SIPI sequence) start
-+		// only on a repeated attempt -- so instead of giving up after one
-+		// shot, run the whole INIT/SIPI/wait sequence up to a few times.
-+		// Every wait stays bounded, so a core that's truly unresponsive
-+		// (or disabled by the firmware despite being listed in the MADT)
-+		// still only costs a couple of seconds before being skipped
-+		// instead of hanging the boot forever.
-+		const uint32 kStartupAttempts = 3;
-+		bool started = false;
-+		for (uint32 attempt = 0; attempt < kStartupAttempts && !started;
-+			attempt++) {
-+			startupFailed = false;
-+
-+			// (Re)set the trampoline stack up. Rewritten on every attempt
-+			// in case a previous, seemingly-failed attempt actually
-+			// consumed the values just after the wait below expired.
-+			tempStack = (uint32 *)(trampolineStack + B_PAGE_SIZE - 4);
-+			// final location of the stack
-+			*tempStack = ((uint32)finalStack) + KERNEL_STACK_SIZE
-+				+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE - sizeof(uint32);
-+			tempStack--;
-+			// page dir
-+			*tempStack = x86_read_cr3() & 0xfffff000;
-+
-+			/* clear apic errors */
-+			if (gKernelArgs.arch_args.cpu_apic_version[i] & 0xf0) {
-+				apic_write(APIC_ERROR_STATUS, 0);
-+				apic_read(APIC_ERROR_STATUS);
-+			}
- 
+-
 -		/* send (aka assert) INIT IPI */
 -		TRACE(("assert INIT\n"));
 -		config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
@@ -6122,43 +6765,88 @@ index 68acf3f830..ba9f052a86 100644
 -		config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
 -			| APIC_TRIGGER_MODE_LEVEL | APIC_DELIVERY_MODE_INIT;
 -		apic_write(APIC_INTR_COMMAND_1, config);
--
++		// Some APs (observed with the HT sibling of the Atom Z520, which
++		// takes no visible action on the first INIT+SIPI sequence) start
++		// only on a repeated attempt -- so instead of giving up after one
++		// shot, run the whole INIT/SIPI/wait sequence up to a few times.
++		// Every wait stays bounded, so a core that's truly unresponsive
++		// (or disabled by the firmware despite being listed in the MADT)
++		// still only costs a couple of seconds before being skipped
++		// instead of hanging the boot forever.
++		// If the early wake took, the AP is already sitting in the
++		// trampoline waiting for the page directory. Publishing the two
++		// handover words is then the whole job -- no INIT, no SIPI, and
++		// crucially no dependence on the AP still being startable this late,
++		// which on this machine it usually is not.
++		if (*(volatile uint32 *)kApParkedMarker == 0x5a5a5a5a) {
++			tempStack = (uint32 *)(trampolineStack + B_PAGE_SIZE - 4);
++			*tempStack = ((uint32)finalStack) + KERNEL_STACK_SIZE
++				+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE - sizeof(uint32);
++			tempStack--;
++			*tempStack = x86_read_cr3() & 0xfffff000;
++
++			tempStack++;
++			uint32 waitMs = kApStartupTimeoutMs;
++			while (*tempStack != 0 && --waitMs != 0)
++				spin(1000);
++
++			if (waitMs != 0) {
++				dprintf("smp: cpu %" B_PRIu32 " was parked by the early wake, "
++					"handed over\n", i);
++				continue;
++			}
+ 
 -		// wait for pending to end
 -		TRACE(("wait for delivery\n"));
 -		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
 -			asm volatile ("pause;");
--
++			dprintf("smp: cpu %" B_PRIu32 " was parked but did not take the "
++				"handover; falling back to a full start\n", i);
++		}
+ 
 -		/* wait 10ms */
 -		spin(10000);
--
++		const uint32 kStartupAttempts = 3;
++		bool started = false;
++		for (uint32 attempt = 0; attempt < kStartupAttempts && !started;
++			attempt++) {
++			startupFailed = false;
++
++			// (Re)set the trampoline stack up. Rewritten on every attempt
++			// in case a previous, seemingly-failed attempt actually
++			// consumed the values just after the wait below expired.
++			tempStack = (uint32 *)(trampolineStack + B_PAGE_SIZE - 4);
++			// final location of the stack
++			*tempStack = ((uint32)finalStack) + KERNEL_STACK_SIZE
++				+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE - sizeof(uint32);
++			tempStack--;
++			// page dir
++			*tempStack = x86_read_cr3() & 0xfffff000;
++
++			/* clear apic errors */
++			if (gKernelArgs.arch_args.cpu_apic_version[i] & 0xf0) {
++				apic_write(APIC_ERROR_STATUS, 0);
++				apic_read(APIC_ERROR_STATUS);
++			}
+ 
 -		/* is this a local apic or an 82489dx ? */
 -		numStartups = (gKernelArgs.arch_args.cpu_apic_version[i] & 0xf0)
 -			? 2 : 0;
 -		TRACE(("num startups = %d\n", numStartups));
--
--		for (j = 0; j < numStartups; j++) {
--			/* it's a local apic, so send STARTUP IPIs */
--			TRACE(("send STARTUP\n"));
--			apic_write(APIC_ERROR_STATUS, 0);
--
--			/* set target pe */
 +			/* send (aka assert) INIT IPI */
 +			TRACE(("assert INIT\n"));
- 			config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
- 				| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
--			apic_write(APIC_INTR_COMMAND_2, config);
--
--			/* send the IPI */
--			config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff0f800)
--				| APIC_DELIVERY_MODE_STARTUP | (trampolineCode >> 12);
++			config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
++				| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
 +			apic_write(APIC_INTR_COMMAND_2, config); /* set target pe */
 +			config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
 +				| APIC_TRIGGER_MODE_LEVEL | APIC_INTR_COMMAND_1_ASSERT
 +				| APIC_DELIVERY_MODE_INIT;
- 			apic_write(APIC_INTR_COMMAND_1, config);
++			apic_write(APIC_INTR_COMMAND_1, config);
  
--			/* wait */
--			spin(200);
+-		for (j = 0; j < numStartups; j++) {
+-			/* it's a local apic, so send STARTUP IPIs */
+-			TRACE(("send STARTUP\n"));
+-			apic_write(APIC_ERROR_STATUS, 0);
 +			// wait for pending to end
 +			TRACE(("wait for delivery\n"));
 +			{
@@ -6176,15 +6864,23 @@ index 68acf3f830..ba9f052a86 100644
 +				}
 +			}
  
+-			/* set target pe */
 +			/* deassert INIT */
 +			TRACE(("deassert INIT\n"));
-+			config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
-+				| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
-+			apic_write(APIC_INTR_COMMAND_2, config);
+ 			config = (apic_read(APIC_INTR_COMMAND_2) & APIC_INTR_COMMAND_2_MASK)
+ 				| (gKernelArgs.arch_args.cpu_apic_id[i] << 24);
+ 			apic_write(APIC_INTR_COMMAND_2, config);
+-
+-			/* send the IPI */
+-			config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff0f800)
+-				| APIC_DELIVERY_MODE_STARTUP | (trampolineCode >> 12);
 +			config = (apic_read(APIC_INTR_COMMAND_1) & 0xfff00000)
 +				| APIC_TRIGGER_MODE_LEVEL | APIC_DELIVERY_MODE_INIT;
-+			apic_write(APIC_INTR_COMMAND_1, config);
-+
+ 			apic_write(APIC_INTR_COMMAND_1, config);
+ 
+-			/* wait */
+-			spin(200);
+-
 +			// wait for pending to end
  			TRACE(("wait for delivery\n"));
 -			while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0)
@@ -6267,6 +6963,7 @@ index 68acf3f830..ba9f052a86 100644
 +					startupFailed = true;
 +				} else
 +					started = true;
++
 +			}
  		}
  
@@ -6286,6 +6983,164 @@ index 68acf3f830..ba9f052a86 100644
  	}
  
  	TRACE(("done trampolining\n"));
+diff --git a/src/system/boot/platform/bios_ia32/smp.h b/src/system/boot/platform/bios_ia32/smp.h
+index 4acda1622d..17d14bdf70 100644
+--- a/src/system/boot/platform/bios_ia32/smp.h
++++ b/src/system/boot/platform/bios_ia32/smp.h
+@@ -18,6 +18,7 @@ extern "C" {
+ #endif
+ 
+ extern void smp_init(void);
++extern void smp_wake_other_cpus_early(void);
+ extern void smp_init_other_cpus(void);
+ extern void smp_boot_other_cpus(void (*entryFunc)(void));
+ 
+diff --git a/src/system/boot/platform/bios_ia32/smp_trampoline.S b/src/system/boot/platform/bios_ia32/smp_trampoline.S
+index 33a5ced675..5ae024ea2b 100644
+--- a/src/system/boot/platform/bios_ia32/smp_trampoline.S
++++ b/src/system/boot/platform/bios_ia32/smp_trampoline.S
+@@ -18,7 +18,7 @@
+ .code16
+ smp_trampoline:
+ 	cli
+-	
++
+ 	mov    $0x9e00,%ax
+ 	mov    %ax,%ds
+ 
+@@ -41,8 +41,31 @@ trampoline_32:
+ 	mov    %ax, %gs
+ 	mov    %ax, %ss
+ 
++	// Tell the BSP this processor made it into protected mode, so that
++	// smp_boot_other_cpus() knows it is parked below and only has to publish
++	// the page directory rather than run a full INIT/SIPI sequence.
++	movl   $0x5a5a5a5a,0x9e804
++
+ 	movl   $0x9eff8,%esp    # set up the stack pointer
+ 
++	// Wait until the BSP has filled in the page directory. This is what lets
++	// the AP be woken *early*, long before the kernel and its page tables
++	// exist: on this hardware the window in which the AP can be started at
++	// all is only a few seconds wide from power-on -- measured, a one second
++	// delay before the SIPI still works and five seconds does not -- and
++	// loading kernel symbols pushes the normal bring-up point past it. So the
++	// SIPI is sent while the window is open, the AP gets this far on a gdt
++	// that is static anyway, and it parks here in our own code until the two
++	// values below are ready. Once it is executing here, whatever the
++	// firmware does with an idle sibling no longer matters.
++	//
++	// The BSP writes the page directory last, so a non-zero value at 0x9eff8
++	// means both words are valid.
++1:
++	pause
++	cmpl   $0x00000000,0x9eff8
++	je     1b
++
+ 	popl   %eax             # get the page dir
+ 	movl   %eax,%cr3        # set the page dir
+ 	
+diff --git a/src/system/boot/platform/bios_ia32/start.cpp b/src/system/boot/platform/bios_ia32/start.cpp
+index a651487cad..44238f009f 100644
+--- a/src/system/boot/platform/bios_ia32/start.cpp
++++ b/src/system/boot/platform/bios_ia32/start.cpp
+@@ -184,7 +184,7 @@ _start(void)
+ 	args.arguments = NULL;
+ 
+ 	serial_init();
+-	serial_enable();
++	//serial_enable();
+ 	interrupts_init();
+ 	console_init();
+ 	cpu_init();
+@@ -195,12 +195,19 @@ _start(void)
+ 	// reading the keyboard doesn't seem to work in graphics mode
+ 	// (maybe a bochs problem)
+ 	sBootOptions = check_for_boot_keys();
+-//	if (sBootOptions & BOOT_OPTION_DEBUG_OUTPUT)
+-//		serial_enable();
++	if (sBootOptions & BOOT_OPTION_DEBUG_OUTPUT)
++		serial_enable();
+ 
+ 	apm_init();
+ 	acpi_init();
+ 	smp_init();
++
++	// Wake the APs now rather than at smp_boot_other_cpus() time. See the
++	// comment on this function: the window in which they can be started is
++	// only seconds wide on some hardware, and everything between here and
++	// there -- loading the kernel, its add-ons and their symbols -- can easily
++	// outlast it.
++	smp_wake_other_cpus_early();
+ 	hpet_init();
+ 	dump_multiboot_info();
+ 	main(&args);
+diff --git a/src/system/boot/platform/bios_ia32/timer.cpp b/src/system/boot/platform/bios_ia32/timer.cpp
+deleted file mode 100644
+index 7edf10046a..0000000000
+--- a/src/system/boot/platform/bios_ia32/timer.cpp
++++ /dev/null
+@@ -1,60 +0,0 @@
+-/*
+- * Copyright 2026, Haiku, Inc.. All rights reserved.
+- * Distributed under the terms of the MIT License.
+- */
+-
+-#include <KernelExport.h>
+-#include <kernel.h>
+-
+-#include "bios.h"
+-
+-
+-static uint64
+-get_ticks()
+-{
+-	struct bios_regs regs;
+-	regs.eax = 0x00;
+-	call_bios(0x1A, &regs);
+-	if ((regs.flags & CARRY_FLAG) != 0)
+-		return 0;
+-
+-	const uint64 kTicksPerDay = 0x1800b0;
+-	return (((regs.ecx << 16) | regs.edx) + regs.eax * kTicksPerDay);
+-}
+-
+-
+-extern "C" bigtime_t
+-system_time()
+-{
+-	uint64 ticks = get_ticks();
+-
+-	// Convert to microseconds. Algebraically simplified version of:
+-	// ticks * (1000 * 1000) / (kTicksPerDay / (24 * 60 * 60))
+-	return (ticks * 1080000000) / 19663;
+-}
+-
+-
+-extern "C" void
+-spin(bigtime_t microseconds)
+-{
+-	struct bios_regs regs;
+-	regs.eax = 0x8600;
+-	regs.edx = microseconds & 0xFFFF;
+-	regs.ecx = microseconds << 16;
+-	call_bios(0x15, &regs);
+-
+-	if ((regs.flags & CARRY_FLAG) != 0) {
+-		// Fall back to INT 1A. (Unfortunately this has a granularity of ~54.9ms.)
+-		uint64 target = get_ticks();
+-		if (target == 0)
+-			return;
+-
+-		uint64 ticks = HOWMANY(microseconds, 55 * 1000);
+-		if (ticks < 2)
+-			ticks = 2;
+-
+-		target += ticks;
+-		while (get_ticks() < target)
+-			asm volatile("pause");
+-	}
+-}
 diff --git a/src/system/boot/platform/bios_ia32/video.cpp b/src/system/boot/platform/bios_ia32/video.cpp
 index 30b5b69088..ba3a5ffdd3 100644
 --- a/src/system/boot/platform/bios_ia32/video.cpp
@@ -6304,6 +7159,272 @@ index 30b5b69088..ba3a5ffdd3 100644
  	sMode = sDefaultMode;
  	return B_OK;
  }
+diff --git a/src/system/boot/platform/efi/arch/arm/Jamfile b/src/system/boot/platform/efi/arch/arm/Jamfile
+index 4ce4c95a2b..565e3f06a9 100644
+--- a/src/system/boot/platform/efi/arch/arm/Jamfile
++++ b/src/system/boot/platform/efi/arch/arm/Jamfile
+@@ -25,6 +25,7 @@ for platform in [ MultiBootSubDirSetup efi ] {
+ 			entry.S
+ 			cache.S
+ 			relocation_func.cpp
++			arch_cpu.cpp
+ 			arch_dtb.cpp
+ 			arch_mmu.cpp
+ 			arch_smp.cpp
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_cpu.cpp b/src/system/boot/platform/efi/arch/arm/arch_cpu.cpp
+new file mode 100644
+index 0000000000..433f9228d2
+--- /dev/null
++++ b/src/system/boot/platform/efi/arch/arm/arch_cpu.cpp
+@@ -0,0 +1,31 @@
++/*
++ * Copyright 2012-2022, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2004-2005, Axel Dörfler, axeld@pinc-software.de. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "cpu.h"
++#include "efi_platform.h"
++
++#include <OS.h>
++#include <boot/platform.h>
++#include <boot/arch/arm/arch_cpu.h>
++
++
++bigtime_t
++system_time()
++{
++	#warning Implement system_time in ARM bootloader!
++	static bigtime_t sSystemTimeCounter = 0;
++	return sSystemTimeCounter++;
++}
++
++
++void
++spin(bigtime_t microseconds)
++{
++	kBootServices->Stall(microseconds);
++}
+diff --git a/src/system/boot/platform/efi/arch/x86/arch_smp.cpp b/src/system/boot/platform/efi/arch/x86/arch_smp.cpp
+index 82460be728..20f087b829 100644
+--- a/src/system/boot/platform/efi/arch/x86/arch_smp.cpp
++++ b/src/system/boot/platform/efi/arch/x86/arch_smp.cpp
+@@ -15,15 +15,12 @@
+ 
+ #include <kernel.h>
+ #include <safemode.h>
+-
+ #include <boot/platform.h>
+ #include <boot/stage2.h>
+ #include <boot/menu.h>
+-
+ #include <arch/x86/apic.h>
+ #include <arch/x86/arch_cpu.h>
+ #include <arch/x86/arch_system_info.h>
+-#include <arch/x86/arch_hpet.h>
+ 
+ #include "mmu.h"
+ #include "acpi.h"
+@@ -38,7 +35,6 @@
+ #	define TRACE(x...) ;
+ #endif
+ 
+-
+ void copy_trampoline_code(uint64 trampolineCode, uint64 trampolineStack);
+ void prepare_trampoline_args(uint64 trampolineCode, uint64 trampolineStack,
+ 	uint32 pagedir, uint64 kernelEntry, addr_t virtKernelArgs,
+@@ -48,30 +44,6 @@ uint32 get_sentinel(uint64 trampolineStack);
+ static bool sX2APIC = false;
+ 
+ 
+-static void
+-hpet_spin(bigtime_t microseconds)
+-{
+-	// Other CPUs are booted after ExitBootServices, so we can't use spin().
+-	// Use the HPET (which we conveniently don't need to calibrate) instead.
+-	static hpet_regs* hpet = NULL;
+-	if (hpet == NULL) {
+-		platform_kernel_address_to_bootloader_address(gKernelArgs.arch_args.hpet.Get(),
+-			(void**)&hpet);
+-	}
+-
+-	uint64 originalConfig = hpet->config;
+-	hpet->config |= HPET_CONF_MASK_ENABLED;
+-
+-	uint64 end = hpet->u0.counter64
+-		+ ((microseconds * 1000000000ULL) / HPET_GET_PERIOD(hpet));
+-	while (hpet->u0.counter64 < end)
+-		asm volatile("pause");
+-
+-	hpet->config = originalConfig;
+-}
+-#define spin hpet_spin
+-
+-
+ static uint32
+ apic_read(uint32 offset)
+ {
+@@ -85,7 +57,6 @@ apic_write(uint32 offset, uint32 data)
+ 	*(volatile uint32 *)((addr_t)gKernelArgs.arch_args.apic_phys + offset) = data;
+ }
+ 
+-
+ static uint32
+ apic_error_status()
+ {
+@@ -347,7 +318,7 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
+ 			spin(200);
+ 
+ 			while (!apic_interrupt_delivered())
+-				asm volatile ("pause");
++				asm volatile ("pause;");
+ 		}
+ 
+ 		// Wait for the trampoline code to clear the final stack location.
+diff --git a/src/system/boot/platform/efi/arch/x86/arch_timer.cpp b/src/system/boot/platform/efi/arch/x86/arch_timer.cpp
+index 00106dd53d..8dbe031ee6 100644
+--- a/src/system/boot/platform/efi/arch/x86/arch_timer.cpp
++++ b/src/system/boot/platform/efi/arch/x86/arch_timer.cpp
+@@ -19,5 +19,9 @@
+ void
+ arch_timer_init(void)
+ {
++	// use PIT channel 2 for the calibration loop
++	// as channel 0 is reserved for the UEFI firmware
++	determine_cpu_conversion_factor(2);
++
+ 	hpet_init();
+ }
+diff --git a/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp b/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp
+index 6da6158f97..73049e288f 100644
+--- a/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp
++++ b/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp
+@@ -19,5 +19,6 @@
+ void
+ arch_timer_init(void)
+ {
++	determine_cpu_conversion_factor(2);
+ 	hpet_init();
+ }
+diff --git a/src/system/boot/platform/efi/timer.cpp b/src/system/boot/platform/efi/timer.cpp
+index 0e6515ab94..25f89b3a7b 100644
+--- a/src/system/boot/platform/efi/timer.cpp
++++ b/src/system/boot/platform/efi/timer.cpp
+@@ -1,60 +1,31 @@
+ /*
+- * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Copyright 2008, Dustin Howett, dustin.howett@gmail.com. All rights reserved.
++ * Copyright 2004-2010, Axel Dörfler, axeld@pinc-software.de.
+  * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2001, Travis Geiselbrecht. All rights reserved.
++ * Distributed under the terms of the NewOS License.
+ */
+ 
++
+ #include "timer.h"
+ 
++#include <string.h>
+ #include <KernelExport.h>
+ 
+ #include "arch_timer.h"
+-#include "efi_platform.h"
+-
+-
+-static bigtime_t sSystemTime = 0;
+-static efi_event sSystemTimeTickEvent;
+-
+-
+-EFIAPI static void
+-system_time_tick(efi_event, void*)
+-{
+-	sSystemTime += 50 * 1000; /* 50ms, in microseconds */
+-}
+-
+-
+-bigtime_t
+-system_time()
+-{
+-	// EFI does not have any mechanism to fetch a current time with a guaranteed
+-	// subsecond precision, so use a timer event. To avoid unnecessary overhead,
+-	// we limit it to 50ms granularity, and only start it when first needed.
+-	if (sSystemTimeTickEvent == NULL) {
+-		efi_status status = kBootServices->CreateEvent(EVT_TIMER | EVT_NOTIFY_SIGNAL,
+-			TPL_CALLBACK, system_time_tick, NULL, &sSystemTimeTickEvent);
+-		if (status == EFI_SUCCESS) {
+-			status = kBootServices->SetTimer(sSystemTimeTickEvent, TimerPeriodic,
+-				500000 /* 50ms, in 100ns units */);
+-		}
+-		if (status != EFI_SUCCESS)
+-			panic("Can't start system_time event!");
+-	}
+-
+-	return sSystemTime;
+-}
+-
+-
+-void
+-spin(bigtime_t microseconds)
+-{
+-	kBootServices->Stall(microseconds);
+-}
+ 
+ 
+-// #pragma mark -
++//#define TRACE_TIMER
++#ifdef TRACE_TIMER
++#	define TRACE(x) dprintf x
++#else
++#	define TRACE(x) ;
++#endif
+ 
+ 
+ void
+-timer_init()
++timer_init(void)
+ {
+ 	arch_timer_init();
+ }
+diff --git a/src/system/boot/platform/pxe_ia32/Jamfile b/src/system/boot/platform/pxe_ia32/Jamfile
+index a8c4e7bd96..49ce6b7c28 100644
+--- a/src/system/boot/platform/pxe_ia32/Jamfile
++++ b/src/system/boot/platform/pxe_ia32/Jamfile
+@@ -33,7 +33,6 @@ local bios_ia32_src =
+ 	acpi.cpp
+ 	smp.cpp
+ 	support.S
+-	timer.cpp
+ 	video.cpp
+ 	apm.cpp
+ 	interrupts.cpp
+diff --git a/src/system/boot/platform/riscv/cpu.cpp b/src/system/boot/platform/riscv/cpu.cpp
+index 2b8a8128d6..7d8dc18cac 100644
+--- a/src/system/boot/platform/riscv/cpu.cpp
++++ b/src/system/boot/platform/riscv/cpu.cpp
+@@ -47,20 +47,3 @@ platform_load_ucode(BootVolume& volume)
+ {
+ 	// we have no ucode
+ }
+-
+-
+-extern "C" bigtime_t
+-system_time()
+-{
+-	// TODO: units conversion
+-	return CpuTime();
+-}
+-
+-
+-extern "C" void
+-spin(bigtime_t microseconds)
+-{
+-	bigtime_t time = system_time();
+-	while ((system_time() - time) < microseconds)
+-		asm volatile ("nop");
+-}
 diff --git a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp b/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
 index 9435811872..64064e554c 100644
 --- a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
@@ -6319,6 +7440,794 @@ index 9435811872..64064e554c 100644
  		}
  
  		delete link;
+diff --git a/src/system/kernel/arch/x86/arch_cpu.cpp b/src/system/kernel/arch/x86/arch_cpu.cpp
+index c635793b60..683b06b58c 100644
+--- a/src/system/kernel/arch/x86/arch_cpu.cpp
++++ b/src/system/kernel/arch/x86/arch_cpu.cpp
+@@ -33,7 +33,6 @@
+ 
+ #include <arch_system_info.h>
+ #include <arch/x86/apic.h>
+-#include <arch/x86/timer.h>
+ #include <boot/kernel_args.h>
+ 
+ #include "paging/X86PagingStructures.h"
+@@ -1500,6 +1499,117 @@ detect_amdc1e_noarat()
+ }
+ 
+ 
++static void
++init_tsc_with_cpuid(kernel_args* args, uint32* conversionFactor)
++{
++	cpu_ent* cpu = get_cpu_struct();
++	if (cpu->arch.vendor != VENDOR_INTEL)
++		return;
++
++	uint32 model = (cpu->arch.extended_model << 4) | cpu->arch.model;
++	cpuid_info cpuid;
++	get_current_cpuid(&cpuid, 0, 0);
++	uint32 maxBasicLeaf = cpuid.eax_0.max_eax;
++	if (maxBasicLeaf < IA32_CPUID_LEAF_TSC)
++		return;
++
++	get_current_cpuid(&cpuid, IA32_CPUID_LEAF_TSC, 0);
++	if (cpuid.regs.eax == 0 || cpuid.regs.ebx == 0)
++		return;
++	uint32 khz = cpuid.regs.ecx / 1000;
++	uint32 denominator = cpuid.regs.eax;
++	uint32 numerator = cpuid.regs.ebx;
++	if (khz == 0 && model == 0x5f) {
++		// CPUID_LEAF_FREQUENCY isn't supported, hardcoding
++		khz = 25000;
++	}
++
++	if (khz == 0 && maxBasicLeaf >= IA32_CPUID_LEAF_FREQUENCY) {
++		// for these CPUs the base frequency is also the tsc frequency
++		get_current_cpuid(&cpuid, IA32_CPUID_LEAF_FREQUENCY, 0);
++		khz = cpuid.regs.eax * 1000 * denominator / numerator;
++	}
++	if (khz == 0)
++		return;
++
++	dprintf("CPU: using TSC frequency from CPUID\n");
++	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
++	// or (1000 << 32) / (tsc freq in kHz)
++	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
++	// overwrite the bootloader value
++	args->arch_args.system_time_cv_factor = *conversionFactor;
++}
++
++
++static void
++init_tsc_with_msr(kernel_args* args, uint32* conversionFactor)
++{
++	cpu_ent* cpuEnt = get_cpu_struct();
++	if (cpuEnt->arch.vendor != VENDOR_AMD)
++		return;
++
++	uint32 family = cpuEnt->arch.family + cpuEnt->arch.extended_family;
++	if (family < 0x10)
++		return;
++	uint64 value = x86_read_msr(MSR_F10H_HWCR);
++	if ((value & HWCR_TSCFREQSEL) == 0)
++		return;
++
++	value = x86_read_msr(MSR_F10H_PSTATEDEF(0));
++	if ((value & PSTATEDEF_EN) == 0)
++		return;
++	if (family != 0x17 && family != 0x19)
++		return;
++
++	uint64 khz = 200 * 1000;
++	uint32 denominator = (value >> 8) & 0x3f;
++	if (denominator < 0x8 || denominator > 0x2c)
++		return;
++	if (denominator > 0x1a && (denominator % 2) == 1)
++		return;
++	uint32 numerator = value & 0xff;
++	if (numerator < 0x10)
++		return;
++
++	dprintf("CPU: using TSC frequency from MSR %" B_PRIu64 "\n", khz * numerator / denominator);
++	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
++	// or (1000 << 32) / (tsc freq in kHz)
++	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
++	// overwrite the bootloader value
++	args->arch_args.system_time_cv_factor = *conversionFactor;
++}
++
++
++static void
++init_tsc(kernel_args* args)
++{
++	// init the TSC -> system_time() conversion factors
++
++	// try to find the TSC frequency with CPUID
++	uint32 conversionFactor = args->arch_args.system_time_cv_factor;
++	init_tsc_with_cpuid(args, &conversionFactor);
++	init_tsc_with_msr(args, &conversionFactor);
++	uint64 conversionFactorNsecs = (uint64)conversionFactor * 1000;
++
++#ifdef __x86_64__
++	// The x86_64 system_time() implementation uses 64-bit multiplication and
++	// therefore shifting is not necessary for low frequencies (it's also not
++	// too likely that there'll be any x86_64 CPUs clocked under 1GHz).
++	__x86_setup_system_time((uint64)conversionFactor << 32,
++		conversionFactorNsecs);
++#else
++	if (conversionFactorNsecs >> 32 != 0) {
++		// the TSC frequency is < 1 GHz, which forces us to shift the factor
++		__x86_setup_system_time(conversionFactor, conversionFactorNsecs >> 16,
++			true);
++	} else {
++		// the TSC frequency is >= 1 GHz
++		__x86_setup_system_time(conversionFactor, conversionFactorNsecs, false);
++	}
++#endif
++}
++
++
+ status_t
+ arch_cpu_init_percpu(kernel_args* args, int cpu)
+ {
+@@ -1507,6 +1617,15 @@ arch_cpu_init_percpu(kernel_args* args, int cpu)
+ 	load_microcode(cpu);
+ 	detect_cpu(cpu);
+ 
++	if (cpu == 0) {
++		init_tsc(args);
++
++		if (detect_amdc1e_noarat())
++			gCpuIdleFunc = amdc1e_noarat_idle;
++		else
++			gCpuIdleFunc = halt_idle;
++	}
++
+ 	if (x86_check_feature(IA32_FEATURE_MCE, FEATURE_COMMON))
+ 		x86_write_cr4(x86_read_cr4() | IA32_CR4_MCE);
+ 
+@@ -1581,13 +1700,6 @@ arch_cpu_init(kernel_args* args)
+ 	// Initialize descriptor tables.
+ 	x86_descriptors_init(args);
+ 
+-	x86_init_tsc(args);
+-
+-	if (detect_amdc1e_noarat())
+-		gCpuIdleFunc = amdc1e_noarat_idle;
+-	else
+-		gCpuIdleFunc = halt_idle;
+-
+ 	return B_OK;
+ }
+ 
+diff --git a/src/system/kernel/arch/x86/arch_debug.cpp b/src/system/kernel/arch/x86/arch_debug.cpp
+index fce986e810..acb6bfbb6b 100644
+--- a/src/system/kernel/arch/x86/arch_debug.cpp
++++ b/src/system/kernel/arch/x86/arch_debug.cpp
+@@ -10,7 +10,6 @@
+ 
+ 
+ #include <arch/debug.h>
+-#include <arch/x86/timer.h>
+ 
+ #include <x86intrin.h>
+ #include <stdio.h>
+@@ -1414,7 +1413,7 @@ arch_debug_init(kernel_args* args)
+ {
+ 	// Store the TSC frequency in kHz.
+ 	sDebugSnoozeConversionFactor =
+-		(uint64(1000) << 32) / gSystemTimeConversionFactor;
++		(uint64(1000) << 32) / args->arch_args.system_time_cv_factor;
+ 	if (x86_check_feature(IA32_FEATURE_AMD_EXT_MWAITX, FEATURE_EXT_AMD_ECX))
+ 		sDebugSnooze = debug_snooze_mwaitx;
+ 	if (x86_check_feature(IA32_FEATURE_WAITPKG, FEATURE_7_ECX))
+@@ -1437,3 +1436,4 @@ arch_debug_init(kernel_args* args)
+ 
+ 	return B_NO_ERROR;
+ }
++
+diff --git a/src/system/kernel/arch/x86/arch_real_time_clock.cpp b/src/system/kernel/arch/x86/arch_real_time_clock.cpp
+index 516581ae9e..1689866fc8 100644
+--- a/src/system/kernel/arch/x86/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/x86/arch_real_time_clock.cpp
+@@ -7,7 +7,7 @@
+ 
+ 
+ #include <arch/real_time_clock.h>
+-#include <arch/x86/timer.h>
++#include <arch/cpu.h>
+ #include <boot/kernel_args.h>
+ 
+ #include <real_time_clock.h>
+@@ -180,7 +180,7 @@ status_t
+ arch_rtc_init(struct kernel_args *args, struct real_time_data *data)
+ {
+ 	data->arch_data.system_time_conversion_factor
+-		= gSystemTimeConversionFactor;
++		= args->arch_args.system_time_cv_factor;
+ 	return B_OK;
+ }
+ 
+diff --git a/src/system/kernel/arch/x86/arch_system_info.cpp b/src/system/kernel/arch/x86/arch_system_info.cpp
+index f77c4fc004..587b770967 100644
+--- a/src/system/kernel/arch/x86/arch_system_info.cpp
++++ b/src/system/kernel/arch/x86/arch_system_info.cpp
+@@ -5,7 +5,6 @@
+ 
+ 
+ #include <arch/system_info.h>
+-#include <arch/x86/timer.h>
+ 
+ #include <string.h>
+ 
+@@ -21,6 +20,7 @@
+ 
+ static enum cpu_vendor sCPUVendor;
+ static uint32 sCPUModel;
++static int64 sCPUClockSpeed;
+ 
+ 
+ struct get_cpuid_args {
+@@ -98,7 +98,19 @@ arch_system_info_init(struct kernel_args *args)
+ 		| (cpu->arch.extended_model << 16) | (cpu->arch.type << 12)
+ 		| (cpu->arch.family << 8) | (cpu->arch.model << 4) | cpu->arch.stepping;
+ 
+-	// gCPUClockSpeed is initialized by arch_timer.
++	sCPUClockSpeed = args->arch_args.cpu_clock_speed;
++	if (cpu->arch.vendor == VENDOR_INTEL) {
++		cpuid_info cpuid;
++		get_current_cpuid(&cpuid, 0, 0);
++		uint32 maxBasicLeaf = cpuid.eax_0.max_eax;
++		if (maxBasicLeaf >= 0x16) {
++			get_current_cpuid(&cpuid, 0x16, 0);
++			if (cpuid.regs.eax != 0) {
++				sCPUClockSpeed = cpuid.regs.eax * 1000000LL;
++				dprintf("found clock speed with CPUID.16h\n");
++			}
++		}
++	}
+ 	return B_OK;
+ }
+ 
+@@ -124,7 +136,7 @@ arch_fill_topology_node(cpu_topology_node_info* node, int32 cpu)
+ 
+ 		case B_TOPOLOGY_CORE:
+ 			node->data.core.model = sCPUModel;
+-			node->data.core.default_frequency = gCPUClockSpeed;
++			node->data.core.default_frequency = sCPUClockSpeed;
+ 			break;
+ 
+ 		default:
+@@ -153,7 +165,7 @@ get_frequency_for(void *_frequency, int cpu)
+ 	if (mperf2 == mperf)
+ 		*frequency = 0;
+ 	else {
+-		*frequency = (aperf2 - aperf) * gCPUClockSpeed / (mperf2 - mperf);
++		*frequency = (aperf2 - aperf) * sCPUClockSpeed / (mperf2 - mperf);
+ 		gCPU[cpu].arch.mperf_prev = mperf2;
+ 		gCPU[cpu].arch.aperf_prev = aperf2;
+ 		gCPU[cpu].arch.perf_timestamp = timestamp2;
+@@ -168,7 +180,7 @@ arch_get_frequency(uint64 *frequency, int32 cpu)
+ 	if (x86_check_feature(IA32_FEATURE_APERFMPERF, FEATURE_6_ECX))
+ 		call_single_cpu_sync(cpu, get_frequency_for, frequency);
+ 	else
+-		*frequency = gCPUClockSpeed;
++		*frequency = sCPUClockSpeed;
+ 
+ 	return B_OK;
+ }
+diff --git a/src/system/kernel/arch/x86/arch_timer.cpp b/src/system/kernel/arch/x86/arch_timer.cpp
+index 705df65092..6397927a44 100644
+--- a/src/system/kernel/arch/x86/arch_timer.cpp
++++ b/src/system/kernel/arch/x86/arch_timer.cpp
+@@ -1,24 +1,29 @@
+ /*
+- * Copyright 2005, Axel Dörfler, axeld@pinc-software.de.
+- * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Copyright 2005, Axel Dörfler, axeld@pinc-software.de. All rights reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Copyright 2001, Travis Geiselbrecht. All rights reserved.
+  * Distributed under the terms of the NewOS License.
+  */
+ 
+-#include <arch/timer.h>
+-#include <arch_system_info.h>
+ 
+-#include <cpu.h>
++#include <boot/stage2.h>
++#include <kernel.h>
++
++#include <arch/int.h>
++#include <arch/cpu.h>
++
++#include <console.h>
++#include <debug.h>
+ #include <timer.h>
+ #include <interrupts.h>
++#include <safemode.h>
++
++#include <arch/timer.h>
+ 
+ #include <arch/x86/smp_priv.h>
+ #include <arch/x86/timer.h>
+ 
+-#include <x86intrin.h>
+-
+ 
+ //#define TRACE_TIMER
+ #ifdef TRACE_TIMER
+@@ -41,7 +46,6 @@ static timer_info *sTimers[] = {
+ 
+ static timer_info *sTimer = NULL;
+ 
+-
+ void
+ arch_timer_set_hardware_timer(bigtime_t timeout)
+ {
+@@ -113,462 +117,3 @@ arch_init_timer(kernel_args *args)
+ 	return 0;
+ }
+ 
+-
+-// #pragma mark -
+-
+-
+-uint32 gSystemTimeConversionFactor;
+-int64 gCPUClockSpeed;
+-
+-
+-// PIT definitions
+-#define TIMER_CLKNUM_HZ					(14318180 / 12)
+-
+-// PIT IO Ports
+-#define PIT_CHANNEL_PORT_BASE			0x40
+-#define PIT_CONTROL						0x43
+-
+-// Channel selection
+-#define PIT_SELECT_CHANNEL_SHIFT		6
+-
+-// Access mode
+-#define PIT_ACCESS_LATCH_COUNTER		(0 << 4)
+-#define PIT_ACCESS_LOW_BYTE_ONLY		(1 << 4)
+-#define PIT_ACCESS_HIGH_BYTE_ONLY		(2 << 4)
+-#define PIT_ACCESS_LOW_THEN_HIGH_BYTE	(3 << 4)
+-
+-// Operating modes
+-#define PIT_MODE_INTERRUPT_ON_0			(0 << 1)
+-#define PIT_MODE_HARDWARE_COUNTDOWN		(1 << 1)
+-#define PIT_MODE_RATE_GENERATOR			(2 << 1)
+-#define PIT_MODE_SQUARE_WAVE_GENERATOR	(3 << 1)
+-#define PIT_MODE_SOFTWARE_STROBE		(4 << 1)
+-#define PIT_MODE_HARDWARE_STROBE		(5 << 1)
+-
+-// BCD/Binary mode
+-#define PIT_BINARY_MODE					0
+-#define PIT_BCD_MODE					1
+-
+-// Channel 2 control (speaker)
+-#define PIT_CHANNEL_2_CONTROL			0x61
+-#define PIT_CHANNEL_2_GATE_HIGH			0x01
+-#define PIT_CHANNEL_2_SPEAKER_OFF_MASK	~0x02
+-
+-// Maximum values
+-#define MAX_QUICK_SAMPLES				20
+-#define MAX_SLOW_SAMPLES				20
+-	// TODO: These are arbitrary. They are here to avoid spinning indefinitely
+-	// if the TSC just isn't stable and we can't get our desired error range.
+-
+-
+-#ifdef __SIZEOF_INT128__
+-typedef unsigned __int128 uint128;
+-#else
+-struct uint128 {
+-	uint128(uint64 low, uint64 high = 0)
+-		:
+-		low(low),
+-		high(high)
+-	{
+-	}
+-
+-	bool operator<(const uint128& other) const
+-	{
+-		return high < other.high || (high == other.high && low < other.low);
+-	}
+-
+-	bool operator<=(const uint128& other) const
+-	{
+-		return !(other < *this);
+-	}
+-
+-	uint128 operator<<(int count) const
+-	{
+-		if (count == 0)
+-			return *this;
+-
+-		if (count >= 128)
+-			return 0;
+-
+-		if (count >= 64)
+-			return uint128(0, low << (count - 64));
+-
+-		return uint128(low << count, (high << count) | (low >> (64 - count)));
+-	}
+-
+-	uint128 operator>>(int count) const
+-	{
+-		if (count == 0)
+-			return *this;
+-
+-		if (count >= 128)
+-			return 0;
+-
+-		if (count >= 64)
+-			return uint128(high >> (count - 64), 0);
+-
+-		return uint128((low >> count) | (high << (64 - count)), high >> count);
+-	}
+-
+-	uint128 operator+(const uint128& other) const
+-	{
+-		uint64 resultLow = low + other.low;
+-		return uint128(resultLow,
+-			high + other.high + (resultLow < low ? 1 : 0));
+-	}
+-
+-	uint128 operator-(const uint128& other) const
+-	{
+-		uint64 resultLow = low - other.low;
+-		return uint128(resultLow,
+-			high - other.high - (resultLow > low ? 1 : 0));
+-	}
+-
+-	uint128 operator*(uint32 other) const
+-	{
+-		uint64 resultMid = (low >> 32) * other;
+-		uint64 resultLow = (low & 0xffffffff) * other + (resultMid << 32);
+-		return uint128(resultLow,
+-			high * other + (resultMid >> 32)
+-				+ (resultLow < resultMid << 32 ? 1 : 0));
+-	}
+-
+-	uint128 operator/(const uint128& other) const
+-	{
+-		int shift = 0;
+-		uint128 shiftedDivider = other;
+-		while (shiftedDivider.high >> 63 == 0 && shiftedDivider < *this) {
+-			shiftedDivider = shiftedDivider << 1;
+-			shift++;
+-		}
+-
+-		uint128 result = 0;
+-		uint128 temp = *this;
+-		for (; shift >= 0; shift--, shiftedDivider = shiftedDivider >> 1) {
+-			if (shiftedDivider <= temp) {
+-				result = result + (uint128(1) << shift);
+-				temp = temp - shiftedDivider;
+-			}
+-		}
+-
+-		return result;
+-	}
+-
+-	operator uint64() const
+-	{
+-		return low;
+-	}
+-
+-private:
+-	uint64	low;
+-	uint64	high;
+-};
+-#endif
+-
+-
+-static inline uint64_t
+-rdtsc_fenced()
+-{
+-	// RDTSC is not serializing, nor does it drain the instruction stream.
+-	// RDTSCP does, but is not available everywhere. Other OSes seem to use
+-	// "CPUID" rather than MFENCE/LFENCE for serializing here during boot.
+-	asm volatile ("cpuid" : : : "eax", "ebx", "ecx", "edx");
+-
+-	return __rdtsc();
+-}
+-
+-
+-static inline void
+-calibration_loop(uint8 desiredHighByte, uint8 channel, uint64& tscDelta,
+-	double& conversionFactor, uint16& expired)
+-{
+-	uint8 select = channel << PIT_SELECT_CHANNEL_SHIFT;
+-	out8(select | PIT_ACCESS_LOW_THEN_HIGH_BYTE | PIT_MODE_INTERRUPT_ON_0
+-		| PIT_BINARY_MODE, PIT_CONTROL);
+-
+-	// Fill in count of 0xffff, low then high byte
+-	uint8 channelPort = PIT_CHANNEL_PORT_BASE + channel;
+-	out8(0xff, channelPort);
+-	out8(0xff, channelPort);
+-
+-	// Read the count back once to delay the start. This ensures that we've
+-	// waited long enough for the counter to actually start counting down, as
+-	// this only happens on the next clock cycle after reload.
+-	in8(channelPort);
+-	in8(channelPort);
+-
+-	// We're expecting the PIT to be at the starting position (high byte 0xff)
+-	// as we just programmed it, but if it isn't we wait for it to wrap.
+-	uint8 startLow;
+-	uint8 startHigh;
+-	do {
+-		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
+-		startLow = in8(channelPort);
+-		startHigh = in8(channelPort);
+-	} while (startHigh != 255);
+-
+-	// Read in the first TSC value
+-	uint64 startTSC = rdtsc_fenced();
+-
+-	// Wait for the PIT to count down to our desired value
+-	uint8 endLow;
+-	uint8 endHigh;
+-	do {
+-		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
+-		endLow = in8(channelPort);
+-		endHigh = in8(channelPort);
+-	} while (endHigh > desiredHighByte);
+-
+-	// And read the second TSC value
+-	uint64 endTSC = rdtsc_fenced();
+-
+-	tscDelta = endTSC - startTSC;
+-	expired = ((startHigh << 8) | startLow) - ((endHigh << 8) | endLow);
+-	conversionFactor = (double)tscDelta / (double)expired;
+-}
+-
+-
+-static void
+-calculate_cpu_conversion_factor(uint8 channel, uint32* conversionFactor)
+-{
+-	// When using channel 2, enable the input and disable the speaker.
+-	if (channel == 2) {
+-		uint8 control = in8(PIT_CHANNEL_2_CONTROL);
+-		control &= PIT_CHANNEL_2_SPEAKER_OFF_MASK;
+-		control |= PIT_CHANNEL_2_GATE_HIGH;
+-		out8(control, PIT_CHANNEL_2_CONTROL);
+-	}
+-
+-	uint64 tscDeltaQuick, tscDeltaSlower, tscDeltaSlow;
+-	double conversionFactorQuick, conversionFactorSlower, conversionFactorSlow;
+-	uint16 expired;
+-
+-	uint32 quickSampleCount = 1;
+-	uint32 slowSampleCount = 1;
+-
+-quick_sample:
+-	calibration_loop(224, channel, tscDeltaQuick, conversionFactorQuick,
+-		expired);
+-
+-slower_sample:
+-	calibration_loop(192, channel, tscDeltaSlower, conversionFactorSlower,
+-		expired);
+-
+-	double deviation = conversionFactorQuick / conversionFactorSlower;
+-	if (deviation < 0.99 || deviation > 1.01) {
+-		// We might have been hit by a SMI or were otherwise stalled
+-		if (quickSampleCount++ < MAX_QUICK_SAMPLES)
+-			goto quick_sample;
+-	}
+-
+-	// Slow sample
+-	calibration_loop(128, channel, tscDeltaSlow, conversionFactorSlow,
+-		expired);
+-
+-	deviation = conversionFactorSlower / conversionFactorSlow;
+-	if (deviation < 0.99 || deviation > 1.01) {
+-		// We might have been hit by a SMI or were otherwise stalled
+-		if (slowSampleCount++ < MAX_SLOW_SAMPLES)
+-			goto slower_sample;
+-	}
+-
+-	// Scale the TSC delta to timer units
+-	tscDeltaSlow *= TIMER_CLKNUM_HZ;
+-
+-	uint64 clockSpeed = tscDeltaSlow / expired;
+-	*conversionFactor = ((uint128(expired) * uint32(1000000)) << 32)
+-		/ uint128(tscDeltaSlow);
+-
+-#ifdef TRACE_TIMER
+-	if (clockSpeed > 1000000000LL) {
+-		dprintf("CPU at %lld.%03Ld GHz\n", clockSpeed / 1000000000LL,
+-			(clockSpeed % 1000000000LL) / 1000000LL);
+-	} else {
+-		dprintf("CPU at %lld.%03Ld MHz\n", clockSpeed / 1000000LL,
+-			(clockSpeed % 1000000LL) / 1000LL);
+-	}
+-#endif
+-
+-	gCPUClockSpeed = clockSpeed;
+-	//dprintf("factors: %lu %llu\n", gTimeConversionFactor, clockSpeed);
+-
+-#ifdef TRACE_TIMER
+-	if (quickSampleCount > 1) {
+-		dprintf("needed %" B_PRIu32 " quick samples for TSC calibration\n",
+-			quickSampleCount);
+-	}
+-
+-	if (slowSampleCount > 1) {
+-		dprintf("needed %" B_PRIu32 " slow samples for TSC calibration\n",
+-			slowSampleCount);
+-	}
+-#endif
+-
+-	if (channel == 2) {
+-		// Set the gate low again
+-		out8(in8(PIT_CHANNEL_2_CONTROL) & ~PIT_CHANNEL_2_GATE_HIGH,
+-			PIT_CHANNEL_2_CONTROL);
+-	}
+-
+-	dprintf("CPU: TSC frequency calibrated via PIT: %" B_PRIu32 "\n", *conversionFactor);
+-}
+-
+-
+-static void
+-init_tsc_with_cpuid(kernel_args* args, uint32* conversionFactor)
+-{
+-	cpu_ent* cpu = get_cpu_struct();
+-	if (cpu->arch.vendor != VENDOR_INTEL)
+-		return;
+-
+-	uint32 model = (cpu->arch.extended_model << 4) | cpu->arch.model;
+-	cpuid_info cpuid;
+-	get_current_cpuid(&cpuid, 0, 0);
+-	uint32 maxBasicLeaf = cpuid.eax_0.max_eax;
+-	if (maxBasicLeaf < IA32_CPUID_LEAF_TSC)
+-		return;
+-
+-	get_current_cpuid(&cpuid, IA32_CPUID_LEAF_TSC, 0);
+-	if (cpuid.regs.eax == 0 || cpuid.regs.ebx == 0)
+-		return;
+-	uint32 khz = cpuid.regs.ecx / 1000;
+-	uint32 denominator = cpuid.regs.eax;
+-	uint32 numerator = cpuid.regs.ebx;
+-	if (khz == 0 && model == 0x5f) {
+-		// CPUID_LEAF_FREQUENCY isn't supported, hardcoding
+-		khz = 25000;
+-	}
+-
+-	if (khz == 0 && maxBasicLeaf >= IA32_CPUID_LEAF_FREQUENCY) {
+-		// for these CPUs the base frequency is also the tsc frequency
+-		get_current_cpuid(&cpuid, IA32_CPUID_LEAF_FREQUENCY, 0);
+-		khz = cpuid.regs.eax * 1000 * denominator / numerator;
+-	}
+-	if (khz == 0)
+-		return;
+-
+-	dprintf("CPU: using TSC frequency from CPUID\n");
+-	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
+-	// or (1000 << 32) / (tsc freq in kHz)
+-	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
+-}
+-
+-
+-static void
+-init_tsc_with_msr(kernel_args* args, uint32* conversionFactor)
+-{
+-	cpu_ent* cpuEnt = get_cpu_struct();
+-	if (cpuEnt->arch.vendor != VENDOR_AMD)
+-		return;
+-
+-	uint32 family = cpuEnt->arch.family + cpuEnt->arch.extended_family;
+-	if (family < 0x10)
+-		return;
+-	uint64 value = x86_read_msr(MSR_F10H_HWCR);
+-	if ((value & HWCR_TSCFREQSEL) == 0)
+-		return;
+-
+-	value = x86_read_msr(MSR_F10H_PSTATEDEF(0));
+-	if ((value & PSTATEDEF_EN) == 0)
+-		return;
+-	if (family != 0x17 && family != 0x19)
+-		return;
+-
+-	uint64 khz = 200 * 1000;
+-	uint32 denominator = (value >> 8) & 0x3f;
+-	if (denominator < 0x8 || denominator > 0x2c)
+-		return;
+-	if (denominator > 0x1a && (denominator % 2) == 1)
+-		return;
+-	uint32 numerator = value & 0xff;
+-	if (numerator < 0x10)
+-		return;
+-
+-	dprintf("CPU: using TSC frequency from MSR %" B_PRIu64 "\n", khz * numerator / denominator);
+-	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
+-	// or (1000 << 32) / (tsc freq in kHz)
+-	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
+-}
+-
+-
+-static void
+-init_tsc_on_hypervisor(kernel_args* args, uint32* conversionFactor)
+-{
+-	cpuid_info info;
+-	if (get_current_cpuid(&info, 1, 0) != B_OK
+-			|| (info.regs.ecx & IA32_FEATURE_EXT_HYPERVISOR) == 0)
+-		return;
+-
+-	get_current_cpuid(&info, 0x40000000, 0);
+-	const uint32 maxVMM = info.regs.eax;
+-
+-	if (maxVMM >= 0x40000010) {
+-		get_current_cpuid(&info, 0x40000010, 0);
+-
+-		uint64 clockSpeed = uint64(info.regs.eax) * 1000;
+-		*conversionFactor = (uint64(1000) << 32) / info.regs.eax;
+-
+-		gCPUClockSpeed = clockSpeed;
+-
+-		dprintf("CPU: TSC frequency read from hypervisor CPUID leaf\n");
+-		return;
+-	}
+-
+-	if (maxVMM >= 0x40000003) {
+-		// Hyper-V does not implement the standard hypervisor timing interface
+-		// "Hv#1" here indicates Hyper-V
+-		get_current_cpuid(&info, 0x40000001, 0);
+-		if (info.regs.eax == 0x31237648) {
+-			// Check for HV_X64_MSR_TSC_FREQUENCY presence
+-			// TSC frequency is represented in Hz
+-			get_current_cpuid(&info, 0x40000003, 0);
+-			if ((info.regs.eax & (1 << 11)) != 0) {
+-				uint64 clockSpeed = x86_read_msr(0x40000022);
+-				if (clockSpeed > 0) {
+-					*conversionFactor = (uint64(1000000) << 32) / clockSpeed;
+-
+-					gCPUClockSpeed = clockSpeed;
+-
+-					dprintf("CPU: TSC frequency read from Hyper-V MSR\n");
+-					return;
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-
+-void
+-x86_init_tsc(kernel_args* args)
+-{
+-	// init the TSC -> system_time() conversion factors
+-
+-	// try to find the TSC frequency with CPUID
+-	uint32 conversionFactor = 0;
+-	init_tsc_with_cpuid(args, &conversionFactor);
+-	init_tsc_with_msr(args, &conversionFactor);
+-	init_tsc_on_hypervisor(args, &conversionFactor);
+-	if (conversionFactor == 0)
+-		calculate_cpu_conversion_factor(2, &conversionFactor);
+-
+-	gSystemTimeConversionFactor = conversionFactor;
+-
+-	uint64 conversionFactorNsecs = (uint64)conversionFactor * 1000;
+-
+-#ifdef __x86_64__
+-	// The x86_64 system_time() implementation uses 64-bit multiplication and
+-	// therefore shifting is not necessary for low frequencies (it's also not
+-	// too likely that there'll be any x86_64 CPUs clocked under 1GHz).
+-	__x86_setup_system_time((uint64)conversionFactor << 32,
+-		conversionFactorNsecs);
+-#else
+-	if (conversionFactorNsecs >> 32 != 0) {
+-		// the TSC frequency is < 1 GHz, which forces us to shift the factor
+-		__x86_setup_system_time(conversionFactor, conversionFactorNsecs >> 16,
+-			true);
+-	} else {
+-		// the TSC frequency is >= 1 GHz
+-		__x86_setup_system_time(conversionFactor, conversionFactorNsecs, false);
+-	}
+-#endif
+-}
 diff --git a/src/system/kernel/arch/x86/ioapic.cpp b/src/system/kernel/arch/x86/ioapic.cpp
 index 576d492921..cf242a82ba 100644
 --- a/src/system/kernel/arch/x86/ioapic.cpp
@@ -6441,3 +8350,15 @@ index 45e7fb785a..277f055149 100644
  	if (partitions.IsEmpty()) {
  		panic("did not find any boot partitions! @! syslog | tail 15");
  	}
+diff --git a/src/system/kernel/timer.cpp b/src/system/kernel/timer.cpp
+index b6cde90c3a..ed9b54ada6 100644
+--- a/src/system/kernel/timer.cpp
++++ b/src/system/kernel/timer.cpp
+@@ -444,7 +444,6 @@ void
+ spin(bigtime_t microseconds)
+ {
+ 	bigtime_t target = system_time() + microseconds;
+-	ASSERT(target > microseconds);
+ 
+ 	while (system_time() < target)
+ 		cpu_pause();

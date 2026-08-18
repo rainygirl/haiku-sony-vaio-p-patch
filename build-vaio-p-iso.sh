@@ -30,8 +30,10 @@
 #                        step most likely to silently go stale/wrong if
 #                        skipped by mistake.
 #   HAIKU_GIT_REF        Branch/tag/commit of haiku.git to check out.
-#                        Default: leave whatever is currently checked out
-#                        (or "master" on a fresh clone).
+#                        Default: the pinned nightly commit the patch was
+#                        generated from and verified against (see below).
+#                        Set to "master" to track the tip instead -- the
+#                        patch may or may not still apply there.
 #   JOBS                 Parallelism for configure/jam. Default: nproc.
 
 set -euo pipefail
@@ -82,11 +84,19 @@ if [ ! -d buildtools/.git ]; then
 	git clone https://github.com/haiku/buildtools.git
 fi
 
-if [ -n "${HAIKU_GIT_REF:-}" ]; then
-	log "Checking out haiku.git ref: $HAIKU_GIT_REF"
-	git -C haiku fetch origin "$HAIKU_GIT_REF"
-	git -C haiku checkout FETCH_HEAD
-fi
+# The nightly commit vaio-p-patches.diff was generated from and verified
+# against. Pinned deliberately: haiku.git master moves several times a day,
+# and an unpinned build silently mixes an untested upstream state into an
+# ISO whose whole point is that it boots on one specific fragile machine.
+# Bumping it is a deliberate act -- re-derive the patch against the new
+# commit, rebuild, and confirm the machine still boots before committing
+# the new value. Override with HAIKU_GIT_REF=master to track the tip.
+HAIKU_GIT_REF="${HAIKU_GIT_REF:-8b91c532fa}"
+
+log "Checking out haiku.git ref: $HAIKU_GIT_REF"
+git -C haiku fetch origin master
+git -C haiku fetch origin "$HAIKU_GIT_REF" 2>/dev/null || true
+git -C haiku checkout --detach "$HAIKU_GIT_REF"
 
 # determine_haiku_revision requires at least one reachable hrev* tag.
 if ! git -C haiku describe --tags --match='hrev*' >/dev/null 2>&1; then
