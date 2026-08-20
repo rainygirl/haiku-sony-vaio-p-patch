@@ -3295,6 +3295,39 @@ index 0000000000..8e2760c67c
 +	(module_info *)&sSonyEcBacklightModule,
 +	NULL
 +};
+diff --git a/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp b/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+index 85a13ce8cd..3340a457c2 100644
+--- a/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
++++ b/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+@@ -527,13 +527,27 @@ EndpointManager::Unbind(TCPEndpoint* endpoint)
+ 	TRACE(("EndpointManager::Unbind(%p)\n", endpoint));
+ 	T(Unbind(endpoint));
+ 
+-	if (endpoint == NULL || !endpoint->IsBound()) {
++	if (endpoint == NULL) {
+ 		TRACE(("  endpoint is unbound.\n"));
+ 		return B_BAD_VALUE;
+ 	}
+ 
++	// The bound check has to happen under the write lock: it reads the local
++	// address' sa_len, and the code below clears that same field under the
++	// lock. Checked before taking the lock (as this used to), two concurrent
++	// Unbind() calls could both pass the check, serialize on the lock, and
++	// the loser then panicked on the failed hash removal ("bound endpoint %p
++	// not in hash!") -- observed on a Sony VAIO P the first day its second
++	// logical CPU actually ran: thread 109 "sshd" tearing down a TCPEndpoint
++	// on CPU 1 while its socket was concurrently freed. Unreachable with one
++	// CPU, which is why it survived this long.
+ 	WriteLocker _(fLock);
+ 
++	if (!endpoint->IsBound()) {
++		TRACE(("  endpoint is unbound.\n"));
++		return B_BAD_VALUE;
++	}
++
+ 	if (!fEndpointHash.Remove(endpoint))
+ 		panic("bound endpoint %p not in hash!", endpoint);
+ 
 diff --git a/src/add-ons/kernel/power/cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/Jamfile
 index 81306a7e6b..01097bf66c 100644
 --- a/src/add-ons/kernel/power/cpufreq/Jamfile
@@ -5403,6 +5436,173 @@ index 6156d5ece5..6aa280af88 100644
  			status_t			_LaunchFinishScript(BPath& path);
  
  			status_t			_PerformInstall(partition_id sourcePartitionID,
+diff --git a/src/kits/app/Roster.cpp b/src/kits/app/Roster.cpp
+index 13131e1c31..925fecc9ea 100644
+--- a/src/kits/app/Roster.cpp
++++ b/src/kits/app/Roster.cpp
+@@ -404,6 +404,121 @@ query_for_app(const char* signature, entry_ref* appRef)
+ }
+ 
+ 
++/*!	Returns whether the file at \a ref carries the application signature
++	\a signature.
++*/
++static bool
++app_has_signature(const entry_ref& ref, const char* signature)
++{
++	BFile file;
++	if (file.SetTo(&ref, B_READ_ONLY) != B_OK)
++		return false;
++
++	BAppFileInfo appFileInfo;
++	if (appFileInfo.SetTo(&file) != B_OK)
++		return false;
++
++	char foundSignature[B_MIME_TYPE_LENGTH];
++	if (appFileInfo.GetSignature(foundSignature) != B_OK)
++		return false;
++
++	// Matched case-insensitively, as query_for_app() does on its second pass.
++	return strcasecmp(foundSignature, signature) == 0;
++}
++
++
++/*!	Searches the standard application directories for an application with the
++	given \a signature.
++
++	The last resort when query_for_app() could not look anywhere. That function
++	only searches volumes that both know queries and carry a BEOS:APP_SIG
++	index, and skips every other volume deliberately -- so on a system booted
++	from a live ISO9660 session it searches nothing at all and reports
++	B_LAUNCH_FAILED_APP_NOT_FOUND.
++
++	That case is not hypothetical: app hints in the MIME database are written
++	when the image is built and name paths on the *build* machine, so they
++	never resolve on the booted system. Together, a stale hint and an
++	unqueryable boot volume made every signature-based launch fail on a live
++	medium -- which is how FirstBootPrompt, and with it the whole installer,
++	silently failed to appear while the desktop itself came up fine.
++
++	\a hintName, when not NULL and not empty, is the file name taken from the
++	stale app hint. It is tried directly in each directory first, which costs
++	a couple of stat() calls instead of a full directory scan in the case that
++	matters -- the hint's path is wrong, but its file name is not.
++*/
++static status_t
++find_app_in_standard_directories(const char* signature, const char* hintName,
++	entry_ref* appRef)
++{
++	if (signature == NULL || appRef == NULL)
++		return B_BAD_VALUE;
++
++	const directory_which kDirectories[] = {
++		B_SYSTEM_APPS_DIRECTORY,
++		B_SYSTEM_PREFERENCES_DIRECTORY,
++		B_SYSTEM_BIN_DIRECTORY,
++		B_SYSTEM_SERVERS_DIRECTORY,
++		B_SYSTEM_NONPACKAGED_BIN_DIRECTORY,
++		B_USER_APPS_DIRECTORY,
++		B_USER_NONPACKAGED_BIN_DIRECTORY,
++	};
++	const size_t kDirectoryCount
++		= sizeof(kDirectories) / sizeof(kDirectories[0]);
++
++	// The name from the stale hint, tried directly.
++	if (hintName != NULL && hintName[0] != '\0') {
++		for (size_t i = 0; i < kDirectoryCount; i++) {
++			BPath path;
++			if (find_directory(kDirectories[i], &path) != B_OK)
++				continue;
++			if (path.Append(hintName) != B_OK)
++				continue;
++
++			BEntry entry;
++			entry_ref ref;
++			if (entry.SetTo(path.Path(), true) != B_OK || !entry.IsFile()
++				|| entry.GetRef(&ref) != B_OK) {
++				continue;
++			}
++
++			if (app_has_signature(ref, signature)
++				&& can_app_be_used(&ref) == B_OK) {
++				*appRef = ref;
++				return B_OK;
++			}
++		}
++	}
++
++	// Otherwise scan them.
++	for (size_t i = 0; i < kDirectoryCount; i++) {
++		BPath path;
++		if (find_directory(kDirectories[i], &path) != B_OK)
++			continue;
++
++		BDirectory directory;
++		if (directory.SetTo(path.Path()) != B_OK)
++			continue;
++
++		entry_ref ref;
++		while (directory.GetNextRef(&ref) == B_OK) {
++			BEntry entry;
++			if (entry.SetTo(&ref, true) != B_OK || !entry.IsFile())
++				continue;
++
++			if (app_has_signature(ref, signature)
++				&& can_app_be_used(&ref) == B_OK) {
++				*appRef = ref;
++				return B_OK;
++			}
++		}
++	}
++
++	return B_LAUNCH_FAILED_APP_NOT_FOUND;
++}
++
++
+ //	#pragma mark - app_info
+ 
+ 
+@@ -2506,6 +2621,7 @@ BRoster::_TranslateType(const char* mimeType, BMimeType* appMeta,
+ 
+ 		// Check, whether the signature is installed and has an app hint
+ 		bool appFound = false;
++		BString staleHintName;
+ 		if (error == B_OK && appMeta->GetAppHint(appRef) == B_OK) {
+ 			// Resolve symbolic links, if necessary
+ 			BEntry entry;
+@@ -2513,16 +2629,30 @@ BRoster::_TranslateType(const char* mimeType, BMimeType* appMeta,
+ 				&& entry.GetRef(appRef) == B_OK) {
+ 				appFound = true;
+ 			} else {
+-				// Bad app hint -- remove it
++				// Bad app hint -- remember the file name it named before
++				// dropping it, the directory search below can use it.
++				staleHintName = appRef->name;
+ 				appMeta->SetAppHint(NULL);
+ 			}
+ 		}
+ 
+ 		// In case there is no app hint or it is invalid, we need to query for
+ 		// the app.
+-		if (error == B_OK && !appFound)
++		if (error == B_OK && !appFound) {
+ 			error = query_for_app(appMeta->Type(), appRef);
+ 
++			if (error != B_OK) {
++				// The query searches only volumes carrying a BEOS:APP_SIG
++				// index and silently skips the rest, so on a live ISO9660
++				// session it had nowhere to look. Search the standard
++				// application directories before giving up.
++				if (find_app_in_standard_directories(appMeta->Type(),
++						staleHintName.String(), appRef) == B_OK) {
++					error = B_OK;
++				}
++			}
++		}
++
+ 		if (error == B_OK)
+ 			error = appFile->SetTo(appRef, B_READ_ONLY);
+ 
 diff --git a/src/kits/device/USBEndpoint.cpp b/src/kits/device/USBEndpoint.cpp
 index fd0d629f67..c07874ea8d 100644
 --- a/src/kits/device/USBEndpoint.cpp
@@ -5957,6 +6157,45 @@ index b696c48674..c28656d18e 100644
  	}
  
  	// Build argument vector
+diff --git a/src/servers/launch/LaunchDaemon.cpp b/src/servers/launch/LaunchDaemon.cpp
+index 750382b861..88b612bbbc 100644
+--- a/src/servers/launch/LaunchDaemon.cpp
++++ b/src/servers/launch/LaunchDaemon.cpp
+@@ -1563,13 +1563,29 @@ LaunchDaemon::_AddRunTargets(BMessage& message)
+ void
+ LaunchDaemon::_AddRunTargets(BMessage& message, const char* name)
+ {
+-	BMessage targets;
+-	if (name != NULL && message.FindMessage(name, &targets) != B_OK)
+-		return;
++	// A "run" block may name its targets directly, with no if/then wrapper:
++	//
++	//	run {
++	//		desktop
++	//	}
++	//
++	// The parser stores those as "target" strings in the block's own message
++	// (RunConverter in SettingsParser.cpp). This function was reading them
++	// out of the local "targets" message even in the name == NULL case, where
++	// nothing ever fills it, so every directly-named target was silently
++	// dropped -- the block parsed, produced no error, and ran nothing. Only
++	// the "then"/"else" sub-message forms worked.
++	BMessage targetsStorage;
++	const BMessage* targets = &message;
++	if (name != NULL) {
++		if (message.FindMessage(name, &targetsStorage) != B_OK)
++			return;
++		targets = &targetsStorage;
++	}
+ 
+ 	const char* target;
+-	for (int32 index = 0; targets.FindString("target", index, &target) == B_OK;
+-			index++) {
++	for (int32 index = 0;
++			targets->FindString("target", index, &target) == B_OK; index++) {
+ 		fRunTargets.Add(target);
+ 	}
+ }
 diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
 index 42bae2a7da..05d3705dfb 100644
 --- a/src/servers/net/AutoconfigLooper.cpp
@@ -6514,6 +6753,18 @@ index c8893e4372..ca0a16c793 100644
  			video.cpp
  			apm.cpp
  			interrupts.cpp
+diff --git a/src/system/boot/platform/bios_ia32/bios.h b/src/system/boot/platform/bios_ia32/bios.h
+index df0ab58757..461c944179 100644
+--- a/src/system/boot/platform/bios_ia32/bios.h
++++ b/src/system/boot/platform/bios_ia32/bios.h
+@@ -49,6 +49,7 @@ extern "C" {
+ 
+ void	call_bios(uint8 num, struct bios_regs* regs);
+ uint32	boot_key_in_keyboard_buffer(void);
++bool	platform_boot_drive_is_ata(void);
+ 
+ #ifdef __cplusplus
+ }
 diff --git a/src/system/boot/platform/bios_ia32/cpu.cpp b/src/system/boot/platform/bios_ia32/cpu.cpp
 index 4bcb0acf55..8185a62023 100644
 --- a/src/system/boot/platform/bios_ia32/cpu.cpp
@@ -6527,11 +6778,78 @@ index 4bcb0acf55..8185a62023 100644
  	gKernelArgs.num_cpus = 1;
  		// this will eventually be corrected later on
  }
+diff --git a/src/system/boot/platform/bios_ia32/devices.cpp b/src/system/boot/platform/bios_ia32/devices.cpp
+index f52f068155..8535aafea9 100644
+--- a/src/system/boot/platform/bios_ia32/devices.cpp
++++ b/src/system/boot/platform/bios_ia32/devices.cpp
+@@ -238,6 +238,39 @@ get_ext_drive_parameters(uint8 drive, drive_parameters *targetParameters)
+ }
+ 
+ 
++/*!	Whether EDD reports the boot drive on an ATA interface.
++
++	Exists for one caller: the loader's pre-wake EHCI BIOS handoff
++	(smp_early_usb_handoff() in smp.cpp), which must never run when the boot
++	medium is read through the BIOS's own USB machinery -- killing the BIOS's
++	USB SMIs while it still had INT 13h reads to serve broke the very next
++	partition scan on real hardware (bytes_per_sector came back 0 and
++	BIOSDrive::ReadAt() died on a divide error, "Boot Loader Death Land").
++	Only an explicit EDD 3.0 answer of "ATA" (which also covers ATAPI)
++	counts; USB, anything else, or any failure to answer means "not safe",
++	so the default is to skip.
++
++	Uses only gBootDriveID (set by shell.S from DL before any C code) and a
++	BIOS call, so it is safe long before platform device init.
++*/
++extern "C" bool
++platform_boot_drive_is_ata(void)
++{
++	drive_parameters parameters;
++
++	if (gBootDriveID < 0x80
++		|| !are_extensions_available(gBootDriveID)
++		|| get_ext_drive_parameters(gBootDriveID, &parameters) != B_OK)
++		return false;
++
++	if (parameters.parameters_size < kParametersSizeVersion3
++		|| parameters.device_path_signature != kDevicePathSignature)
++		return false;
++
++	return strncmp(parameters.interface_type, "ATA", 3) == 0;
++}
++
++
+ static status_t
+ get_drive_parameters(uint8 drive, drive_parameters *parameters)
+ {
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 68acf3f830..681756d037 100644
+index 68acf3f830..3994bd594b 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
-@@ -379,6 +379,157 @@ smp_init_other_cpus(void)
+@@ -10,6 +10,7 @@
+ 
+ #include "smp.h"
+ 
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include <KernelExport.h>
+@@ -18,12 +19,14 @@
+ #include <safemode.h>
+ #include <boot/stage2.h>
+ #include <boot/menu.h>
++#include <arch/cpu.h>
+ #include <arch/x86/apic.h>
+ #include <arch/x86/arch_cpu.h>
+ #include <arch/x86/arch_smp.h>
+ #include <arch/x86/arch_system_info.h>
+ #include <arch/x86/descriptors.h>
+ 
++#include "bios.h"
+ #include "mmu.h"
+ #include "acpi.h"
+ 
+@@ -379,6 +382,685 @@ smp_init_other_cpus(void)
  }
  
  
@@ -6551,6 +6869,11 @@ index 68acf3f830..681756d037 100644
 +// BSP tell "already parked, just hand over the page directory" from "never
 +// started, run the whole INIT/SIPI sequence".
 +static const uint32 kApParkedMarker = 0x9e804;
++
++// Written by the trampoline's first real-mode instructions. Distinguishes
++// "the AP never executed anything at all" (the documented out-of-window
++// behaviour) from "it ran but did not reach protected mode".
++static const uint32 kApRealModeMarker = 0x9e808;
 +
 +
 +/*!	Copies the trampoline into place and builds the gdt it loads. Contents are
@@ -6576,6 +6899,98 @@ index 68acf3f830..681756d037 100644
 +}
 +
 +
++/*!	Per-IPI record of what the local APIC actually did.
++
++	Measured 2026-08-19: all four sends complete in 0 us with esr 0x0, and the
++	sequence reports "completed on attempt 1", yet the whole call still takes
++	211 ms against 10.4 ms of spin(). So the missing ~200 ms is neither a
++	delivery-status timeout nor the spins -- it is wall-clock lost between the
++	sample points, which is what an SMI storm looks like from inside the
++	loader. This machine's BIOS is known never to acknowledge the EHCI legacy
++	handoff (see "Early EHCI BIOS handoff"), so USB legacy emulation is still
++	running on SMIs throughout. sSegmentUs below times each segment separately
++	to find where it goes.
++*/
++struct ipi_step_trace {
++	const char*	name;
++	uint32		writtenIcr;
++	uint32		readbackIcr;
++	uint32		esr;
++	uint32		elapsedUs;
++	bool		timedOut;
++};
++
++static const uint32 kMaxIPITrace = 12;
++static ipi_step_trace sIpiTrace[kMaxIPITrace];
++static uint32 sIpiTraceCount;
++
++// Microseconds spent in each segment of one INIT/SIPI sequence, by the
++// loader's own TSC clock. Indices: 0 esr-clear, 1 init-assert write, 2
++// init-assert wait, 3 init-deassert write, 4 init-deassert wait, 5 spin(10000),
++// 6 sipi-1 write, 7 sipi-1 spin(200), 8 sipi-1 wait, 9 sipi-2 write,
++// 10 sipi-2 spin(200), 11 sipi-2 wait.
++static uint32 sSegmentUs[12];
++
++// Which slice of the INIT-to-SIPI wait the 200 ms stall lands in, if any.
++static uint32 sStallSlice[4];
++static uint32 sStallSliceUs[4];
++static uint32 sStallSliceCount;
++
++// How many wake attempts were spoiled by a stall landing in the INIT-to-SIPI
++// wait. Perfectly predicts an AP that does not come up.
++static uint32 sStalledAttempts;
++
++// Kept for smp_add_safemode_menus(), which runs much later and reports these.
++static uint32 sEarlyWakeAttempt;
++static uint32 sEarlyWakeMaxAttempts;
++static const char* const kSegmentName[12] = {
++	"esr-clear", "init-assert-write", "init-assert-wait",
++	"init-deassert-write", "init-deassert-wait", "spin10ms",
++	"sipi1-write", "sipi1-spin200", "sipi1-wait",
++	"sipi2-write", "sipi2-spin200", "sipi2-wait"
++};
++
++#define SEGMENT_BEGIN()		bigtime_t segStart = system_time()
++#define SEGMENT_END(index)	sSegmentUs[index] += (uint32)(system_time() \
++								- segStart); segStart = system_time()
++
++
++/*!	Bounded wait for the local APIC to finish sending, recording how long it
++	took and what the ICR and error status looked like afterwards.
++*/
++static bool
++smp_wait_for_delivery(const char* name, uint32 writtenIcr)
++{
++	bigtime_t start = system_time();
++
++	uint32 timeout = kIPIDeliveryTimeout;
++	while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
++			&& --timeout != 0) {
++		asm volatile ("pause;");
++	}
++
++	uint32 elapsedUs = (uint32)(system_time() - start);
++	uint32 readback = apic_read(APIC_INTR_COMMAND_1);
++
++	// The error status register latches on write, so write-then-read is the
++	// only way to see the errors raised by the send that just happened.
++	apic_write(APIC_ERROR_STATUS, 0);
++	uint32 esr = apic_read(APIC_ERROR_STATUS);
++
++	if (sIpiTraceCount < kMaxIPITrace) {
++		ipi_step_trace& step = sIpiTrace[sIpiTraceCount++];
++		step.name = name;
++		step.writtenIcr = writtenIcr;
++		step.readbackIcr = readback;
++		step.esr = esr;
++		step.elapsedUs = elapsedUs;
++		step.timedOut = timeout == 0;
++	}
++
++	return timeout != 0;
++}
++
++
 +/*!	One INIT assert/de-assert plus the startup IPIs, with every wait bounded.
 +	Returns false if a send never completed.
 +*/
@@ -6585,10 +7000,14 @@ index 68acf3f830..681756d037 100644
 +	uint32 apicID = gKernelArgs.arch_args.cpu_apic_id[cpu];
 +	uint32 config;
 +
++	SEGMENT_BEGIN();
++
 +	if (gKernelArgs.arch_args.cpu_apic_version[cpu] & 0xf0) {
 +		apic_write(APIC_ERROR_STATUS, 0);
 +		apic_read(APIC_ERROR_STATUS);
 +	}
++
++	SEGMENT_END(0);
 +
 +	// INIT, asserted then de-asserted
 +	for (int32 phase = 0; phase < 2; phase++) {
@@ -6601,16 +7020,35 @@ index 68acf3f830..681756d037 100644
 +			| (phase == 0 ? APIC_INTR_COMMAND_1_ASSERT : 0);
 +		apic_write(APIC_INTR_COMMAND_1, config);
 +
-+		uint32 timeout = kIPIDeliveryTimeout;
-+		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
-+				&& --timeout != 0) {
-+			asm volatile ("pause;");
-+		}
-+		if (timeout == 0)
++		SEGMENT_END(phase == 0 ? 1 : 3);
++
++		if (!smp_wait_for_delivery(
++				phase == 0 ? "init-assert" : "init-deassert", config)) {
 +			return false;
++		}
++
++		SEGMENT_END(phase == 0 ? 2 : 4);
 +	}
 +
-+	spin(10000);
++	// The 10 ms the MP init protocol asks for between INIT and SIPI, sliced so
++	// the 200 ms stall that lands in here can be located. Measured: baseline
++	// 10 ms spins are exact to the microsecond, an INIT to a bogus APIC id
++	// costs nothing, and a *second* INIT to id 1 costs nothing -- only the
++	// first INIT of the boot is followed by this stall. That is what a core
++	// resetting its sibling thread looks like from the thread that is still
++	// running, and it means something is there to reset.
++	for (uint32 slice = 0; slice < 20; slice++) {
++		bigtime_t sliceStart = system_time();
++		spin(500);
++		uint32 sliceUs = (uint32)(system_time() - sliceStart);
++		if (sliceUs > 2000 && sStallSliceCount < 4) {
++			sStallSlice[sStallSliceCount] = slice;
++			sStallSliceUs[sStallSliceCount] = sliceUs;
++			sStallSliceCount++;
++		}
++	}
++
++	SEGMENT_END(5);
 +
 +	uint32 numStartups
 +		= (gKernelArgs.arch_args.cpu_apic_version[cpu] & 0xf0) ? 2 : 0;
@@ -6625,19 +7063,171 @@ index 68acf3f830..681756d037 100644
 +			| APIC_DELIVERY_MODE_STARTUP | (kTrampolineCode >> 12);
 +		apic_write(APIC_INTR_COMMAND_1, config);
 +
++		SEGMENT_END(j == 0 ? 6 : 9);
++
 +		spin(200);
 +
-+		uint32 timeout = kIPIDeliveryTimeout;
-+		while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
-+				&& --timeout != 0) {
-+			asm volatile ("pause;");
-+		}
-+		if (timeout == 0)
++		SEGMENT_END(j == 0 ? 7 : 10);
++
++		if (!smp_wait_for_delivery(j == 0 ? "sipi-1" : "sipi-2", config))
 +			return false;
++
++		SEGMENT_END(j == 0 ? 8 : 11);
 +	}
 +
 +	return true;
 +}
++
++
++#ifdef _PXE_ENV
++
++// PXE boots through the BIOS's network stack, which must keep working for
++// the rest of the load -- the same class of dependency that made the USB
++// case crash (see below). Leave the BIOS's SMIs alone entirely.
++static void
++smp_early_usb_handoff(void)
++{
++}
++
++#else	// !_PXE_ENV
++
++// Raw PCI configuration mechanism 1. The loader has no PCI module; these
++// twenty lines are the whole requirement.
++
++static uint32
++pci_cfg_read(uint8 bus, uint8 device, uint8 function, uint8 offset, int size)
++{
++	out32(0x80000000 | (bus << 16) | (device << 11) | (function << 8)
++		| (offset & 0xfc), 0xcf8);
++	uint32 value = in32(0xcfc);
++	value >>= (offset & 3) * 8;
++	if (size == 1)
++		return value & 0xff;
++	if (size == 2)
++		return value & 0xffff;
++	return value;
++}
++
++
++static void
++pci_cfg_write(uint8 bus, uint8 device, uint8 function, uint8 offset, int size,
++	uint32 value)
++{
++	out32(0x80000000 | (bus << 16) | (device << 11) | (function << 8)
++		| (offset & 0xfc), 0xcf8);
++	if (size == 1)
++		out8(value, 0xcfc + (offset & 3));
++	else if (size == 2)
++		out16(value, 0xcfc + (offset & 3));
++	else
++		out32(value, 0xcfc);
++}
++
++
++/*!	Takes the Poulsbo/SCH EHCI controller away from the BIOS before the AP is
++	woken, replicating the kernel's intel_fixup_ehci_bar() (pci_fixup.cpp) --
++	which runs at kernel PCI scan time, far too late for this purpose.
++
++	Why here: on the VAIO P the AP intermittently cannot be started, decided
++	per boot, and the boots that fail are exactly the boots where a ~200 ms
++	stall (an SMI storm; this thread simply stops executing) lands in the
++	INIT-to-SIPI window -- measured via the sliced spin in
++	smp_send_init_sipi(). This BIOS never acknowledges the EHCI legacy
++	handoff, so its USB legacy emulation is still armed and generating SMIs
++	throughout the loader's early wake. An SMI takes *both* logical processors
++	into SMM; an INIT/SIPI colliding with that is handled by firmware whose
++	idea of the sibling's state is its own business. Killing the BIOS's EHCI
++	claim and every one of its SMI enables before the first INIT removes that
++	collision at the source.
++
++	Gated to the SCH EHCI (8086:8117) found on bus 0, so it is a no-op
++	everywhere else. The SCH's UHCI companions (0x8114-0x8116) are left
++	strictly alone: they do not implement the standard USBLEGSUP register and
++	writing it corrupts their transfer engine (see the UHCI headline fix).
++*/
++static void
++smp_early_usb_handoff(void)
++{
++	// Never while the BIOS's own USB machinery still has work to do: booting
++	// from a USB stick, the loader reads the kernel via INT 13h *after* this
++	// point, and killing the BIOS's EHCI SMIs first broke exactly that on
++	// real hardware -- the very next partition scan read a bytes_per_sector
++	// of 0 and BIOSDrive::ReadAt() died on a divide error. Only an explicit
++	// EDD "ATA" answer for the boot drive makes this safe; anything else
++	// (USB, no EDD 3.0, no answer) skips.
++	if (!platform_boot_drive_is_ata()) {
++		dprintf("smp: early usb handoff skipped: boot drive is not ATA, the "
++			"BIOS's USB machinery may be load-bearing for INT 13h\n");
++		return;
++	}
++
++	for (uint8 device = 0; device < 32; device++) {
++		for (uint8 function = 0; function < 8; function++) {
++			uint32 id = pci_cfg_read(0, device, function, 0, 4);
++			if (id != 0x81178086)
++				continue;
++
++			uint32 bar0 = pci_cfg_read(0, device, function, 0x10, 4);
++			uint16 pciCommand = pci_cfg_read(0, device, function, 0x04, 2);
++			pci_cfg_write(0, device, function, 0x04, 2,
++				pciCommand | 0x02 /* memory decode */);
++
++			// EECP lives in MMIO HCCPARAMS bits 15:8; the capability
++			// registers themselves are in config space.
++			uint8 eecp = 0;
++			if ((bar0 & ~0xfffUL) != 0) {
++				addr_t regs = mmu_map_physical_memory(bar0 & ~0xfffUL,
++					B_PAGE_SIZE, kDefaultPageFlags);
++				if (regs != 0) {
++					uint32 hccparams = *(volatile uint32 *)(regs + 8);
++					eecp = (hccparams >> 8) & 0xff;
++				}
++			}
++			if (eecp < 0x40)
++				eecp = 0x68;	// SCH datasheet's fixed offset
++
++			uint32 legacySupport = pci_cfg_read(0, device, function, eecp, 4);
++			if ((legacySupport & 0xff) != 0x01) {
++				dprintf("smp: early usb handoff: no legacy capability at "
++					"%#02x (%#08" B_PRIx32 "), skipping\n", eecp,
++					legacySupport);
++				pci_cfg_write(0, device, function, 0x04, 2, pciCommand);
++				return;
++			}
++
++			bool wasBiosOwned = (legacySupport & (1 << 16)) != 0;
++			if (wasBiosOwned) {
++				// Ask politely first, but only briefly -- this BIOS has
++				// never once acknowledged, so the wait is a formality.
++				pci_cfg_write(0, device, function, eecp + 3, 1, 1);
++				for (int32 i = 0; i < 10; i++) {
++					legacySupport
++						= pci_cfg_read(0, device, function, eecp, 4);
++					if ((legacySupport & (1 << 16)) == 0)
++						break;
++					spin(5000);
++				}
++			}
++
++			// Force the BIOS semaphore off and disable/clear every SMI
++			// source regardless.
++			pci_cfg_write(0, device, function, eecp + 2, 1, 0);
++			pci_cfg_write(0, device, function, eecp + 4, 4, 0);
++			pci_cfg_write(0, device, function, 0x04, 2, pciCommand);
++
++			dprintf("smp: early usb handoff: EHCI at 0:%u:%u, was %s, SMI "
++				"enables cleared %" B_PRIu32 " ms before the wake\n",
++				device, function, wasBiosOwned
++					? ((legacySupport & (1 << 16)) != 0
++						? "BIOS-owned (forced off)" : "BIOS-owned (released)")
++					: "already unowned",
++				(uint32)(system_time() / 1000));
++			return;
++		}
++	}
++}
++
++#endif	// !_PXE_ENV
 +
 +
 +/*!	Wakes the application processors as early as possible and parks them in the
@@ -6665,6 +7255,10 @@ index 68acf3f830..681756d037 100644
 +	if (gKernelArgs.arch_args.apic_phys == 0 || gKernelArgs.num_cpus < 2)
 +		return;
 +
++	// Silence the BIOS's USB SMIs before the first INIT goes out -- see the
++	// function's comment for why this decides whether the AP starts at all.
++	smp_early_usb_handoff();
++
 +	if (gKernelArgs.arch_args.apic == NULL) {
 +		gKernelArgs.arch_args.apic = (void *)mmu_map_physical_memory(
 +			gKernelArgs.arch_args.apic_phys, B_PAGE_SIZE, kDefaultPageFlags);
@@ -6677,24 +7271,290 @@ index 68acf3f830..681756d037 100644
 +	*(volatile uint32 *)(kTrampolineStack + B_PAGE_SIZE - 8) = 0;
 +	*(volatile uint32 *)(kTrampolineStack + B_PAGE_SIZE - 4) = 0;
 +	*(volatile uint32 *)kApParkedMarker = 0;
++	*(volatile uint32 *)kApRealModeMarker = 0;
 +
-+	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++)
-+		smp_send_init_sipi(i);
++	// Read the local APIC back through the mapping this function just made,
++	// which is not the one smp_init_other_cpus() installs later. If the early
++	// mapping were wrong, every apic_read() below would be reading nothing,
++	// and a stuck delivery-status bit would be an artefact rather than a
++	// hardware fact.
++	uint32 apicId = apic_read(APIC_ID);
++	uint32 apicVersion = apic_read(APIC_VERSION);
++	uint32 apicSvr = apic_read(APIC_SPURIOUS_INTR_VECTOR);
 +
-+	dprintf("smp: early wake sent to %" B_PRIu32 " ap(s)\n",
-+		gKernelArgs.num_cpus - 1);
++	// How far into the boot the SIPI actually goes out. The window in which
++	// this machine will start an AP is measured from power-on, and the TSC
++	// counts from power-on too, so this is the number that says whether the
++	// wake is inside the window or not. Capture before printing: dprintf()
++	// itself costs enough time to move the result.
++	uint64 tscAtWake;
++	asm volatile ("rdtsc" : "=A" (tscAtWake));
++	bigtime_t usDirectStart = system_time();
++
++	// A single delivery timeout used to abort the entire early wake with no
++	// SIPI sent and nothing in the log to say so, because the return value
++	// was thrown away. Retry, and report the outcome either way.
++	// Retry until the AP actually runs, not until the APIC says it sent.
++	//
++	// Measured over many boots: the local APIC always reports a clean send
++	// (0 us, esr 0x0) whether the AP comes up or not, so the send status says
++	// nothing. What does predict the outcome, perfectly, is whether a ~200 ms
++	// stall lands inside the 10 ms INIT-to-SIPI wait. Boots with the stall
++	// never bring the AP up; boots without it always do. The stall is this
++	// thread being held off -- an SMI, on a machine whose BIOS never
++	// acknowledges the EHCI legacy handoff and so is still running USB legacy
++	// emulation on SMIs -- and an SMI takes both logical processors into SMM
++	// together, where a SIPI is discarded rather than latched. So the SIPI is
++	// simply lost when it happens to be sent around one.
++	//
++	// It is intermittent, roughly one boot in two, so the fix is to notice and
++	// try again: send INIT/SIPI, give the AP a couple of milliseconds, and
++	// check its own real-mode marker. Repeating SIPIs alone does not work
++	// (measured: 50 of them over 5 seconds, no response) -- the AP needs the
++	// whole INIT/SIPI sequence again.
++	// The BIOS warm-reset vector, set the way Linux always has
++	// (smpboot_setup_warm_reset_vector): CMOS shutdown-status 0x0a plus a
++	// real-mode far pointer to the trampoline at 40:67. On the IPI path the
++	// SIPI vector makes this redundant -- but on this machine's bad boots the
++	// AP is being held by firmware (the SMI-shaped stalls on the BSP are the
++	// visible half of that), and an AP that firmware routes back through the
++	// BIOS's own reset path never sees a SIPI vector at all: the BIOS reads
++	// the shutdown status, and 0x0a means "jump via 40:67 without POST".
++	// This pointer is the only door into that path.
++	//
++	// The change log claims this was tried on 2026-08-18 and dropped, but
++	// those loaders fell inside the HAIKU_TOP build-trap window (see "A build
++	// trap that invalidated two experiments"), so it was likely never
++	// actually executed.
++	//
++	// The 0x0a MUST be cleared before anything can reboot the machine --
++	// including this function's own reroll below -- or the next warm reset
++	// jumps through a stale pointer instead of POSTing.
++	out8(0x0f, 0x70);
++	out8(0x0a, 0x71);
++	*(volatile uint16 *)0x467 = (uint16)(kTrampolineCode & 0xf);	// offset
++	*(volatile uint16 *)0x469 = (uint16)(kTrampolineCode >> 4);	// segment
++
++	const uint32 kEarlyWakeAttempts = 10;
++	bool sent = false;
++	uint32 attempt;
++	for (attempt = 1; attempt <= kEarlyWakeAttempts; attempt++) {
++		sStallSliceCount = 0;
++
++		sent = true;
++		for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
++			if (!smp_send_init_sipi(i))
++				sent = false;
++		}
++
++		spin(2000);
++
++		if (*(volatile uint32 *)kApRealModeMarker != 0)
++			break;
++
++		sStalledAttempts += sStallSliceCount != 0 ? 1 : 0;
++	}
++
++	// Give the firmware-mediated path a moment beyond the IPI one: if the AP
++	// comes back through the BIOS and the 40:67 pointer, it does so on the
++	// firmware's schedule, not within the 2 ms the loop above waits.
++	if (*(volatile uint32 *)kApRealModeMarker == 0) {
++		for (uint32 waited = 0; waited < 500; waited += 10) {
++			spin(10000);
++			if (*(volatile uint32 *)kApRealModeMarker != 0)
++				break;
++		}
++	}
++
++	// Disarm the warm-reset shortcut before anything can reboot.
++	out8(0x0f, 0x70);
++	out8(0x00, 0x71);
++
++	bigtime_t usDirectEnd = system_time();
++	uint64 tscAfter;
++	asm volatile ("rdtsc" : "=A" (tscAfter));
++
++	// Use the loader's PIT-calibrated clock, not an assumed clock rate: an
++	// earlier version divided by a hand-picked 1.33 GHz and reported a SIPI
++	// sequence of 208 ms where the code's own spins account for about 10,
++	// which is what exposed the error.
++	uint64 usNow = (uint64)system_time();
++	uint32 msAtWake = (uint32)(((tscAtWake * usNow / tscAfter)) / 1000ULL);
++	uint32 msAfter = (uint32)(usNow / 1000ULL);
++
++	dprintf("smp: early wake sent to %" B_PRIu32 " ap(s) at %" B_PRIu32
++		" ms after power-on (took %" B_PRIu32 " ms, sequence %s, attempt %"
++		B_PRIu32 " of %" B_PRIu32 ", %" B_PRIu32 " spoiled by a stall)\n",
++		gKernelArgs.num_cpus - 1, msAtWake, msAfter - msAtWake,
++		sent ? "completed" : "ABORTED", attempt > kEarlyWakeAttempts
++			? kEarlyWakeAttempts : attempt, kEarlyWakeAttempts,
++		sStalledAttempts);
++
++	// The reroll. Whether the AP can be started at all is decided by the
++	// firmware before the loader ever runs: across every instrumented boot,
++	// a boot whose wake attempts see the ~200 ms stall never brings the AP
++	// up and a boot without it always does, with no exception. Nothing
++	// software-side has changed a bad boot into a good one -- not 10 full
++	// INIT/SIPI sequences here, not 50 extra SIPIs, not the kernel's own 3
++	// attempts seconds later, not clearing the EHCI legacy SMI enables
++	// before the first INIT (tried; the stall and the failures persisted).
++	// What does change the outcome is another POST: the state re-rolls per
++	// boot at usable odds.
++	//
++	// So when the AP has not answered, reboot on purpose and roll again.
++	// The counter lives in the RTC alarm-seconds CMOS byte: it survives a
++	// warm reset, it is not part of the checksummed BIOS setup area (which
++	// this machine could not even re-configure, having no setup UI), and
++	// nothing in this system arms RTC alarms. A magic high nibble keeps a
++	// stale byte from a previous OS from being mistaken for a count.
++	{
++		const uint8 kRerollCmosIndex = 0x01;	// RTC alarm seconds
++		const uint8 kRerollMagic = 0xa0;
++		const uint8 kMaxRerolls = 3;
++
++		out8(kRerollCmosIndex, 0x70);
++		uint8 cmos = in8(0x71);
++		uint8 rerolls = (cmos & 0xf0) == kRerollMagic ? (cmos & 0x0f) : 0;
++
++		bool apAnswered = *(volatile uint32 *)kApRealModeMarker != 0;
++		if (apAnswered) {
++			if (rerolls != 0) {
++				dprintf("smp: early wake: AP came up after %u deliberate "
++					"reboot(s) re-rolling the firmware state\n", rerolls);
++			}
++			out8(kRerollCmosIndex, 0x70);
++			out8(0, 0x71);
++		} else if (rerolls < kMaxRerolls) {
++			out8(kRerollCmosIndex, 0x70);
++			out8(kRerollMagic | (rerolls + 1), 0x71);
++			dprintf("smp: early wake: AP unresponsive, rebooting to re-roll "
++				"the firmware state (reroll %u of %u)\n", rerolls + 1,
++				kMaxRerolls);
++			spin(50000);	// let serial output drain
++
++			// The coldest reset available first: a KBC-pulse warm reset
++			// demonstrably carries the bad state along -- measured, one
++			// give-up after 3 straight failed rerolls, in line with the
++			// evening's 7-of-8 warm-reboot failure streak. RST_CNT (port
++			// 0xcf9) with FULL_RST set is as close to a power cycle as
++			// software gets here; the KBC pulse stays as the fallback for
++			// the case where this chipset ignores 0xcf9.
++			out8(0x02, 0xcf9);
++			spin(500);
++			out8(0x0e, 0xcf9);
++			spin(100000);
++			out8(0xfe, 0x64);	// keyboard-controller pulse, as platform_exit()
++			for (;;)
++				asm volatile ("hlt");
++		} else {
++			dprintf("smp: early wake: AP unresponsive after %u reroll(s), "
++				"continuing with one CPU\n", rerolls);
++			out8(kRerollCmosIndex, 0x70);
++			out8(0, 0x71);
++		}
++	}
++
++	dprintf("smp:   local apic at %p: id %#" B_PRIx32 ", version %#" B_PRIx32
++		", svr %#" B_PRIx32 " (%s)\n", (void *)gKernelArgs.arch_args.apic,
++		apicId,
++		apicVersion, apicSvr,
++		(apicSvr & APIC_ENABLE) != 0 ? "enabled" : "SOFTWARE-DISABLED");
++
++	for (uint32 i = 0; i < sIpiTraceCount; i++) {
++		dprintf("smp:   ipi %s: wrote icr1 %#" B_PRIx32 ", waited %" B_PRIu32
++			" us%s, icr1 now %#" B_PRIx32 ", esr %#" B_PRIx32 "\n",
++			sIpiTrace[i].name, sIpiTrace[i].writtenIcr,
++			sIpiTrace[i].elapsedUs, sIpiTrace[i].timedOut ? " (TIMED OUT)" : "",
++			sIpiTrace[i].readbackIcr, sIpiTrace[i].esr);
++	}
++
++	// Where the ~200 ms actually goes. These segments tile the whole of
++	// smp_send_init_sipi(), so they have to add up to the figure above; the
++	// one that does not match its nominal cost is the answer. usDirect is the
++	// same interval measured straight off system_time() instead of through the
++	// TSC ratio, as a check that the ratio arithmetic is not itself the bug.
++	uint32 segmentTotal = 0;
++	for (uint32 i = 0; i < 12; i++)
++		segmentTotal += sSegmentUs[i];
++
++	dprintf("smp:   segments (us): total %" B_PRIu32 ", direct %" B_PRIu32
++		"\n", segmentTotal, (uint32)(usDirectEnd - usDirectStart));
++	for (uint32 i = 0; i < 12; i++) {
++		if (sSegmentUs[i] != 0) {
++			dprintf("smp:     %s %" B_PRIu32 " us\n", kSegmentName[i],
++				sSegmentUs[i]);
++		}
++	}
++
++	// Read the markers here, milliseconds after the SIPI, rather than only in
++	// smp_boot_other_cpus() several seconds and one whole kernel load later.
++	// If the AP does run, this is where it shows -- and a marker that is set
++	// here but zero there means the 0x9e000 page was overwritten in between,
++	// not that the AP never started.
++	spin(5000);
++	dprintf("smp:   markers 5 ms after the wake: real-mode %#" B_PRIx32
++		", pmode %#" B_PRIx32 "\n", *(volatile uint32 *)kApRealModeMarker,
++		*(volatile uint32 *)kApParkedMarker);
++
++	// The 200 ms is entirely inside the one spin(10000) that follows the INIT
++	// de-assert: measured 210496 us for a 10 ms request, while both spin(200)
++	// calls in the same sequence come back at exactly 200 us. A spin cannot
++	// overshoot by 20x on its own -- it polls the same clock it is measured
++	// with -- so either the clock jumped or the thread did not execute for
++	// 200 ms. Both are things that happen to a thread whose sibling has just
++	// been sent an INIT.
++	//
++	// Three measurements separate the possibilities, all after the real wake
++	// so none of them moves the SIPI:
++	//   baseline   -- a 10 ms spin with no IPI anywhere near it. If this is
++	//                 already 210 ms, the cost is periodic (an SMI storm from
++	//                 the USB legacy emulation this BIOS never hands off) and
++	//                 has nothing to do with the INIT.
++	//   after-absent -- a 10 ms spin right after an INIT aimed at an APIC id
++	//                 that cannot exist. Isolates "sending any INIT is
++	//                 expensive" from "reaching that particular target is".
++	//   after-real -- the same right after an INIT aimed at id 1. If only this
++	//                 one costs 200 ms, then something IS there receiving it,
++	//                 which is the opposite of what every other measurement so
++	//                 far suggests.
++	sEarlyWakeAttempt
++		= attempt > kEarlyWakeAttempts ? kEarlyWakeAttempts : attempt;
++	sEarlyWakeMaxAttempts = kEarlyWakeAttempts;
++
++	if (sStallSliceCount != 0) {
++		for (uint32 i = 0; i < sStallSliceCount; i++) {
++			dprintf("smp:   stall: slice %" B_PRIu32 " of 20 took %" B_PRIu32
++				" us\n", sStallSlice[i], sStallSliceUs[i]);
++		}
++	}
++
++
 +}
 +
 +
  void
  smp_boot_other_cpus(void (*entryFunc)(void))
  {
-@@ -401,10 +552,17 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -401,10 +1083,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  	uint32 trampolineStack = 0x9e000;
  #endif
  
 +	const uint32 trampolineSize
 +		= (uint32)&smp_trampoline_end - (uint32)&smp_trampoline;
++
++	// What survived between the early wake and here. The memcpy below restores
++	// the trampoline code and the gdt is rebuilt per CPU, so anything that
++	// disturbed the 0x9e000-0x9ffff window in between is only visible now.
++	dprintf("smp: before handover: trampoline code %s, gdt limit %#x base %#x,"
++		" markers real-mode %#" B_PRIx32 " pmode %#" B_PRIx32 ", handover"
++		" %#" B_PRIx32 "/%#" B_PRIx32 "\n",
++		memcmp((const void *)trampolineCode, (const void *)&smp_trampoline,
++			trampolineSize) == 0 ? "intact" : "CLOBBERED",
++		*(uint16 *)trampolineStack, *(uint32 *)(trampolineStack + 2),
++		*(volatile uint32 *)kApRealModeMarker,
++		*(volatile uint32 *)kApParkedMarker,
++		*(volatile uint32 *)(trampolineStack + B_PAGE_SIZE - 8),
++		*(volatile uint32 *)(trampolineStack + B_PAGE_SIZE - 4));
 +
  	// copy the trampoline code over
  	memcpy((char *)trampolineCode, (const void*)&smp_trampoline,
@@ -6708,7 +7568,7 @@ index 68acf3f830..681756d037 100644
  	// boot the cpus
  	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
  		uint32 *finalStack;
-@@ -412,6 +570,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -412,6 +1115,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		uint32 config;
  		uint32 numStartups;
  		uint32 j;
@@ -6716,7 +7576,7 @@ index 68acf3f830..681756d037 100644
  
  		// set this stack up
  		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
-@@ -422,15 +581,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -422,15 +1126,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  				/ sizeof(uint32)) - 1;
  		*tempStack = (uint32)entryFunc;
  
@@ -6732,7 +7592,7 @@ index 68acf3f830..681756d037 100644
  		// put a gdt descriptor at the bottom of the stack
  		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT
  		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;
-@@ -444,78 +594,191 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -444,78 +1139,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
  			DPL_KERNEL);
  
@@ -6960,6 +7820,13 @@ index 68acf3f830..681756d037 100644
 +						" of %" B_PRIu32 ")\n", i,
 +						gKernelArgs.arch_args.cpu_apic_id[i],
 +						kApStartupTimeoutMs, attempt + 1, kStartupAttempts);
++					uint32 realMode = *(volatile uint32 *)kApRealModeMarker;
++					uint32 parked = *(volatile uint32 *)kApParkedMarker;
++					dprintf("smp:   markers: real-mode %#" B_PRIx32 " (%s), "
++						"pmode %#" B_PRIx32 " (%s), now %" B_PRIu32 " ms\n",
++						realMode, realMode == 0xa5a5 ? "ran" : "never ran",
++						parked, parked == 0x5a5a5a5a ? "reached" : "did not",
++						(uint32)(system_time() / 1000));
 +					startupFailed = true;
 +				} else
 +					started = true;
@@ -6983,6 +7850,47 @@ index 68acf3f830..681756d037 100644
  	}
  
  	TRACE(("done trampolining\n"));
+@@ -527,6 +1342,40 @@ smp_add_safemode_menus(Menu *menu)
+ {
+ 	MenuItem *item;
+ 
++	// The AP bring-up verdict, shown where it can actually be read.
++	//
++	// Two earlier attempts to surface this failed. On-screen debug output
++	// scrolls the lines away, and its paging waits for a keypress this
++	// machine's keyboard does not deliver at that point. Holding the screen
++	// from smp_wake_other_cpus_early() does not work either: that runs at
++	// start.cpp:219 and the boot menu, which is where safemode settings like
++	// debug_screen come from, is not reached until main() at :260 -- so the
++	// setting always read false and the hold never ran.
++	//
++	// This menu is built from main(), long after the wake, so the result is
++	// already known and the markers are still in low memory. The menu waits
++	// for the user by construction: no timing, no scrolling, no paging.
++	if (gKernelArgs.num_cpus > 1 || sIpiTraceCount != 0) {
++		uint32 realMode = *(volatile uint32 *)kApRealModeMarker;
++		uint32 parked = *(volatile uint32 *)kApParkedMarker;
++
++		static char apResult[64];
++		static char apHelp[192];
++		snprintf(apResult, sizeof(apResult), "AP: %s",
++			realMode != 0 ? "STARTED -- 2 CPUs this boot"
++				: "NOT STARTED -- 1 CPU this boot");
++		snprintf(apHelp, sizeof(apHelp),
++			"Early wake: attempt %" B_PRIu32 " of %" B_PRIu32 ", %" B_PRIu32
++			" spoiled by a stall. Markers: real-mode %#" B_PRIx32 ", pmode %#"
++			B_PRIx32 ". Not a setting -- this line only reports what happened.",
++			sEarlyWakeAttempt, sEarlyWakeMaxAttempts, sStalledAttempts,
++			realMode, parked);
++
++		menu->AddItem(item = new(nothrow) MenuItem(apResult));
++		item->SetType(MENU_ITEM_NO_CHOICE);
++		item->SetHelpText(apHelp);
++	}
++
+ 	if (gKernelArgs.arch_args.ioapic_phys != 0) {
+ 		menu->AddItem(item = new(nothrow) MenuItem("Disable IO-APIC"));
+ 		item->SetType(MENU_ITEM_MARKABLE);
 diff --git a/src/system/boot/platform/bios_ia32/smp.h b/src/system/boot/platform/bios_ia32/smp.h
 index 4acda1622d..17d14bdf70 100644
 --- a/src/system/boot/platform/bios_ia32/smp.h
@@ -6996,10 +7904,10 @@ index 4acda1622d..17d14bdf70 100644
  extern void smp_boot_other_cpus(void (*entryFunc)(void));
  
 diff --git a/src/system/boot/platform/bios_ia32/smp_trampoline.S b/src/system/boot/platform/bios_ia32/smp_trampoline.S
-index 33a5ced675..5ae024ea2b 100644
+index 33a5ced675..ce4cc1b66a 100644
 --- a/src/system/boot/platform/bios_ia32/smp_trampoline.S
 +++ b/src/system/boot/platform/bios_ia32/smp_trampoline.S
-@@ -18,7 +18,7 @@
+@@ -18,12 +18,44 @@
  .code16
  smp_trampoline:
  	cli
@@ -7008,7 +7916,46 @@ index 33a5ced675..5ae024ea2b 100644
  	mov    $0x9e00,%ax
  	mov    %ax,%ds
  
-@@ -41,8 +41,31 @@ trampoline_32:
+-//	lgdt   0x9e000          # load the gdt
+-.byte 0x66, 0x0f, 0x01, 0x15, 0x00, 0xe0, 0x09, 0x00
++	// Diagnostic: the AP reached its very first instructions in real mode.
++	// ds is 0x9e00, so this offset is linear 0x9e808 -- above the gdt at
++	// 0x9e000 and below the stack at 0x9eff8, so it clobbers nothing.
++	movw   $0xa5a5,0x808
++
++	// Give the AP a moment before touching the gdt. Measured on this machine:
++	// with the gdt load as the first thing after cli, the marker above comes
++	// back but the protected-mode one below does not -- the AP starts, gets a
++	// few instructions in, and dies, which from the BSP is indistinguishable
++	// from an AP that never started. Any padding ahead of the load, as little
++	// as eleven bytes, made it come up every time; that is far too short to be
++	// a real settle time, so the bring-up here is simply marginal and a delay
++	// pushes it to the working side. Costs about a microsecond, once, per AP.
++	movw   $0x400,%cx
++1:
++	loop   1b
++
++	// Load the gdt from 0x9e000, reached as ds:di with di explicitly zeroed.
++	//
++	// Upstream hand-encodes this as
++	//     .byte 0x66, 0x0f, 0x01, 0x15, 0x00, 0xe0, 0x09, 0x00
++	// under a comment reading "lgdt 0x9e000". It does not assemble to that: in
++	// 16-bit addressing modrm 0x15 (mod=00, r/m=101) is [DI], so the descriptor
++	// comes from ds:di and lands on 0x9e000 only because di happens to be zero,
++	// and the four address bytes are then executed as instructions
++	// ("add %ah,%al", then "or %ax,(%bx,%si)", which writes into the very
++	// descriptor just loaded). Written out here so di is zeroed explicitly and
++	// no stray bytes are emitted.
++	//
++	// The addressing has to stay ds-relative: this is still real mode, where
++	// the segment limit is 0xffff, so the absolute form ("lgdtl 0x9e000" with
++	// a 0x67 address-size prefix) exceeds the limit and faults.
++	xorw   %di,%di
++	lgdtl  (%di)
+ 
+ 	movl   %cr0,%eax
+ 	orl    $0x01,%eax
+@@ -41,8 +73,31 @@ trampoline_32:
  	mov    %ax, %gs
  	mov    %ax, %ss
  
@@ -7041,19 +7988,80 @@ index 33a5ced675..5ae024ea2b 100644
  	movl   %eax,%cr3        # set the page dir
  	
 diff --git a/src/system/boot/platform/bios_ia32/start.cpp b/src/system/boot/platform/bios_ia32/start.cpp
-index a651487cad..44238f009f 100644
+index a651487cad..9c2099a5fe 100644
 --- a/src/system/boot/platform/bios_ia32/start.cpp
 +++ b/src/system/boot/platform/bios_ia32/start.cpp
-@@ -184,7 +184,7 @@ _start(void)
+@@ -183,24 +183,78 @@ _start(void)
+ 	args.heap_size = 0;
  	args.arguments = NULL;
  
++	// Stage timing, to find where the time before the SIPI actually goes.
++	// The TSC counts from processor reset, so the first reading is how long
++	// the BIOS spent in POST before the loader got control at all -- time no
++	// change to this loader can recover.
++	uint64 tscStart, tscSerial, tscInterrupts, tscCpu, tscMmu, tscAcpi, tscSmp;
++	asm volatile ("rdtsc" : "=A" (tscStart));
++
  	serial_init();
 -	serial_enable();
 +	//serial_enable();
++	asm volatile ("rdtsc" : "=A" (tscSerial));
  	interrupts_init();
- 	console_init();
+-	console_init();
++	asm volatile ("rdtsc" : "=A" (tscInterrupts));
  	cpu_init();
-@@ -195,12 +195,19 @@ _start(void)
++	asm volatile ("rdtsc" : "=A" (tscCpu));
+ 	mmu_init();
++	asm volatile ("rdtsc" : "=A" (tscMmu));
+ 	debug_init_post_mmu();
++
++	// Everything from here to smp_wake_other_cpus_early() is on the critical
++	// path to the SIPI, because the window in which this machine will start an
++	// AP at all is only a few seconds wide from power-on. Only what the wake
++	// genuinely needs runs first: cpu_init() for CPUID, mmu_init() to map the
++	// local APIC, and acpi_init() because smp_init() reads the MADT.
++	//
++	// console_init() (which switches video mode), check_for_boot_keys() (which
++	// polls the keyboard) and apm_init() were all ahead of the wake and none of
++	// them is needed by it, so they now run afterwards. Waking with the early
++	// path alone was still landing on the edge of the window and failing most
++	// boots with load_symbols on; this buys back the time they were spending.
++	acpi_init();
++	asm volatile ("rdtsc" : "=A" (tscAcpi));
++	smp_init();
++	asm volatile ("rdtsc" : "=A" (tscSmp));
++	smp_wake_other_cpus_early();
++
++	// Printed only now: dprintf() is itself expensive enough to move the
++	// numbers it would be reporting. 1330000 ticks is 1 ms at 1.33 GHz.
++	// Convert with the loader's own PIT-calibrated clock rather than an
++	// assumed clock rate. system_time() is valid once cpu_init() has run
++	// calculate_cpu_conversion_factor(); reading it together with the TSC
++	// gives the ratio needed to date the stages that ran before that.
++	uint64 tscNow;
++	asm volatile ("rdtsc" : "=A" (tscNow));
++	uint64 usNow = (uint64)system_time();
++
++	#define TSC_TO_MS(t) ((uint32)((((uint64)(t)) * usNow / tscNow) / 1000ULL))
++
++	dprintf("smp: stage ms -- bios_post %" B_PRIu32 " serial %" B_PRIu32
++		" interrupts %" B_PRIu32 " cpu %" B_PRIu32 " mmu %" B_PRIu32
++		" acpi %" B_PRIu32 " smp_init %" B_PRIu32 " (uptime now %" B_PRIu32
++		" ms)\n",
++		TSC_TO_MS(tscStart),
++		TSC_TO_MS(tscSerial - tscStart),
++		TSC_TO_MS(tscInterrupts - tscSerial),
++		TSC_TO_MS(tscCpu - tscInterrupts),
++		TSC_TO_MS(tscMmu - tscCpu),
++		TSC_TO_MS(tscAcpi - tscMmu),
++		TSC_TO_MS(tscSmp - tscAcpi),
++		(uint32)(usNow / 1000ULL));
++
++	#undef TSC_TO_MS
++
++	console_init();
+ 	parse_multiboot_commandline(&args);
+ 
  	// reading the keyboard doesn't seem to work in graphics mode
  	// (maybe a bochs problem)
  	sBootOptions = check_for_boot_keys();
@@ -7063,15 +8071,8 @@ index a651487cad..44238f009f 100644
 +		serial_enable();
  
  	apm_init();
- 	acpi_init();
- 	smp_init();
-+
-+	// Wake the APs now rather than at smp_boot_other_cpus() time. See the
-+	// comment on this function: the window in which they can be started is
-+	// only seconds wide on some hardware, and everything between here and
-+	// there -- loading the kernel, its add-ons and their symbols -- can easily
-+	// outlast it.
-+	smp_wake_other_cpus_early();
+-	acpi_init();
+-	smp_init();
  	hpet_init();
  	dump_multiboot_info();
  	main(&args);
