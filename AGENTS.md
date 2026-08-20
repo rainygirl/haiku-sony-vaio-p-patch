@@ -1383,3 +1383,38 @@ not need fixing.
 
 The 311 ms remains unattributed. The segment comparison described above is still
 the next step.
+
+## Git remotes in `/Volumes/HaikuBuild` after the fork separation (2026-08-20)
+
+The repository shared by the five worktrees (`haiku`, `wt-check`, `wt-master`,
+`wt-new`, `wt-verify`) no longer treats haiku.git as its origin:
+
+| remote | URL | role |
+| --- | --- | --- |
+| `origin` | `git@github.com:rainygirl/haiku.git` | the fork this tree is developed from. Fetch refspec is narrowed to `+refs/heads/r1beta6:refs/remotes/origin/r1beta6`, so a plain `git fetch origin` brings in nothing else. |
+| `haiku-upstream` | `https://github.com/haiku/haiku.git` | read-only reference. Its push URL is deliberately set to the non-URL `DISABLED_no_push_to_upstream_haiku` so a mistyped `git push haiku-upstream` fails at the transport instead of attempting a push to the real Haiku repository. |
+| `backup` | `git@github.com:rainygirl/haiku-private.git` | unchanged. |
+
+When the remote was repointed, the fork's `r1beta6` looked like it had diverged
+from upstream's by 18 commits. It had not: the local `haiku-upstream/r1beta6`
+ref was simply 18 commits stale, and after fetching it the two refs are the
+same object (`6681f06a44`). The fork's `r1beta6` is a clean mirror of upstream's
+branch, so **anything that looks like fork-only history on that branch should be
+checked against a freshly fetched upstream ref before acting on it** -- a rebase
+onto a "diverged" fork would have been a no-op at best.
+
+`vaio-p-beta6` (the 20-commit patch series, in the `haiku` worktree) was rebased
+onto that tip and now tracks `origin/r1beta6`. All 20 commits replayed without a
+conflict, and the resulting patch set touches exactly the same files as before
+with the only content change being the beacon-miss fix committed in the same
+pass. One of the 18 new upstream commits is wireless-adjacent --
+`1f47d9a206 freebsd_wlan: Reinstate the IEEE80211_SCAN_NOJOIN flag set.`, which
+stops a zero-SSID scan from joining -- so it is worth keeping in mind next to
+this patch set's own `AutoconfigLooper` join-retry change, but the two do not
+touch the same code.
+
+Note that `wt-new`, which the exported diff is generated from and which
+`generated.vaio-pin/Jamfile` points `HAIKU_TOP` at, sits on the **master** line
+(`8b91c532fa`), not on `r1beta6`. The beta6 rebase therefore does not affect
+either `vaio-p-patches.diff` or the ISO; those two lines are maintained in
+parallel and a fix has to be landed on both.
