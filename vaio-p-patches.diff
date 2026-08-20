@@ -2423,7 +2423,7 @@ index edeba186d9..bfd203eea2 100644
  	mode &= info.shared_info->dpms_capabilities;
  
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
-index 3f3670c14f..3657b94e00 100644
+index 3f3670c14f..3ec6deadd1 100644
 --- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 +++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 @@ -72,6 +72,8 @@
@@ -2435,7 +2435,7 @@ index 3f3670c14f..3657b94e00 100644
  #include <net/if.h>
  #include <net/if_var.h>
  #include <net/if_dl.h>
-@@ -2504,6 +2506,52 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2504,6 +2506,65 @@ ath_bmiss_proc(void *arg, int pending)
  
  	ath_beacon_miss(sc);
  
@@ -2450,31 +2450,44 @@ index 3f3670c14f..3657b94e00 100644
 +	 * has) has been seen to reliably recover it.
 +	 */
 +	/*
-+	 * Two recoveries inside thirty seconds used to be enough to escalate,
-+	 * which turns out to fire on load rather than on a broken radio. Beacon
-+	 * miss is detected on a timer: when both cores are saturated -- a native
-+	 * Chromium build at -j2 is enough -- the driver's own callout runs late,
-+	 * normal traffic looks like missed beacons, and the escalation power
-+	 * cycles a perfectly healthy adapter and drops the link. Observed
-+	 * directly: five recoveries inside six seconds, two power cycles, and no
-+	 * hardware fault anywhere in the log.
++	 * When to escalate to a PCI power cycle, which is the only recovery here
++	 * that drops the link.
 +	 *
-+	 * The condition this is meant to catch looks different. Per the note
-+	 * below it recurs *every time the interface reassociates*, so its
-+	 * recoveries are spread across reassociations rather than arriving in a
-+	 * burst. Requiring both a higher count and that the run has actually
-+	 * lasted a while separates the two: a starvation burst is dense and
-+	 * short, a broken radio keeps coming back over minutes.
++	 * Counting beacon-miss recoveries is the wrong signal, at any threshold.
++	 * Beacon miss is detected on a timer, so a saturated machine -- a native
++	 * Chromium build at -j2 is enough -- produces them steadily: measured,
++	 * roughly one every two to four minutes for as long as the build runs.
++	 * Density does not separate the cases either, because those are spread
++	 * out too. Two earlier attempts at this both misfired: "two within thirty
++	 * seconds" fired within seconds of load starting, and "four spread over
++	 * at least thirty seconds" fired after forty-five minutes of it.
++	 *
++	 * The real difference is in whether the link survives. Under load every
++	 * one of these recovers and the vap stays in RUN -- forty-five minutes of
++	 * it, eleven resets, association and DHCP lease held throughout. The
++	 * condition this escalation exists for looks nothing like that: per the
++	 * note below it recurs *every time the interface reassociates*, meaning
++	 * the vap keeps falling out of RUN and cannot get back.
++	 *
++	 * So escalate on lost association, not on recovery count. A miss that we
++	 * recover from is not evidence of a broken radio.
 +	 */
-+	if (ticks - sc->sc_bmiss_last_tick > 120 * hz)
-+		sc->sc_bmiss_count = 0;
-+	if (sc->sc_bmiss_count == 0)
-+		sc->sc_bmiss_first_tick = ticks;
-+	sc->sc_bmiss_last_tick = ticks;
-+	sc->sc_bmiss_count++;
++	struct ieee80211vap *vap = TAILQ_FIRST(&sc->sc_ic.ic_vaps);
++	bool associated = vap != NULL && vap->iv_state == IEEE80211_S_RUN;
 +
-+	if (sc->sc_bmiss_count >= 4
-+			&& ticks - sc->sc_bmiss_first_tick >= 30 * hz) {
++	if (associated) {
++		/* Recovered, still on the network: transient, not a fault. */
++		sc->sc_bmiss_count = 0;
++	} else {
++		if (ticks - sc->sc_bmiss_last_tick > 120 * hz)
++			sc->sc_bmiss_count = 0;
++		if (sc->sc_bmiss_count == 0)
++			sc->sc_bmiss_first_tick = ticks;
++		sc->sc_bmiss_count++;
++	}
++	sc->sc_bmiss_last_tick = ticks;
++
++	if (!associated && sc->sc_bmiss_count >= 3) {
 +		device_printf(sc->sc_dev,
 +		    "repeated beacon miss recovery, power-cycling the "
 +		    "adapter\n");
@@ -2488,7 +2501,7 @@ index 3f3670c14f..3657b94e00 100644
  	/*
  	 * Do a reset upon any beacon miss event.
  	 *
-@@ -2516,8 +2564,8 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2516,8 +2577,8 @@ ath_bmiss_proc(void *arg, int pending)
  		    "bb hang detected (0x%x), resetting\n", hangs);
  	} else {
  		ath_reset(sc, ATH_RESET_NOLOSS, HAL_RESET_FORCE_COLD);
