@@ -32,6 +32,15 @@ DMG_PATH="${VAIO_P_DMG_PATH:-$HOME/HaikuBuild.sparseimage}"
 VOLUME_NAME="HaikuBuild"
 VOLUME_PATH="/Volumes/$VOLUME_NAME"
 CONTAINER_NAME="haiku-builder"
+# Build output goes here rather than onto the shared build volume. The shared
+# volume reaches the container over virtiofs, which returns ENOTSUP for
+# setxattr, and Haiku stores file types (SetType, mimeset) as extended
+# attributes. Building there succeeds but silently ships an image whose files
+# have lost their types -- the symptom we hit was a Deskbar leaf menu reading
+# "<Deskbar folder is empty>", because data/deskbar/menu_entries came out as
+# text/plain instead of application/x-vnd.haiku-virtual-directory. A Docker
+# named volume is a real Linux filesystem and holds attributes correctly.
+GEN_VOLUME_NAME="${GEN_VOLUME_NAME:-haiku-vaio-p-generated}"
 IMAGE_NAME="ubuntu:22.04"
 
 log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -68,12 +77,33 @@ if ! docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
 	docker run -d --name "$CONTAINER_NAME" \
 		--platform linux/amd64 \
 		-v "$VOLUME_PATH:/haiku-build" \
+		-v "$GEN_VOLUME_NAME:/haiku-gen" \
 		"$IMAGE_NAME" \
 		sleep infinity
 elif [ "$(docker container inspect -f '{{.State.Status}}' "$CONTAINER_NAME")" != "running" ]; then
 	log "Starting existing (stopped) container $CONTAINER_NAME"
 	docker start "$CONTAINER_NAME"
 fi
+
+# ---------------------------------------------------------------------------
+log "Ensuring the output volume exists and holds extended attributes"
+# ---------------------------------------------------------------------------
+docker volume inspect "$GEN_VOLUME_NAME" >/dev/null 2>&1 \
+	|| docker volume create "$GEN_VOLUME_NAME" >/dev/null
+
+# attr provides setfattr/getfattr, which the inner script probes with.
+docker exec "$CONTAINER_NAME" sh -c \
+	'command -v setfattr >/dev/null 2>&1 \
+		|| (apt-get update -qq && apt-get install -y -qq attr)' >/dev/null
+
+docker exec "$CONTAINER_NAME" sh -c \
+	'f=/haiku-gen/.probe.$$; : > "$f" \
+		&& setfattr -n user.haiku.probe -v ok "$f" \
+		&& getfattr --only-values -n user.haiku.probe "$f" >/dev/null; \
+	 rc=$?; rm -f "$f"; exit $rc' \
+	|| die "/haiku-gen cannot hold extended attributes -- the build would" \
+		"silently produce an image with the wrong file types. Check that" \
+		"$GEN_VOLUME_NAME is a Docker named volume and not a bind mount."
 
 # ---------------------------------------------------------------------------
 log "Copying build script and patch into the container"
@@ -87,6 +117,7 @@ docker exec "$CONTAINER_NAME" chmod +x /haiku-build/tools/vaio-p/build-vaio-p-is
 log "Running the build inside the container (this is the slow part)"
 # ---------------------------------------------------------------------------
 docker exec \
+	-e XATTR_OUTPUT_DIR=/haiku-gen \
 	-e SKIP_CROSS_TOOLS="${SKIP_CROSS_TOOLS:-0}" \
 	${HAIKU_GIT_REF:+-e HAIKU_GIT_REF="$HAIKU_GIT_REF"} \
 	${JOBS:+-e JOBS="$JOBS"} \

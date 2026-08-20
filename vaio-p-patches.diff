@@ -2423,7 +2423,7 @@ index edeba186d9..bfd203eea2 100644
  	mode &= info.shared_info->dpms_capabilities;
  
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
-index 3f3670c14f..e5d3177dab 100644
+index 3f3670c14f..3657b94e00 100644
 --- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 +++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 @@ -72,6 +72,8 @@
@@ -2435,7 +2435,7 @@ index 3f3670c14f..e5d3177dab 100644
  #include <net/if.h>
  #include <net/if_var.h>
  #include <net/if_dl.h>
-@@ -2504,6 +2506,32 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2504,6 +2506,52 @@ ath_bmiss_proc(void *arg, int pending)
  
  	ath_beacon_miss(sc);
  
@@ -2449,12 +2449,32 @@ index 3f3670c14f..e5d3177dab 100644
 +	 * power-off/power-on cycle (the same effect a hardware kill switch
 +	 * has) has been seen to reliably recover it.
 +	 */
-+	if (ticks - sc->sc_bmiss_last_tick > 30 * hz)
++	/*
++	 * Two recoveries inside thirty seconds used to be enough to escalate,
++	 * which turns out to fire on load rather than on a broken radio. Beacon
++	 * miss is detected on a timer: when both cores are saturated -- a native
++	 * Chromium build at -j2 is enough -- the driver's own callout runs late,
++	 * normal traffic looks like missed beacons, and the escalation power
++	 * cycles a perfectly healthy adapter and drops the link. Observed
++	 * directly: five recoveries inside six seconds, two power cycles, and no
++	 * hardware fault anywhere in the log.
++	 *
++	 * The condition this is meant to catch looks different. Per the note
++	 * below it recurs *every time the interface reassociates*, so its
++	 * recoveries are spread across reassociations rather than arriving in a
++	 * burst. Requiring both a higher count and that the run has actually
++	 * lasted a while separates the two: a starvation burst is dense and
++	 * short, a broken radio keeps coming back over minutes.
++	 */
++	if (ticks - sc->sc_bmiss_last_tick > 120 * hz)
 +		sc->sc_bmiss_count = 0;
++	if (sc->sc_bmiss_count == 0)
++		sc->sc_bmiss_first_tick = ticks;
 +	sc->sc_bmiss_last_tick = ticks;
 +	sc->sc_bmiss_count++;
 +
-+	if (sc->sc_bmiss_count >= 2) {
++	if (sc->sc_bmiss_count >= 4
++			&& ticks - sc->sc_bmiss_first_tick >= 30 * hz) {
 +		device_printf(sc->sc_dev,
 +		    "repeated beacon miss recovery, power-cycling the "
 +		    "adapter\n");
@@ -2468,7 +2488,7 @@ index 3f3670c14f..e5d3177dab 100644
  	/*
  	 * Do a reset upon any beacon miss event.
  	 *
-@@ -2516,8 +2544,8 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2516,8 +2564,8 @@ ath_bmiss_proc(void *arg, int pending)
  		    "bb hang detected (0x%x), resetting\n", hangs);
  	} else {
  		ath_reset(sc, ATH_RESET_NOLOSS, HAL_RESET_FORCE_COLD);
@@ -2479,15 +2499,18 @@ index 3f3670c14f..e5d3177dab 100644
  	/* Force a beacon resync, in case they've drifted */
  	sc->sc_syncbeacon = 1;
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
-index 8302153b47..5be1b57c00 100644
+index 8302153b47..abcec9befd 100644
 --- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
 +++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
-@@ -595,6 +595,8 @@ struct ath_softc {
+@@ -595,6 +595,11 @@ struct ath_softc {
  	void 			(*sc_node_cleanup)(struct ieee80211_node *);
  	void 			(*sc_node_free)(struct ieee80211_node *);
  	device_t		sc_dev;
 +	int			sc_bmiss_count;	/* consecutive bmiss recoveries */
 +	int			sc_bmiss_last_tick;
++	int			sc_bmiss_first_tick;
++		/* when the current run of recoveries started, so a burst can be
++		   told from a condition that persists -- see ath_bmiss_proc() */
  	HAL_BUS_TAG		sc_st;		/* bus space tag */
  	HAL_BUS_HANDLE		sc_sh;		/* bus space handle */
  	bus_dma_tag_t		sc_dmat;	/* bus DMA tag */
@@ -6197,7 +6220,7 @@ index 750382b861..88b612bbbc 100644
  	}
  }
 diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
-index 42bae2a7da..05d3705dfb 100644
+index 42bae2a7da..0d142e5629 100644
 --- a/src/servers/net/AutoconfigLooper.cpp
 +++ b/src/servers/net/AutoconfigLooper.cpp
 @@ -18,6 +18,7 @@
@@ -6208,26 +6231,41 @@ index 42bae2a7da..05d3705dfb 100644
  #include <NetworkInterface.h>
  #include <NetworkNotifications.h>
  
-@@ -26,6 +27,8 @@
+@@ -26,6 +27,22 @@
  
  
  static const uint32 kMsgReadyToRun = 'rdyr';
-+static const bigtime_t kJoinNetworkRetryTimeout = 8000000;
-+	// 8 seconds
++static const bigtime_t kJoinNetworkRetryTimeout = 30000000;
++	// 30 seconds. This has to exceed how long a join can legitimately take,
++	// because a retry is not free: the new join request deauthenticates
++	// whatever the previous one was in the middle of. Retrying too eagerly
++	// therefore kills attempts that were about to succeed, and the interface
++	// livelocks -- AUTH, deauth (reason 3), INIT, SCAN, AUTH, and round again
++	// until it gives up with no link at all.
++	//
++	// It was 8 seconds, which is under what authentication plus association
++	// plus the WPA2 four-way handshake can take on slow hardware while the
++	// rest of the boot is still competing for the CPU. That is exactly when
++	// this matters, and it made wireless fail on roughly one boot in seven.
++static const bigtime_t kJoinNetworkRetryTimeoutMax = 120000000;
++	// 2 minutes. Each unsuccessful round doubles the wait, so a network that
++	// simply is not joinable is retried a few times and then left alone
++	// rather than being hammered every time a scan completes.
  
  
  AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
-@@ -34,7 +37,8 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+@@ -34,7 +51,9 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
  	fDevice(device),
  	fCurrentClient(NULL),
  	fLastMediaStatus(0),
 -	fJoiningNetwork(false)
 +	fJoiningNetwork(false),
-+	fJoiningNetworkSince(0)
++	fJoiningNetworkSince(0),
++	fJoinNetworkRetryTimeout(kJoinNetworkRetryTimeout)
  {
  	BMessage ready(kMsgReadyToRun);
  	PostMessage(&ready);
-@@ -194,18 +198,49 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+@@ -194,18 +213,59 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
  
  		case B_NETWORK_WLAN_SCANNED:
  		{
@@ -6260,12 +6298,22 @@ index 42bae2a7da..05d3705dfb 100644
 +
 +			if (fJoiningNetwork
 +					&& system_time() - fJoiningNetworkSince
-+						< kJoinNetworkRetryTimeout) {
++						< fJoinNetworkRetryTimeout) {
 +				// A join attempt is still within its grace period; give it
 +				// a chance to complete instead of overlapping another one.
  				break;
  			}
  
++			if (fJoiningNetwork) {
++				// This is a retry: the previous attempt used up its whole
++				// window without producing a link. Back off before the next
++				// one so a network that cannot be joined is not retried
++				// forever at a fixed interval.
++				fJoinNetworkRetryTimeout *= 2;
++				if (fJoinNetworkRetryTimeout > kJoinNetworkRetryTimeoutMax)
++					fJoinNetworkRetryTimeout = kJoinNetworkRetryTimeoutMax;
++			}
++
  			fJoiningNetwork = true;
 -				// TODO: For now we never reset this flag. We can only do that
 -				// after infrastructure has been added to discern a scan reason.
@@ -6286,14 +6334,15 @@ index 42bae2a7da..05d3705dfb 100644
  			BMessage message(kMsgAutoJoinNetwork);
  			message.AddString("device", fDevice);
 diff --git a/src/servers/net/AutoconfigLooper.h b/src/servers/net/AutoconfigLooper.h
-index 948b9b4d6f..aa10189865 100644
+index 948b9b4d6f..d1b1225f3c 100644
 --- a/src/servers/net/AutoconfigLooper.h
 +++ b/src/servers/net/AutoconfigLooper.h
-@@ -38,6 +38,7 @@ private:
+@@ -38,6 +38,8 @@ private:
  			AutoconfigClient*	fCurrentClient;
  			int32				fLastMediaStatus;
  			bool				fJoiningNetwork;
 +			bigtime_t			fJoiningNetworkSince;
++			bigtime_t			fJoinNetworkRetryTimeout;
  };
  
  #endif	// AUTOCONFIG_LOOPER_H
@@ -6823,7 +6872,7 @@ index f52f068155..8535aafea9 100644
  get_drive_parameters(uint8 drive, drive_parameters *parameters)
  {
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 68acf3f830..3994bd594b 100644
+index 68acf3f830..7697be60ea 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
 @@ -10,6 +10,7 @@
@@ -6849,7 +6898,7 @@ index 68acf3f830..3994bd594b 100644
  #include "mmu.h"
  #include "acpi.h"
  
-@@ -379,6 +382,685 @@ smp_init_other_cpus(void)
+@@ -379,6 +382,697 @@ smp_init_other_cpus(void)
  }
  
  
@@ -7410,7 +7459,19 @@ index 68acf3f830..3994bd594b 100644
 +	{
 +		const uint8 kRerollCmosIndex = 0x01;	// RTC alarm seconds
 +		const uint8 kRerollMagic = 0xa0;
-+		const uint8 kMaxRerolls = 3;
++		const uint8 kMaxRerolls = 8;
++			// Was 3. The odds per boot are not fixed -- runs of six or more
++			// consecutive stalled boots have been observed -- so a budget of
++			// three retires the only mechanism that works while the machine
++			// is still perfectly capable of coming up with both CPUs on the
++			// next roll. Each roll costs one POST, about thirty seconds, and
++			// the payoff on a build machine is +39% for however long it then
++			// stays up, so spending a few more is clearly worth it.
++			//
++			// Note the counter is sticky: once it reaches the maximum the
++			// mechanism stops for good until something resets the byte, which
++			// is exactly the state this machine was found in -- three rolls
++			// spent days ago and no further attempts since.
 +
 +		out8(kRerollCmosIndex, 0x70);
 +		uint8 cmos = in8(0x71);
@@ -7535,7 +7596,7 @@ index 68acf3f830..3994bd594b 100644
  void
  smp_boot_other_cpus(void (*entryFunc)(void))
  {
-@@ -401,10 +1083,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -401,10 +1095,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  	uint32 trampolineStack = 0x9e000;
  #endif
  
@@ -7568,7 +7629,7 @@ index 68acf3f830..3994bd594b 100644
  	// boot the cpus
  	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
  		uint32 *finalStack;
-@@ -412,6 +1115,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -412,6 +1127,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		uint32 config;
  		uint32 numStartups;
  		uint32 j;
@@ -7576,7 +7637,7 @@ index 68acf3f830..3994bd594b 100644
  
  		// set this stack up
  		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
-@@ -422,15 +1126,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -422,15 +1138,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  				/ sizeof(uint32)) - 1;
  		*tempStack = (uint32)entryFunc;
  
@@ -7592,7 +7653,7 @@ index 68acf3f830..3994bd594b 100644
  		// put a gdt descriptor at the bottom of the stack
  		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT
  		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;
-@@ -444,78 +1139,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -444,78 +1151,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
  			DPL_KERNEL);
  
@@ -7850,7 +7911,7 @@ index 68acf3f830..3994bd594b 100644
  	}
  
  	TRACE(("done trampolining\n"));
-@@ -527,6 +1342,40 @@ smp_add_safemode_menus(Menu *menu)
+@@ -527,6 +1354,40 @@ smp_add_safemode_menus(Menu *menu)
  {
  	MenuItem *item;
  

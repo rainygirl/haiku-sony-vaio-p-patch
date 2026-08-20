@@ -57,7 +57,7 @@ cd "$WORK_DIR"
 # ---------------------------------------------------------------------------
 log "Checking build dependencies"
 # ---------------------------------------------------------------------------
-REQUIRED_CMDS=(git wget gcc g++ make bison flex gawk nasm autoconf automake
+REQUIRED_CMDS=(setfattr getfattr git wget gcc g++ make bison flex gawk nasm autoconf automake
 	libtool xorriso zip unzip)
 MISSING=()
 for cmd in "${REQUIRED_CMDS[@]}"; do
@@ -132,9 +132,62 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+log "Choosing an output directory that can hold extended attributes"
+# ---------------------------------------------------------------------------
+# Haiku's build stores BeOS file attributes -- what SetType, mimeset and
+# friends write -- as Linux extended attributes on the built files. If the
+# output tree sits on a filesystem that cannot hold them, every setxattr
+# fails, and it fails *silently*: the build succeeds and produces an image
+# whose files have lost their types.
+#
+# That is not hypothetical. Built on a macOS sparsebundle shared into Docker
+# over virtiofs (which returns ENOTSUP for setxattr), the image shipped
+# data/deskbar/menu_entries as text/plain instead of
+# application/x-vnd.haiku-virtual-directory. Tracker then does not recognise
+# it as a virtual directory, and the whole Deskbar leaf menu comes up reading
+# "<Deskbar folder is empty>" on the booted system.
+#
+# So probe first, and refuse to build rather than ship a broken image.
+xattr_works() {
+	local dir="$1" probe rc
+	mkdir -p "$dir" 2>/dev/null || return 1
+	probe="$dir/.xattr-probe.$$"
+	: > "$probe" 2>/dev/null || return 1
+	setfattr -n user.haiku.probe -v ok "$probe" >/dev/null 2>&1
+	rc=$?
+	if [ $rc -eq 0 ]; then
+		getfattr --only-values -n user.haiku.probe "$probe" >/dev/null 2>&1 || rc=1
+	fi
+	rm -f "$probe"
+	return $rc
+}
+
+GENDIR="$WORK_DIR/generated.x86_gcc2h"
+
+if xattr_works "$WORK_DIR"; then
+	log "Output directory $GENDIR holds extended attributes"
+else
+	# XATTR_OUTPUT_DIR is where the Docker wrapper mounts a real Linux volume.
+	XATTR_OUTPUT_DIR="${XATTR_OUTPUT_DIR:-/haiku-gen}"
+	if xattr_works "$XATTR_OUTPUT_DIR"; then
+		GENDIR="$XATTR_OUTPUT_DIR/generated.x86_gcc2h"
+		log "$WORK_DIR cannot hold extended attributes; building in $GENDIR instead"
+	else
+		die "neither $WORK_DIR nor $XATTR_OUTPUT_DIR supports extended" \
+			"attributes." \
+			"Haiku stores file types as xattrs, so building here would" \
+			"silently produce an image with the wrong types (a Deskbar" \
+			"menu reading \"<Deskbar folder is empty>\" is the usual" \
+			"symptom)." \
+			"Point XATTR_OUTPUT_DIR at a directory on a filesystem that" \
+			"supports them -- with the Docker wrapper that is a named" \
+			"volume, not the shared build volume."
+	fi
+fi
+
+# ---------------------------------------------------------------------------
 log "Building cross-tools (x86_gcc2 + x86)"
 # ---------------------------------------------------------------------------
-GENDIR="$WORK_DIR/generated.x86_gcc2h"
 CROSS_TOOLS_READY=0
 if [ -d "$GENDIR/cross-tools-x86_gcc2/bin" ] && [ -d "$GENDIR/cross-tools-x86/bin" ]; then
 	CROSS_TOOLS_READY=1

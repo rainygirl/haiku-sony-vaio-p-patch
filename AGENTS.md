@@ -1133,3 +1133,253 @@ live USB boot is expected, not a warning sign.
 Booting the live image, the Deskbar leaf menu shows only `<empty>`. Terminal via
 Ctrl+Alt+Del works, so the system itself is fine. To be reproduced in QEMU and
 fixed there - unrelated to SMP.
+
+### Deskbar `<empty>`: traced but not reproducible (2026-08-20)
+
+Clicking the Deskbar leaf on a live USB boot of the VAIO P showed only
+`<empty>`. **It does not reproduce in QEMU**, from either an emulated CD-ROM or
+an EHCI USB mass-storage device, with the same image and 2 CPUs. So it is either
+specific to this hardware or to the state of that one boot - worth noting that
+the machine needed two reboots before a screen appeared at all, which says that
+boot was not healthy.
+
+The code path is fully traced, so a recurrence can be settled in one command.
+
+`<empty>` is `TDeskbarMenu::DoneBuildingItemList()` in
+`src/apps/deskbar/DeskbarMenu.cpp`, which appends a disabled
+`<Deskbar folder is empty>` when `fItemList` came out empty. The important
+detail is that the *standard* items - About Haiku, Find, Restart and the rest -
+were missing too, and those are added unconditionally. That points one level up,
+to `TBarWindow::MenusBeginning()` in `BarWindow.cpp`, which does:
+
+```text
+1. ~/config/settings/deskbar/menu_entries   (nothing in the tree ever creates this)
+2. /boot/system/data/deskbar/menu_entries   (shipped in haiku.hpkg)
+   neither -> TRESPASS(); return;           (no nav dir is ever set)
+```
+
+Since path 1 is never created by anything - checked across `src/` and `data/` -
+every system, installed or live, uses path 2. This is not a live-media-only code
+path.
+
+Packaging was ruled out by extracting the actual package that went into the
+image, not by reading the Jamfiles:
+
+```sh
+package extract haiku.hpkg data/deskbar
+```
+
+`data/deskbar/menu_entries` is present and lists the five directories it should;
+`data/deskbar/menu/` holds Applications, Preferences, Demos and Desktop applets
+with 72 entries whose relative symlinks (`../../../../apps/ActivityMonitor`)
+resolve correctly. Nothing is missing.
+
+So on the failing boot, `/boot/system/data/deskbar/menu_entries` was not
+readable at runtime. If it happens again, run this in the live Terminal before
+anything else:
+
+```sh
+ls -l /boot/system/data/deskbar/menu_entries
+ls /boot/system/data/deskbar/menu/
+df /boot/system
+```
+
+Present means `find_directory(B_SYSTEM_DATA_DIRECTORY)` or
+`BEntry::SetTo(..., true)` failed against packagefs; absent means packagefs did
+not mount the haiku package completely, which fits an unhealthy boot and would
+also be consistent with the `Roster.cpp` finding above, where live media broke
+signature-based launching and silently cost the installer.
+
+Not worth chasing further while it cannot be reproduced.
+
+### Wireless failed on about one boot in seven: the retry killed its own attempt
+
+Diagnosed 2026-08-20 and fixed in `AutoconfigLooper.cpp`.
+
+The auto-join retry this patch set added is what broke it. A retry is not free -
+the new join request deauthenticates whatever the previous one was in the middle
+of - and the grace period was 8 seconds, less than authentication plus
+association plus the WPA2 four-way handshake can take on this hardware while the
+rest of the boot is still competing for the CPU. On a slow boot the retry fired
+into a live attempt and killed it, and the interface livelocked:
+
+```text
+SCAN -> AUTH
+station deauth via MLME (reason: 3 (sending STA is leaving/has left IBSS or ESS))
+AUTH -> INIT
+INIT -> SCAN
+... and round again, ending at INIT with no link
+```
+
+`reason 3` is the giveaway: that is the local end saying it is leaving, not the
+AP dropping us.
+
+**How it was found, which is the reusable part.** An intermittent fault is not
+visible in one log. Segment every retained syslog by boot - the boundary is
+`smp: using ACPI to detect MP configuration` - and score each boot for
+association, link-up and DHCP:
+
+```text
+boot  file        lines  scans  assoc linkup   dhcp  verdict
+1     syslog.1     1539      8      4      1      1  OK
+4     syslog.1     2285     15      0      0      0  *** WIFI FAILED ***
+7     syslog        1556      6      4      1      1  OK
+```
+
+The failing boot stands out immediately: fifteen scans, never once ASSOC, while
+every working boot ran four to eight and associated cleanly. Reading only the
+current boot's log would have shown nothing wrong.
+
+The grace period is now 30 seconds and each unsuccessful round doubles it up to
+two minutes, so the retry still rescues an attempt that lost a race right after
+boot, without interrupting one that was about to succeed and without hammering a
+network that cannot be joined. `jam -q net_server` builds clean.
+
+`syslog_time_stamps true` is now set in the machine's kernel settings. These
+logs had no timestamps, so how long the join actually took could only be
+bounded, not measured; a recurrence will be measurable.
+
+### The AP failure is a stall, and USB is not the source (2026-08-20, measured)
+
+With `syslog_time_stamps` on, a failing boot finally shows the mechanism in
+numbers. The USB handoff runs and does its job:
+
+```text
+smp: early usb handoff: EHCI at 0:29:7, was BIOS-owned (released),
+     SMI enables cleared 11182 ms before the wake
+```
+
+And the wake still fails, because the sequence is being stalled anyway:
+
+```text
+smp: early wake sent to 1 ap(s) at 11182 ms after power-on (took 916 ms,
+     sequence completed, attempt 10 of 10, 2 spoiled by a stall)
+smp: early wake: AP unresponsive after 3 reroll(s), continuing with one CPU
+smp:   segments (us): total 315402, direct 915017
+smp:     spin10ms 311354 us
+smp:     sipi1-spin200 2000 us
+```
+
+A `spin(10000)` took **311 ms** and a `spin(200)` took **2 ms** - 31x and 10x
+over. The segment total (315 ms) and the direct measurement of the whole
+sequence (915 ms) disagree by 600 ms, so time is also disappearing outside the
+instrumented segments.
+
+Two things this settles:
+
+- **The stall is real, not a measurement artefact.** The same log reports
+  `bios_post 11131 ms` and `uptime now 12103 ms`, which match the machine's
+  observed boot time, so the TSC conversion factor is sound.
+- **USB SMIs are not the cause.** They were cleared 11 seconds earlier and the
+  stall still happens. Whatever is stealing the time is something else - ACPI,
+  the Sony EC, or another SMM handler this firmware runs.
+
+Success and failure track the stall exactly. A boot that works reports
+`attempt 1 of 10, 0 spoiled by a stall` and the AP up in 13 ms; a boot that
+fails reports `attempt 10 of 10, 2 spoiled by a stall` and 916 ms. The AP
+bring-up is effectively a coin flip on whether the sequence runs unstalled.
+
+Note also that a longer INIT-to-SIPI gap should be harmless by the SDM - the
+10 ms is a minimum wait, not a maximum - so "the gap grew" is not on its own a
+sufficient explanation. Either this AP does time out of its wait-for-SIPI
+state, or the damage is done by a stall landing somewhere else in the sequence.
+That distinction has not been measured yet and is where the next attempt should
+start: instrument which segment is stalled on failing versus succeeding boots,
+rather than only that one was.
+
+Until the remaining SMI source is found, the practical answer for a build
+machine is to reboot and take the boot that comes up with two CPUs; the reboot
+costs about six minutes and buys the measured +39%.
+
+### The stall has a fixed cost, and the obvious culprit is already ruled out
+
+Two consecutive failing boots measured the same stall to within 63 microseconds:
+
+```text
+boot A   spin10ms 311354 us
+boot B   spin10ms 311417 us
+```
+
+0.02% apart. That is not sporadic SMI traffic - when this intrudes it costs a
+fixed ~311 ms, which is the signature of one specific firmware routine with its
+own timeout, not a storm.
+
+But it is not present on every boot: the boot that succeeded reported
+`attempt 1 of 10, 0 spoiled by a stall` and the AP up in 13 ms, with no such
+segment. So the accurate statement is **a specific fixed-cost firmware
+operation that intrudes on some boots and not others** - which is what makes AP
+bring-up look like a coin flip.
+
+The obvious suspect does not survive contact with this tree. The machine has
+four USB host controllers:
+
+```text
+8114  Poulsbo USB UHCI Controller #1
+8115  Poulsbo USB UHCI Controller #2
+8116  Poulsbo USB UHCI Controller #3
+8117  Poulsbo USB EHCI Controller      <- the only one the handoff releases
+```
+
+Three UHCI companions stay BIOS-owned, and UHCI legacy support is exactly the
+kind of thing that raises SMIs for PS/2 emulation. Releasing them is however
+**not** an available fix, and `smp_early_usb_handoff()` already says why:
+
+> The SCH's UHCI companions (0x8114-0x8116) are left strictly alone: they do
+> not implement the standard USBLEGSUP register and writing it corrupts their
+> transfer engine (see the UHCI headline fix).
+
+So that was tried and it cost the transfer engine. Do not re-derive it.
+
+Where to pick this up: the instrumentation already prints per-segment timings,
+so capture several failing and several succeeding boots and compare *which*
+segment carries the 311 ms, not merely that a stall occurred. If it is always
+`spin10ms` - between the INIT de-assert and the first SIPI - then the question
+is why this AP leaves its wait-for-SIPI state during a gap the SDM says is only
+a minimum. If it moves around, the cause is ambient and the sequence needs to be
+made stall-tolerant rather than stall-free.
+
+### UHCI legacy SMI is not the stall source, measured (2026-08-20)
+
+The natural next suspect after the EHCI handoff was the three UHCI companions
+this machine also has, still BIOS-owned. It is wrong, and the register says so.
+Read from the running system through `/dev/misc/poke`:
+
+```text
+dev  func   devid    0xC0     0xC2     0x04(cmd)
+29   0      0x8114   0x0000   0x0000   0x0005     UHCI #1
+29   1      0x8115   0x0000   0x0000   0x0005     UHCI #2
+29   2      0x8116   0x0000   0x0000   0x0005     UHCI #3
+29   7      0x8117   0x0000   0x0000   0x0006     EHCI
+```
+
+USBLEGSUP reads `0x0000` on all three UHCI companions - no legacy claim, no SMI
+enable bit set anywhere. Nothing in Haiku writes that register on Poulsbo (the
+driver skips it deliberately), so it was zero for the whole boot. **There is
+nothing there to disable, so it cannot be what steals the 311 ms.**
+
+This also independently confirms the operational half of the UHCI driver's
+comment. Whatever the truth about whether the register is implemented, its last
+sentence is the one that matters and it is correct:
+
+> There's no USB legacy support to take over there anyway.
+
+Combined with the specific corruption that writing it caused (ActLen stuck at
+`0x7ff`, transfers trampling past their buffers) and the independent
+coreboot/SeaBIOS report, the conclusion stands: do not write `0xC0` on
+`8086:8114-8116`. There is no benefit available to trade against the risk.
+
+And to be clear about a wording trap: the UHCI controllers are fully in use.
+All three root hubs come up and a real device enumerates on UHCI bus 1:
+
+```text
+/dev/bus/usb/0/hub   UHCI RootHub
+/dev/bus/usb/1/1     BCM2046 Bluetooth Device
+/dev/bus/usb/1/hub   UHCI RootHub
+/dev/bus/usb/2/hub   UHCI RootHub
+```
+
+"Not released from the BIOS" is not the same as "not usable", and the first does
+not need fixing.
+
+The 311 ms remains unattributed. The segment comparison described above is still
+the next step.
