@@ -8463,6 +8463,74 @@ index 0e6515ab94..25f89b3a7b 100644
  {
  	arch_timer_init();
  }
+diff --git a/src/system/boot/platform/generic/video_splash.cpp b/src/system/boot/platform/generic/video_splash.cpp
+index 5b5931c912..a600f3064d 100644
+--- a/src/system/boot/platform/generic/video_splash.cpp
++++ b/src/system/boot/platform/generic/video_splash.cpp
+@@ -14,7 +14,15 @@
+ #include <boot/platform/generic/video.h>
+ #include <boot/platform/generic/video_blitter.h>
+ 
++// <boot/images.h> defines every splash image as a static array. This
++// distribution draws no logo, so the two kSplashLogo* arrays are unused while
++// the icons and the palette are still needed. An unused static is fatal under
++// -Werror, so suppress that one diagnostic for this include instead of keeping
++// dead drawing code -- which also keeps the logo data out of the loader.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wunused-variable"
+ #include <boot/images.h>
++#pragma GCC diagnostic pop
+ #include <boot/platform/generic/video_splash.h>
+ 
+ #include <stdio.h>
+@@ -133,41 +141,14 @@ video_display_splash(addr_t frameBuffer)
+ 	for (; pos < size; pos++)
+ 		*(char*)(frameBuffer + pos) = 0;
+ 
+-	uint8* uncompressedLogo = NULL;
+-	unsigned int uncompressedSize = kSplashLogoWidth * kSplashLogoHeight;
+-	switch (gKernelArgs.frame_buffer.depth) {
+-		case 8:
+-			platform_set_palette(k8BitPalette);
+-			uncompressedLogo = (uint8*)malloc(uncompressedSize);
+-			if (uncompressedLogo == NULL)
+-				return B_NO_MEMORY;
+-
+-			uncompress(kSplashLogo8BitCompressedImage,
+-				sizeof(kSplashLogo8BitCompressedImage), uncompressedLogo,
+-				uncompressedSize);
+-		break;
+-		default: // 24 bits is assumed here
+-			uncompressedSize *= 3;
+-			uncompressedLogo = (uint8*)malloc(uncompressedSize);
+-			if (uncompressedLogo == NULL)
+-				return B_NO_MEMORY;
++	// This distribution does not use the Haiku logo, so none is drawn and the
++	// boot screen stays blank apart from the progress icons below. The 8-bit
++	// palette the logo path used to install is still needed for those icons.
++	if (gKernelArgs.frame_buffer.depth == 8)
++		platform_set_palette(k8BitPalette);
+ 
+-			uncompress(kSplashLogo24BitCompressedImage,
+-				sizeof(kSplashLogo24BitCompressedImage), uncompressedLogo,
+-				uncompressedSize);
+-		break;
+-	}
+-
+-	// TODO: support 4-bit indexed version of the images!
+-
+-	// render splash logo
+ 	int width, height, x, y;
+-	compute_splash_logo_placement(gKernelArgs.frame_buffer.width, gKernelArgs.frame_buffer.height,
+-		width, height, x, y);
+-	video_blit_image(frameBuffer, uncompressedLogo, width, height,
+-		kSplashLogoWidth, x, y);
+-
+-	free(uncompressedLogo);
++	unsigned int uncompressedSize;
+ 
+ 	const uint8* lowerHalfIconImage;
+ 	uncompressedSize = kSplashIconsWidth * kSplashIconsHeight;
 diff --git a/src/system/boot/platform/pxe_ia32/Jamfile b/src/system/boot/platform/pxe_ia32/Jamfile
 index a8c4e7bd96..49ce6b7c28 100644
 --- a/src/system/boot/platform/pxe_ia32/Jamfile

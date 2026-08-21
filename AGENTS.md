@@ -1466,3 +1466,55 @@ keeps `KDEBUG_LEVEL 2`, so asserts stay on there. Silencing the assert is not a
 fix: freeing a page still in MODIFIED state corrupts the modified-queue
 accounting, which is exactly what the assert exists to catch. Rely on
 `a964c2cdaf`, not on the debug level.
+
+## No boot logo (2026-08-21)
+
+This distribution does not use the Haiku logo, so the boot loader no longer
+draws one. `src/system/boot/platform/generic/video_splash.cpp` keeps clearing the
+framebuffer and keeps drawing the progress icons, so boot still gives feedback --
+only the logo blit is gone.
+
+**There is no setting that does this.** `platform_switch_to_graphics_mode()` in
+`bios_ia32/video.cpp` calls `video_display_splash()` with nothing gating it, and
+the loader consults no option before drawing. The one thing that looks like a
+switch is the boot menu's "Enable on screen debug output" (safemode key
+`debug_screen`), and it does something different: it only makes the *kernel*'s
+`boot_splash_set_stage()` return early, so the progress icons stop being filled
+in, and the debug text then covers the logo rather than hiding it -- with a
+screenful of debug output as a side effect. The five safemode keys the kernel
+reads are `serial_debug_output`, `syslog_debug_output`, `bluescreen`,
+`emergency_keys` and `debug_screen`; none concerns the splash.
+
+Switching `HAIKU_DISTRO_COMPATIBILITY` off "official" is also not the answer.
+It selects `<boot/images-sans-tm.h>` instead of `images-tm-development.h`, but
+that variant still carries a 372x96 logo -- it is trademark-free artwork, not the
+absence of artwork -- and the setting additionally changes branding strings and
+package naming, so it is both insufficient here and far broader than the change
+called for.
+
+Two details worth keeping:
+
+- `platform_set_palette(k8BitPalette)` lived inside the logo's `case 8:` branch
+  but the *icons* need it too, so it has to survive the removal. It is now a
+  plain depth check ahead of the icon code.
+- With the logo gone the two `kSplashLogo*CompressedImage` arrays in
+  `<boot/images.h>` are unused, and an unused static is fatal under the loader's
+  `-Werror`. The build catches this immediately. It is handled by suppressing
+  `-Wunused-variable` around that one include, which is better than keeping dead
+  decompress-and-blit code because it also keeps the image data out of the
+  loader: the loader binary went from 318,944 to 299,136 bytes, and the package
+  from 320,159 to 300,351.
+
+Installed on the machine the same day. The active `haiku_loader` package was
+backed up to `/boot/home/loaderbak/haiku_loader-withlogo-ACTIVE-backup.hpkg` and
+the old file moved to `removed-haiku_loader-r1beta6-hrev99002_52.hpkg` before
+`haiku_loader-nologo.hpkg` went in; `package_daemon` logged
+`activating 1, deactivating 1 packages` and `/boot/system/haiku_loader.bios_ia32`
+changed size accordingly. Note that the file BIOS boot actually uses is
+`/boot/system/haiku_loader.bios_ia32` from the `haiku_loader` package, not the
+`/boot/system/data/platform_loaders/` copies that come from the `haiku` package.
+
+Before building, it was checked that `video_splash.cpp` was the *only* file under
+`src/system/boot` modified since the running loader was built, and that
+`kMaxRerolls = 8` was still in place -- so if this loader ever misbehaves, the
+logo removal is the only variable, and the second-CPU fix did not regress.
