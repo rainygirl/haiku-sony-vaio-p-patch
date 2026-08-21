@@ -1518,3 +1518,51 @@ Before building, it was checked that `video_splash.cpp` was the *only* file unde
 `src/system/boot` modified since the running loader was built, and that
 `kMaxRerolls = 8` was still in place -- so if this loader ever misbehaves, the
 logo removal is the only variable, and the second-CPU fix did not regress.
+
+## Repeated reboots at power-on are the reroll working, not a boot failure (2026-08-21)
+
+This cost two unnecessary rollbacks in one evening, so it is worth stating plainly:
+**this patch set makes the machine reboot itself, on purpose, up to eight times
+before it finishes booting.** `smp_wake_other_cpus_early()` re-tosses the
+firmware state by taking a full reset whenever the AP does not answer, because
+that is the only thing found to change the outcome. Eight rolls at roughly thirty
+seconds of POST each is about four minutes of what looks exactly like a reboot
+loop, with nothing on screen to say otherwise -- the reroll notice goes out via
+`dprintf`, so it reaches the serial port and the syslog but not the display
+unless on-screen debug output is enabled.
+
+The evidence from the evening it was misread, both lines from `/var/log/syslog`:
+
+```
+21:58:51 smp: early wake: AP unresponsive after 8 reroll(s), continuing with one CPU
+22:11:31 smp: early wake: AP came up after 5 deliberate reboot(s) re-rolling the firmware state
+22:11:31 smp: cpu 1 was parked by the early wake, handed over
+```
+
+The second boot rebooted itself five times and then came up **with both CPUs**.
+It was interrupted and rolled back anyway, twice, on the assumption that a freshly
+installed loader and kernel had broken booting. Neither had. What actually
+happened is that a `haiku` + `haiku_loader` package upgrade was reverted for no
+reason, and a genuine question -- whether the newer kernel fixes the VM wedge --
+was left unanswered.
+
+Rules that follow:
+
+1. Repeated resets during POST, before any Haiku output, are the expected
+   behaviour of this patch. Let it run for at least eight POSTs (~4 minutes)
+   before treating anything as broken.
+2. After the machine is up, `grep -iE 'reroll|early wake' /var/log/syslog` says
+   exactly what happened. Do that before concluding anything about a boot
+   failure -- it is one command and it is authoritative.
+3. A single CPU after boot means the rolls were spent (`AP unresponsive after 8
+   reroll(s)`), not that something is broken. The counter is sticky, so the next
+   boot will not retry until an AP wake succeeds and clears it.
+4. Do not diagnose a boot failure from "the user says it kept rebooting" alone.
+   The observable symptom of this patch's success path and of a genuine early
+   crash are the same thing.
+
+The underlying usability defect is real, though: a designed behaviour is
+indistinguishable from a crash to anyone watching the screen. Making the reroll
+print a visible line on the text console before it resets -- rather than only to
+serial -- would remove the ambiguity, and is worth doing before this patch set
+goes anywhere near another machine.
