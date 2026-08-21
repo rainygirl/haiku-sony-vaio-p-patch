@@ -1418,3 +1418,51 @@ Note that `wt-new`, which the exported diff is generated from and which
 (`8b91c532fa`), not on `r1beta6`. The beta6 rebase therefore does not affect
 either `vaio-p-patches.diff` or the ISO; those two lines are maintained in
 parallel and a fix has to be landed on both.
+
+## Kernel panic in `VMCache::Delete()` under Chromium build load (2026-08-21)
+
+The machine panicked after 2h32m of a `-j2` native Chromium build and sat in KDL
+for seven hours:
+
+```
+PANIC: ASSERT FAILED (src/system/kernel/vm/vm_page.cpp:3172):
+    (page->State() != PAGE_STATE_MODIFIED); page: 0x83aa8600
+revision: hrev99002+46
+Thread 4630 "cc1plus" running on CPU 1
+  6  vm_page_free_etc + 0x33d
+  7  VMCache<...>::Delete() + 0x20d
+  8  delete_area(VMAddressSpace*: NULL, VMArea*: 0xe6b06480, true, true)
+  9  vm_unmap_address_range(0xf277d158, 0x4850d000, 0x2000000, false)
+ 10  _user_unmap_memory
+ 11  handle_syscall
+```
+
+**This is not a VAIO P problem and not something this patch set caused.** It is
+upstream Haiku bug #20240, fixed on 2026-08-08 by `a964c2cdaf kernel/vm: Move
+page ACCESS state up in VMCache::Delete.` (cherry-picked from
+`5e3fdaa3cc`). `VMCache::Delete()` clears `PAGE_STATE_MODIFIED` before freeing
+each page -- `vm_page_free_etc()` refuses a MODIFIED page because it cannot tell
+which modified queue the page is on -- but it did that check and clear *outside*
+`DEBUG_PAGE_ACCESS_START(page)`. Without page access held the window is open for
+the page to be MODIFIED again by the time `vm_page_free_etc()` looks, and the
+assert fires. The fix just moves `DEBUG_PAGE_ACCESS_START` above the check.
+
+`cc1plus` is an ideal trigger: it unmaps large anonymous areas constantly (the
+faulting call is a 32 MiB `munmap` at `0x4850d000`), so a long compile run keeps
+retrying the race. It fired once in 2h32m here, and has not fired in earlier
+multi-hour runs, so it is rare rather than deterministic.
+
+Both source trees in `/Volumes/HaikuBuild` already carry the fix -- `wt-new` at
+`8b91c532fa` (master, which the ISO is built from) and `haiku` after the rebase
+onto `origin/r1beta6`. **Only the installed kernel lacks it**, because that image
+was built on 2026-07-28 (`hrev99002+46`), eleven days before the fix landed. So
+the next ISO built from either tree resolves this with no patch work needed.
+
+Worth knowing if the assert ever looks like it "went away" without a rebuild:
+`3aa6bdccbd kernel_debug_config: Fix KDEBUG_LEVEL.` (2026-08-10, r1beta6 only)
+sets `KDEBUG_LEVEL 1` with `KDEBUG = KDEBUG_LEVEL_2`, which evaluates to 0 and
+disables kernel `ASSERT()`s entirely on the release branch. master (`wt-new`)
+keeps `KDEBUG_LEVEL 2`, so asserts stay on there. Silencing the assert is not a
+fix: freeing a page still in MODIFIED state corrupts the modified-queue
+accounting, which is exactly what the assert exists to catch. Rely on
+`a964c2cdaf`, not on the debug level.
