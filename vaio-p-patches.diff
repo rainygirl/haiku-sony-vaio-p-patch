@@ -6885,7 +6885,7 @@ index f52f068155..8535aafea9 100644
  get_drive_parameters(uint8 drive, drive_parameters *parameters)
  {
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 68acf3f830..7697be60ea 100644
+index 68acf3f830..11540a95bb 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
 @@ -10,6 +10,7 @@
@@ -6911,7 +6911,7 @@ index 68acf3f830..7697be60ea 100644
  #include "mmu.h"
  #include "acpi.h"
  
-@@ -379,6 +382,697 @@ smp_init_other_cpus(void)
+@@ -379,6 +382,751 @@ smp_init_other_cpus(void)
  }
  
  
@@ -7311,6 +7311,54 @@ index 68acf3f830..7697be60ea 100644
 +	take, that function still performs the full INIT/SIPI sequence itself, so
 +	nothing depends on it having worked.
 +*/
++// Writes a string straight to the screen through the BIOS teletype call.
++// console_init() deliberately runs *after* smp_wake_other_cpus_early() -- the
++// video mode switch is kept off the critical path -- so there is no console
++// here and printf() would go nowhere. INT 10h/0Eh does not touch the video
++// mode, which makes it the only way to tell someone watching the screen that
++// the resets below are on purpose. Without this the reroll is indistinguishable
++// from a boot loop, and it has been mistaken for one.
++static void
++reroll_screen_print(const char* string)
++{
++	for (const char* c = string; *c != '\0'; c++) {
++		struct bios_regs regs;
++		regs.eax = 0x0e00 | (uint8)*c;
++		regs.ebx = 0x0007;
++		call_bios(0x10, &regs);
++	}
++}
++
++
++// The deliberate-reboot reroll is only ever correct on the machine it was
++// characterised on, and it is actively harmful elsewhere.
++static bool
++reroll_is_for_this_machine(void)
++{
++	cpuid_info info;
++	if (get_current_cpuid(&info, 1, 0) != B_OK)
++		return false;
++
++	// Under a hypervisor there is no firmware state to re-roll, and the virtual
++	// RTC is cleared along with the machine, so the counter never reaches its
++	// maximum and the reroll becomes an endless reboot loop. Measured: QEMU
++	// rebooted forever until this was gated.
++	if ((info.regs.ecx & (1 << 31)) != 0)
++		return false;
++
++	uint32 family = info.eax_1.family;
++	if (family == 0xf)
++		family += info.eax_1.extended_family;
++	uint32 model = info.eax_1.model;
++	if (family == 6 || family == 0xf)
++		model += info.eax_1.extended_model << 4;
++
++	// Family 6, model 0x1c: the Atom Silverthorne/Diamondville this whole
++	// mechanism was measured against. Anything else boots straight through.
++	return family == 6 && model == 0x1c;
++}
++
++
 +void
 +smp_wake_other_cpus_early(void)
 +{
@@ -7469,7 +7517,10 @@ index 68acf3f830..7697be60ea 100644
 +	// this machine could not even re-configure, having no setup UI), and
 +	// nothing in this system arms RTC alarms. A magic high nibble keeps a
 +	// stale byte from a previous OS from being mistaken for a count.
-+	{
++	if (!reroll_is_for_this_machine()) {
++		dprintf("smp: early wake: AP unresponsive, and the deliberate-reboot "
++			"reroll is gated off on this machine; continuing with one CPU\n");
++	} else {
 +		const uint8 kRerollCmosIndex = 0x01;	// RTC alarm seconds
 +		const uint8 kRerollMagic = 0xa0;
 +		const uint8 kMaxRerolls = 8;
@@ -7504,6 +7555,9 @@ index 68acf3f830..7697be60ea 100644
 +			dprintf("smp: early wake: AP unresponsive, rebooting to re-roll "
 +				"the firmware state (reroll %u of %u)\n", rerolls + 1,
 +				kMaxRerolls);
++			reroll_screen_print("\r\nSMP: second CPU did not answer. Rebooting on "
++				"purpose to re-roll the firmware state.\r\nThis is expected and "
++				"may repeat several times before the machine finishes booting.\r\n");
 +			spin(50000);	// let serial output drain
 +
 +			// The coldest reset available first: a KBC-pulse warm reset
@@ -7609,7 +7663,7 @@ index 68acf3f830..7697be60ea 100644
  void
  smp_boot_other_cpus(void (*entryFunc)(void))
  {
-@@ -401,10 +1095,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -401,10 +1149,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  	uint32 trampolineStack = 0x9e000;
  #endif
  
@@ -7642,7 +7696,7 @@ index 68acf3f830..7697be60ea 100644
  	// boot the cpus
  	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
  		uint32 *finalStack;
-@@ -412,6 +1127,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -412,6 +1181,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		uint32 config;
  		uint32 numStartups;
  		uint32 j;
@@ -7650,7 +7704,7 @@ index 68acf3f830..7697be60ea 100644
  
  		// set this stack up
  		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
-@@ -422,15 +1138,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -422,15 +1192,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  				/ sizeof(uint32)) - 1;
  		*tempStack = (uint32)entryFunc;
  
@@ -7666,7 +7720,7 @@ index 68acf3f830..7697be60ea 100644
  		// put a gdt descriptor at the bottom of the stack
  		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT
  		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;
-@@ -444,78 +1151,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -444,78 +1205,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
  			DPL_KERNEL);
  
@@ -7924,7 +7978,7 @@ index 68acf3f830..7697be60ea 100644
  	}
  
  	TRACE(("done trampolining\n"));
-@@ -527,6 +1354,40 @@ smp_add_safemode_menus(Menu *menu)
+@@ -527,6 +1408,40 @@ smp_add_safemode_menus(Menu *menu)
  {
  	MenuItem *item;
  

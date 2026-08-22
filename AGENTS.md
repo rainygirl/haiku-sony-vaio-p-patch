@@ -1566,3 +1566,40 @@ indistinguishable from a crash to anyone watching the screen. Making the reroll
 print a visible line on the text console before it resets -- rather than only to
 serial -- would remove the ambiguity, and is worth doing before this patch set
 goes anywhere near another machine.
+
+## The reroll is now gated, and announces itself (2026-08-22)
+
+Two changes to `smp_wake_other_cpus_early()`, both prompted by this patch set
+costing more time than it saved on a day it was not even at fault.
+
+**Gated to this machine.** The reroll now runs only when CPUID reports no
+hypervisor and the CPU is family 6 model 0x1c -- the Atom Silverthorne it was
+measured against. Everything else boots straight through. Under a hypervisor the
+old behaviour was not merely pointless but fatal: nothing there carries firmware
+state across a reset, and the virtual RTC is cleared with the machine, so the
+counter never reaches `kMaxRerolls` and the reboot loop has no end. An image with
+this patch would not finish booting under QEMU until this landed.
+
+**It says so on screen.** Before each deliberate reset the loader now writes two
+lines through the BIOS teletype call:
+
+```
+SMP: second CPU did not answer. Rebooting on purpose to re-roll the firmware state.
+This is expected and may repeat several times before the machine finishes booting.
+```
+
+`printf` is unavailable there: `console_init()` deliberately runs *after*
+`smp_wake_other_cpus_early()` because the video mode switch is kept off that
+critical path, and moving it would disturb the timing this code exists to work
+around. INT 10h/0Eh writes to the screen without touching the mode.
+
+Confirmed on the first boot carrying it: three deliberate reboots, then
+`AP came up after 3 deliberate reboot(s) re-rolling the firmware state`, and the
+machine came up with both CPUs.
+
+One installation note: the loader package built from this tree carries the same
+version string as the one already installed, and `pkgman install` refuses that
+with `Failed to change the package activation in packagefs: Name in use`. Move
+the old `.hpkg` out of `/boot/system/packages` and copy the new one in under a
+different filename instead, then confirm by checksum rather than by size --
+the sizes are identical.
