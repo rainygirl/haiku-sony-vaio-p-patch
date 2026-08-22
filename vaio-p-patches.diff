@@ -9505,3 +9505,110 @@ index b6cde90c3a..ed9b54ada6 100644
  
  	while (system_time() < target)
  		cpu_pause();
+diff --git a/src/system/kernel/vm/ModifiedPageQueue.h b/src/system/kernel/vm/ModifiedPageQueue.h
+index f42bbd69df..23a324954d 100644
+--- a/src/system/kernel/vm/ModifiedPageQueue.h
++++ b/src/system/kernel/vm/ModifiedPageQueue.h
+@@ -29,6 +29,7 @@ public:
+ private:
+ 	static	status_t			_WriterThreadEntry(void* _this);
+ 			status_t			_PageWriter();
++			void				_ReconcileAndNotify();
+ 
+ private:
+ 			thread_id			fWriterThread;
+diff --git a/src/system/kernel/vm/vm_page_writer.cpp b/src/system/kernel/vm/vm_page_writer.cpp
+index 5f64ffaa03..60991a0022 100644
+--- a/src/system/kernel/vm/vm_page_writer.cpp
++++ b/src/system/kernel/vm/vm_page_writer.cpp
+@@ -565,13 +565,17 @@ ModifiedPageQueue::_PageWriter()
+ 	while (fWriterThread >= 0) {
+ 		if (queue.Count() < kNumPages) {
+ 			// wait the full amount when no one triggers us
+-			if (!fPageWriterCondition.Wait(PAGES_FLUSH_DURATION_LOCAL_QUOTA, true))
++			if (!fPageWriterCondition.Wait(PAGES_FLUSH_DURATION_LOCAL_QUOTA, true)) {
++				_ReconcileAndNotify();
+ 				continue;
++			}
+ 		}
+ 
+ 		page_num_t modifiedPages = queue.Count();
+-		if (modifiedPages == 0)
++		if (modifiedPages == 0) {
++			_ReconcileAndNotify();
+ 			continue;
++		}
+ 
+ 		if (modifiedPages <= pagesSinceLastSuccessfulWrite) {
+ 			// We ran through the whole queue without being able to write a
+@@ -696,8 +700,10 @@ ModifiedPageQueue::_PageWriter()
+ #ifdef TRACE_VM_PAGE_WRITER
+ 		pageCollectionTime += system_time();
+ #endif
+-		if (numPages == 0)
++		if (numPages == 0) {
++			_ReconcileAndNotify();
+ 			continue;
++		}
+ 
+ 		// write pages to disk and do all the cleanup
+ 		bigtime_t runStart = system_time();
+@@ -729,14 +735,29 @@ ModifiedPageQueue::_PageWriter()
+ 		if (failedPages == 0 && numPages >= 8)
+ 			fLastAveragePageWriteDuration = (system_time() - runStart) / numPages;
+ 
+-		if (!IsOverQuota())
+-			fUnderQuotaCondition.NotifyAll();
++		_ReconcileAndNotify();
+ 	}
+ 
+ 	return B_OK;
+ }
+ 
+ 
++void
++ModifiedPageQueue::_ReconcileAndNotify()
++{
++	// IsOverQuota() is the only place this queue's contribution to the global
++	// counters is reconciled, so it has to be called on every pass of the
++	// writer loop, including the passes that find nothing to write. A queue
++	// that drains and is then never queried again leaves its last estimate in
++	// sGlobalEstimatedWriteDuration for good, and once the stale total exceeds
++	// the global quota every queue is over quota forever: waiters block in
++	// WaitIfOverQuota() and no writer ever reaches the notify below, because
++	// its own IsOverQuota() is false for exactly the same reason.
++	if (!IsOverQuota())
++		fUnderQuotaCondition.NotifyAll();
++}
++
++
+ /*static*/ status_t
+ ModifiedPageQueue::_WriterThreadEntry(void* _this)
+ {
+@@ -919,12 +940,21 @@ vm_page_schedule_write_page_range(struct VMCache *cache, uint32 firstPage,
+ ModifiedPageQueue::~ModifiedPageQueue()
+ {
+ 	thread_id writerThread = fWriterThread;
+-	if (writerThread < 0)
+-		return;
++	if (writerThread >= 0) {
++		fWriterThread = -1;
++		fPageWriterCondition.WakeUp();
++		wait_for_thread(writerThread, NULL);
++	}
+ 
+-	fWriterThread = -1;
+-	fPageWriterCondition.WakeUp();
+-	wait_for_thread(writerThread, NULL);
++	// Take this queue's last reported figures back out of the global
++	// counters. Without this a destroyed queue inflates them permanently,
++	// which is the same failure as an un-reconciled drained queue.
++	InterruptsSpinLocker locker(fLock);
++	atomic_add64(&sGlobalModifiedCount, -fLastReportedModifiedCount);
++	atomic_add64(&sGlobalEstimatedWriteDuration,
++		-fLastReportedEstimatedWriteDuration);
++	fLastReportedModifiedCount = 0;
++	fLastReportedEstimatedWriteDuration = 0;
+ }
+ 
+ 
