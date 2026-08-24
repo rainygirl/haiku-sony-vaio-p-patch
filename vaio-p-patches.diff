@@ -5747,7 +5747,7 @@ index 0ea6c2f41e..11c87d39bb 100644
  		} else
  			err = WaitForMessage(waitUntil);
 diff --git a/src/kits/media/MediaRecorder.cpp b/src/kits/media/MediaRecorder.cpp
-index b4227875a1..ca7faf92d3 100644
+index b4227875a1..930cca6ff5 100644
 --- a/src/kits/media/MediaRecorder.cpp
 +++ b/src/kits/media/MediaRecorder.cpp
 @@ -219,19 +219,23 @@ BMediaRecorder::Disconnect()
@@ -5803,7 +5803,59 @@ index b4227875a1..ca7faf92d3 100644
  
  	// then un-mute it
  	if (err == B_OK) {
-@@ -302,7 +316,19 @@ BMediaRecorder::Stop(bool force)
+@@ -283,6 +297,51 @@ BMediaRecorder::Start(bool force)
+ }
+ 
+ 
++/*!	Does the producer still feed someone other than us?
++
++	StartNode()/StopNode() carry no reference count, and nothing prevents two
++	recorders connecting to the same producer -- one sound card feeding two
++	applications is the obvious case, and a BMediaRecorder is cheap enough that
++	one program may well hold several. So a recorder that stops the producer on
++	its own way out can take another recorder's capture down with it, and the
++	victim goes on looking perfectly healthy while receiving nothing at all.
++	That is the hardest class of failure to attribute, so ask first.
++
++	When the answer cannot be obtained, say yes. Declining to stop the producer
++	just reinstates the older behaviour -- a capture device left clocking
++	buffers nobody reads -- which is a much smaller problem than silently
++	killing a recording that belongs to someone else.
++*/
++static bool
++producer_has_other_consumers(const media_node& producer,
++	const media_source& ourSource)
++{
++	const int32 kMaxOutputs = 16;
++	media_output outputs[kMaxOutputs];
++	int32 count = 0;
++
++	if (BMediaRoster::CurrentRoster()->GetConnectedOutputsFor(producer,
++			outputs, kMaxOutputs, &count) != B_OK) {
++		return true;
++	}
++
++	// count cannot exceed kMaxOutputs: GetConnectedOutputsFor() only counts
++	// what it managed to write and stops when the buffer is full. Truncation
++	// cannot produce a wrong answer here anyway -- it can only drop outputs,
++	// and dropping ours while keeping someone else's still leaves a source
++	// that is not ours in the list, which is the answer that keeps the
++	// producer running.
++	for (int32 i = 0; i < count; i++) {
++		if (outputs[i].source.port != ourSource.port
++				|| outputs[i].source.id != ourSource.id) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
++
+ status_t
+ BMediaRecorder::Stop(bool force)
+ {
+@@ -302,7 +361,25 @@ BMediaRecorder::Stop(bool force)
  
  	fRunning = false;
  
@@ -5813,7 +5865,13 @@ index b4227875a1..ca7faf92d3 100644
 +	// Start() starts the producer, so Stop() has to stop it again -- stopping
 +	// only our own node left the capture device running indefinitely after
 +	// the recorder was done with it, still clocking buffers nobody reads.
-+	if (fConnected) {
++	//
++	// Only when we are its last consumer, though; see
++	// producer_has_other_consumers() for why. Disconnect() calls Stop()
++	// before it disconnects, so our own connection is still counted here,
++	// which is what makes "is anything else attached" answerable at all.
++	if (fConnected
++			&& !producer_has_other_consumers(fOutputNode, fOutputSource)) {
 +		status_t producerErr = BMediaRoster::CurrentRoster()->StopNode(
 +			fOutputNode, 0);
 +		if (err == B_OK)
