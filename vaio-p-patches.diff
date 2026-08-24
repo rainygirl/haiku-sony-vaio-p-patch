@@ -794,10 +794,10 @@ index 7b9dd027e6..c509f78641 100644
  		ps2_service_notify_device_added(&ps2_device[PS2_DEVICE_KEYB]);
  	} else {
 diff --git a/src/add-ons/kernel/bus_managers/usb/BusManager.cpp b/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
-index bc264e8aa1..853ef490ce 100644
+index bc264e8aa1..151c9a7419 100644
 --- a/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
 +++ b/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
-@@ -136,8 +136,51 @@ BusManager::AllocateDevice(Hub *parent, int8 hubAddress, uint8 hubPort,
+@@ -136,6 +136,54 @@ BusManager::AllocateDevice(Hub *parent, int8 hubAddress, uint8 hubPort,
  
  	defaultPipe->SetHubInfo(hubAddress, hubPort);
  
@@ -837,21 +837,23 @@ index bc264e8aa1..853ef490ce 100644
 +		}
 +	}
 +
-+	// A device that won't even answer the simplest possible request at
-+	// address 0 is extremely unlikely to suddenly start responding to
-+	// SET_ADDRESS on a 2nd or 3rd retry 200ms later; don't burn that time
-+	// (repeated on every failed hub Explore() cycle) on a device that has
-+	// already shown it isn't there.
-+	int32 setAddressAttempts = respondedAtAddressZero ? 3 : 1;
++	// The probe above is diagnostic only. Cutting the SET_ADDRESS retries
++	// down to one when it fails was tempting -- a device that won't answer
++	// the simplest possible request looks like a device that isn't there --
++	// but GET_DESCRIPTOR at address 0 is not something the spec requires a
++	// device to answer, so a device that only ever accepts SET_ADDRESS first
++	// would stop enumerating anywhere. The time this was meant to save is
++	// already bounded by Hub::Explore()'s per-port failure counter, which
++	// stops servicing a hopeless port after a couple of attempts instead of
++	// retrying it on every poll -- so the saving was small and the risk
++	// applied to every machine.
++	(void)respondedAtAddressZero;
 +
  	status_t result = B_ERROR;
--	for (int32 i = 0; i < 3; i++) {
-+	for (int32 i = 0; i < setAddressAttempts; i++) {
+ 	for (int32 i = 0; i < 3; i++) {
  		// Set the address of the device USB 1.1 spec p202
- 		result = defaultPipe->SendRequest(
- 			USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_OUT,	// type
 diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
-index e335e09054..1d481b8865 100644
+index e335e09054..4cfe8610c2 100644
 --- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
 +++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
 @@ -15,6 +15,39 @@
@@ -909,7 +911,7 @@ index e335e09054..1d481b8865 100644
  
  	if (!fInitOK) {
  		TRACE_ERROR("device failed to initialize\n");
-@@ -195,11 +233,67 @@ Hub::DisablePort(uint8 index)
+@@ -195,11 +233,81 @@ Hub::DisablePort(uint8 index)
  }
  
  
@@ -920,9 +922,23 @@ index e335e09054..1d481b8865 100644
 +	// port's transaction servicing) is the closest a driver can get, in
 +	// software, to what physically unplugging and replugging a device
 +	// does. Some flaky devices that never recover via reset alone do
-+	// recover from this. Not all hubs support per-port power switching
-+	// (root hubs generally do); if this request fails there's nothing
-+	// more to be done in software.
++	// recover from this.
++	//
++	// Only where the hub switches power per port, though. Bits 0-1 of the
++	// hub characteristics carry the logical power switching mode, and any
++	// value other than 01b means the ports are ganged (or not switchable at
++	// all): clearing PORT_POWER on one port of a ganged hub takes down every
++	// port in the gang, which on a root hub is the whole controller -- the
++	// keyboard, and quite possibly the volume this system booted from.
++	// Recovering one unresponsive device is not worth that trade, so a hub
++	// that cannot do it per port simply does not get this recovery step.
++	if ((fHubDescriptor.characteristics & 0x3) != 0x1) {
++		TRACE_ALWAYS("hub does not switch port power individually "
++			"(characteristics 0x%04x); not power cycling port %u\n",
++			fHubDescriptor.characteristics, index);
++		return B_NOT_SUPPORTED;
++	}
++
 +	status_t status = DefaultPipe()->SendRequest(USB_REQTYPE_CLASS
 +		| USB_REQTYPE_OTHER_OUT, USB_REQUEST_CLEAR_FEATURE, PORT_POWER,
 +		index + 1, 0, NULL, 0, NULL);
@@ -977,7 +993,7 @@ index e335e09054..1d481b8865 100644
  		status_t result = UpdatePortStatus(i);
  		if (result < B_OK)
  			continue;
-@@ -214,7 +308,9 @@ Hub::Explore(change_item **changeList)
+@@ -214,7 +322,9 @@ Hub::Explore(change_item **changeList)
  		}
  #endif
  
@@ -988,7 +1004,7 @@ index e335e09054..1d481b8865 100644
  				|| ((fPortStatus[i].status & PORT_STATUS_CONNECTION)
  					&& fChildren[i] == NULL)) {
  			// clear status change
-@@ -222,7 +318,22 @@ Hub::Explore(change_item **changeList)
+@@ -222,7 +332,22 @@ Hub::Explore(change_item **changeList)
  				USB_REQUEST_CLEAR_FEATURE, C_PORT_CONNECTION, i + 1,
  				0, NULL, 0, NULL);
  
@@ -1012,7 +1028,7 @@ index e335e09054..1d481b8865 100644
  				// new device attached!
  				TRACE_ALWAYS("port %" B_PRId32 ": new device connected\n", i);
  
-@@ -299,6 +410,8 @@ Hub::Explore(change_item **changeList)
+@@ -299,6 +424,8 @@ Hub::Explore(change_item **changeList)
  					if (newDevice) {
  						newDevice->Changed(changeList, true);
  						fChildren[i] = newDevice;
@@ -1021,7 +1037,7 @@ index e335e09054..1d481b8865 100644
  						break;
  					} else {
  						// the device failed to setup correctly, disable the
-@@ -307,6 +420,53 @@ Hub::Explore(change_item **changeList)
+@@ -307,6 +434,53 @@ Hub::Explore(change_item **changeList)
  						DisablePort(i);
  					}
  				}
@@ -1075,7 +1091,7 @@ index e335e09054..1d481b8865 100644
  			} else {
  				// Device removed...
  				TRACE_ALWAYS("port %" B_PRId32 ": device removed\n", i);
-@@ -315,6 +475,15 @@ Hub::Explore(change_item **changeList)
+@@ -315,6 +489,15 @@ Hub::Explore(change_item **changeList)
  					fChildren[i]->Changed(changeList, false);
  					fChildren[i] = NULL;
  				}
@@ -2423,7 +2439,7 @@ index edeba186d9..bfd203eea2 100644
  	mode &= info.shared_info->dpms_capabilities;
  
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
-index 3f3670c14f..3ec6deadd1 100644
+index 3f3670c14f..121a9ec261 100644
 --- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 +++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 @@ -72,6 +72,8 @@
@@ -2435,7 +2451,7 @@ index 3f3670c14f..3ec6deadd1 100644
  #include <net/if.h>
  #include <net/if_var.h>
  #include <net/if_dl.h>
-@@ -2504,6 +2506,65 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2504,6 +2506,75 @@ ath_bmiss_proc(void *arg, int pending)
  
  	ath_beacon_miss(sc);
  
@@ -2487,7 +2503,17 @@ index 3f3670c14f..3ec6deadd1 100644
 +	}
 +	sc->sc_bmiss_last_tick = ticks;
 +
-+	if (!associated && sc->sc_bmiss_count >= 3) {
++	/*
++	 * Power-cycling the adapter is not an upstream recovery: upstream only
++	 * does a link-preserving reset here. It was added for one card that
++	 * otherwise stays deaf after repeated beacon loss, and it is not safe to
++	 * apply blind -- an Atheros part that needs its firmware reloaded after
++	 * D3 may not come back at all until the machine is rebooted. So keep it
++	 * to the device it was measured on: AR928X, 168c:002a.
++	 */
++	if (!associated && sc->sc_bmiss_count >= 3
++	    && pci_get_vendor(sc->sc_dev) == 0x168c
++	    && pci_get_device(sc->sc_dev) == 0x002a) {
 +		device_printf(sc->sc_dev,
 +		    "repeated beacon miss recovery, power-cycling the "
 +		    "adapter\n");
@@ -2501,7 +2527,7 @@ index 3f3670c14f..3ec6deadd1 100644
  	/*
  	 * Do a reset upon any beacon miss event.
  	 *
-@@ -2516,8 +2577,8 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2516,8 +2587,8 @@ ath_bmiss_proc(void *arg, int pending)
  		    "bb hang detected (0x%x), resetting\n", hangs);
  	} else {
  		ath_reset(sc, ATH_RESET_NOLOSS, HAL_RESET_FORCE_COLD);
@@ -3391,10 +3417,10 @@ index 0000000000..61ceffd259
 +	;
 diff --git a/src/add-ons/kernel/power/cpufreq/intel_est/intel_est.cpp b/src/add-ons/kernel/power/cpufreq/intel_est/intel_est.cpp
 new file mode 100644
-index 0000000000..442fd236a9
+index 0000000000..8bbfce9a2b
 --- /dev/null
 +++ b/src/add-ons/kernel/power/cpufreq/intel_est/intel_est.cpp
-@@ -0,0 +1,596 @@
+@@ -0,0 +1,621 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All Rights Reserved.
 + * Distributed under the terms of the MIT License.
@@ -3879,6 +3905,31 @@ index 0000000000..442fd236a9
 +			return B_ERROR;
 +	}
 +
++	// CPUID advertising EST is not the same as EST being usable. Bit 16 of
++	// MISC_ENABLE gates it, and bit 20 -- the EIST Select Lock -- makes bit 16
++	// read-only once the firmware has set it, so on a machine whose BIOS ships
++	// with SpeedStep turned off the enable below is silently discarded rather
++	// than faulting. Every IA32_PERF_CTL write would then be ignored too, and
++	// this module would sit there claiming the CPU while the frequency never
++	// moved -- worse than no cpufreq module, because there is nothing in the
++	// log to say so. Try the enable here, read it back, and decline the CPU if
++	// it did not take.
++	//
++	// Only the boot CPU is checked. MISC_ENABLE is per-thread on some parts,
++	// which is why set_normal_pstate() repeats the enable on each one, but the
++	// lock bit is a firmware setting and does not vary between them.
++	uint64 miscEnable = x86_read_msr(IA32_MSR_MISC_ENABLE);
++	if ((miscEnable & IA32_MISC_ENABLE_EST) == 0) {
++		x86_write_msr(IA32_MSR_MISC_ENABLE,
++			miscEnable | IA32_MISC_ENABLE_EST);
++		if ((x86_read_msr(IA32_MSR_MISC_ENABLE) & IA32_MISC_ENABLE_EST) == 0) {
++			dprintf("intel_est: EST is disabled and locked by the firmware "
++				"(MISC_ENABLE %#" B_PRIx64 "); not claiming this CPU\n",
++				miscEnable);
++			return B_ERROR;
++		}
++	}
++
 +	// Find any ACPI processor node and read its _PCT/_PSS. The table is
 +	// identical across all logical CPUs on these platforms.
 +	device_node* root = sDeviceManager->get_root_node();
@@ -3992,7 +4043,7 @@ index 0000000000..442fd236a9
 +	{}
 +};
 diff --git a/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp b/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
-index fda337add7..aa347ddbd7 100644
+index fda337add7..3910a0339b 100644
 --- a/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
 +++ b/src/add-ons/kernel/power/cpuidle/x86_acpi_cstates/acpi_cpuidle.cpp
 @@ -234,6 +234,11 @@ acpi_cstate_set_scheduler_mode(scheduler_mode mode)
@@ -4042,40 +4093,56 @@ index fda337add7..aa347ddbd7 100644
  {
  	// get the CPU index
  	acpi_data buffer;
-@@ -528,30 +543,9 @@ acpi_processor_init(acpi_cpuidle_driver_info *device)
+@@ -528,30 +543,41 @@ acpi_processor_init(acpi_cpuidle_driver_info *device)
  	}
  
  	acpi_object_type *tmpObject = (acpi_object_type *)buffer.pointer;
 -	const uint32 processor_cpu_id = tmpObject->processor.cpu_id;
 +	*_cpuId = tmpObject->processor.cpu_id;
  	free(buffer.pointer);
--
--	// Find this processor's CPU index.
--	int32 cpuIndex = -1;
--	for (int32 i = 0; i < smp_get_num_cpus(); i++) {
--		cpu_ent* cpu = &gCPU[i];
++	return B_OK;
++}
++
++
++static status_t
++acpi_processor_init(acpi_cpuidle_driver_info *device)
++{
++	uint32 processorCpuId;
++	status_t status = acpi_processor_get_id(device, &processorCpuId);
++	if (status != B_OK)
++		return status;
+ 
+ 	// Find this processor's CPU index.
+ 	int32 cpuIndex = -1;
+ 	for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+ 		cpu_ent* cpu = &gCPU[i];
 -		if ((uint32)cpu->arch.acpi_processor_id == processor_cpu_id) {
--			cpuIndex = i;
--			break;
--		}
--	}
--
--	if (cpuIndex < 0) {
++		if ((uint32)cpu->arch.acpi_processor_id == processorCpuId) {
+ 			cpuIndex = i;
+ 			break;
+ 		}
+ 	}
+ 
+ 	if (cpuIndex < 0) {
 -		dprintf("can't find matching cpu_ent for acpi cpu %" B_PRId32 "\n",
 -			processor_cpu_id);
--		return B_ERROR;
--	}
--
++		dprintf("can't find matching cpu_ent for acpi cpu %" B_PRIu32 "\n",
++			processorCpuId);
+ 		return B_ERROR;
+ 	}
+ 
 -	dprintf("acpi cpu %" B_PRId32 " maps to cpu %" B_PRId32 "\n",
 -		processor_cpu_id, cpuIndex);
--
--	sAcpiProcessor[cpuIndex] = device;
++	dprintf("acpi cpu %" B_PRIu32 " maps to cpu %" B_PRId32 "\n",
++		processorCpuId, cpuIndex);
+ 
+ 	sAcpiProcessor[cpuIndex] = device;
 -	return status;
 +	return B_OK;
  }
  
  
-@@ -575,10 +569,56 @@ acpi_cpuidle_init()
+@@ -575,8 +601,74 @@ acpi_cpuidle_init()
  	if (x86_check_feature(IA32_FEATURE_EXT_HYPERVISOR, FEATURE_EXT))
  		return B_ERROR;
  
@@ -4123,141 +4190,41 @@ index fda337add7..aa347ddbd7 100644
 +
  	device_node* root = sDeviceManager->get_root_node();
  
-+	const int32 numCpus = smp_get_num_cpus();
-+	acpi_cpuidle_driver_info* devices[SMP_MAX_CPUS];
-+	uint32 deviceCpuIds[SMP_MAX_CPUS];
-+	int32 deviceCount = 0;
-+
++	// Everything below this point is upstream's, deliberately. An earlier
++	// version of this patch replaced the by-ID processor mapping with a
++	// discovery-order fallback, and replaced the per-CPU _OSC/_CST
++	// evaluation with one evaluation on a representative CPU copied to the
++	// others -- both to work around the Atom Z520, whose HT sibling hangs
++	// the machine on a second _CST evaluation of a dynamically Load()ed OEM
++	// SSDT.
++	//
++	// Neither is reachable on that machine any more: the model 0x1c check
++	// above refuses the CPU outright, before any of this runs. What the two
++	// changes did still affect was every other machine, and this driver is
++	// now in the standard image (see build/jam/packages/Haiku), so that is a
++	// lot of machines. Copying one CPU's C-state table to the rest assumes
++	// every logical CPU has the same table, which stopped being true with
++	// hybrid P-core/E-core parts -- their _CST genuinely differs by core
++	// type, and programming a P-core's MWAIT hints into an E-core is not a
++	// workaround, it is a bug. The discovery-order fallback likewise binds
++	// leftover Processor() objects to leftover CPUs, where upstream
++	// deliberately ignores the ones that do not match; firmwares commonly
++	// declare Processor() objects for CPUs that are not present.
++	//
++	// So the workaround is gone and the refusal stays. If the Atom ever
++	// needs this driver, the place to solve it is the repeat-Load() hang,
++	// not a table copy imposed on everyone else.
  	status_t status = B_OK;
--	int32 processors = 0;
+ 	int32 processors = 0;
  	device_node* processor = NULL;
- 	while (true) {
- 		device_attr acpiAttrs[] = {
-@@ -602,29 +642,113 @@ acpi_cpuidle_init()
- 		sDeviceManager->get_driver(processor, (driver_module_info **)&device->acpi,
- 			(void **)&device->acpi_cookie);
- 
--		status = acpi_processor_init(device);
--		if (status != B_OK) {
-+		uint32 cpuId;
-+		if (deviceCount >= numCpus
-+				|| acpi_processor_get_id(device, &cpuId) != B_OK) {
- 			sDeviceManager->put_node(processor);
- 			free(device);
--
--			// Ignore the error and continue: there are sometimes processor
--			// objects that don't map to cpu_ents, apparently.
--			status = B_OK;
- 			continue;
- 		}
- 
--		processors++;
-+		devices[deviceCount] = device;
-+		deviceCpuIds[deviceCount] = cpuId;
-+		deviceCount++;
+@@ -617,6 +709,7 @@ acpi_cpuidle_init()
  	}
  
  	sDeviceManager->put_node(root);
--	if (status == B_OK && processors != smp_get_num_cpus()) {
 +
-+	bool cpuClaimed[SMP_MAX_CPUS] = {};
-+	bool deviceClaimed[SMP_MAX_CPUS] = {};
-+
-+	// First pass: match by the ACPI processor ID, as ioapic.cpp filled it in
-+	// from the MADT's LAPIC entries.
-+	for (int32 d = 0; status == B_OK && d < deviceCount; d++) {
-+		for (int32 i = 0; i < numCpus; i++) {
-+			if (!cpuClaimed[i]
-+					&& (uint32)gCPU[i].arch.acpi_processor_id
-+						== deviceCpuIds[d]) {
-+				sAcpiProcessor[i] = devices[d];
-+				cpuClaimed[i] = true;
-+				deviceClaimed[d] = true;
-+				dprintf("acpi cpu %" B_PRIu32 " maps to cpu %" B_PRId32 "\n",
-+					deviceCpuIds[d], i);
-+				break;
-+			}
-+		}
-+	}
-+
-+	// Second pass: some firmwares (e.g. the Sony VAIO P / Atom Z520, on its
-+	// HT sibling thread) disagree between the MADT LAPIC ProcessorId and the
-+	// DSDT Processor() object's ProcessorId. Fall back to matching whatever
-+	// is left over by discovery order.
-+	int32 nextCpu = 0;
-+	for (int32 d = 0; status == B_OK && d < deviceCount; d++) {
-+		if (deviceClaimed[d])
-+			continue;
-+		while (nextCpu < numCpus && cpuClaimed[nextCpu])
-+			nextCpu++;
-+		if (nextCpu >= numCpus)
-+			break;
-+		dprintf("acpi cpu %" B_PRIu32 " id mismatch, falling back to "
-+			"discovery order -> cpu %" B_PRId32 "\n", deviceCpuIds[d],
-+			nextCpu);
-+		sAcpiProcessor[nextCpu] = devices[d];
-+		cpuClaimed[nextCpu] = true;
-+		deviceClaimed[d] = true;
-+		nextCpu++;
-+	}
-+
-+	int32 processors = 0;
-+	for (int32 d = 0; d < deviceCount; d++) {
-+		if (!deviceClaimed[d]) {
-+			sDeviceManager->put_node(devices[d]->processor);
-+			free(devices[d]);
-+		} else {
-+			processors++;
-+		}
-+	}
-+
-+	if (status == B_OK && processors != numCpus) {
+ 	if (status == B_OK && processors != smp_get_num_cpus()) {
  		dprintf("can't use x86 ACPI idle: missing %" B_PRId32 " processor objects\n",
--			smp_get_num_cpus() - processors);
-+			numCpus - processors);
- 		status = B_NOT_SUPPORTED;
- 	}
- 
--	for (int32 i = 0; status == B_OK && i < smp_get_num_cpus(); i++)
--		status = acpi_cpuidle_setup(sAcpiProcessor[i]);
-+	// Evaluate _OSC/_CST on a single representative CPU only, then copy the
-+	// resulting C-state table to the rest. On this class of hardware (e.g.
-+	// Sony VAIO P / Atom Z520), the first _CST evaluation dynamically
-+	// Load()s a shared OEM SSDT via AML; evaluating _OSC/_CST a second time
-+	// for the HT sibling hangs the machine hard (observed on real hardware
-+	// -- looks like an ACPICA dynamic-table-load deadlock on a repeat
-+	// Load() of the same table). All logical CPUs share one identical
-+	// table on these platforms anyway, matching the same assumption
-+	// intel_est already makes for _PSS/_PCT, so there's nothing lost by
-+	// not re-running the AML per CPU.
-+	int32 representative = -1;
-+	for (int32 i = 0; i < numCpus; i++) {
-+		if (sAcpiProcessor[i] != NULL) {
-+			representative = i;
-+			break;
-+		}
-+	}
-+
-+	if (status == B_OK && representative < 0)
-+		status = B_NOT_SUPPORTED;
-+
-+	if (status == B_OK)
-+		status = acpi_cpuidle_setup(sAcpiProcessor[representative]);
-+
-+	if (status == B_OK) {
-+		acpi_cpuidle_driver_info* source = sAcpiProcessor[representative];
-+		for (int32 i = 0; i < numCpus; i++) {
-+			if (i == representative || sAcpiProcessor[i] == NULL)
-+				continue;
-+			sAcpiProcessor[i]->flags = source->flags;
-+			sAcpiProcessor[i]->state_count = source->state_count;
-+			memcpy(sAcpiProcessor[i]->states, source->states,
-+				sizeof(source->states));
-+		}
-+	}
- 
- 	if (status == B_OK) {
- 		acpi_cstate_set_scheduler_mode(SCHEDULER_MODE_LOW_LATENCY);
+ 			smp_get_num_cpus() - processors);
 diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
 index 0e067c49cd..5afe292084 100644
 --- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
@@ -6163,7 +6130,7 @@ index 3d8d3b9c49..c8059de8ec 100644
  
  #endif
 diff --git a/src/servers/launch/Job.cpp b/src/servers/launch/Job.cpp
-index b696c48674..c28656d18e 100644
+index b696c48674..8261813197 100644
 --- a/src/servers/launch/Job.cpp
 +++ b/src/servers/launch/Job.cpp
 @@ -11,6 +11,7 @@
@@ -6174,36 +6141,53 @@ index b696c48674..c28656d18e 100644
  #include <Roster.h>
  
  #include <MessagePrivate.h>
-@@ -375,7 +376,17 @@ Job::Launch()
+@@ -375,7 +376,35 @@ Job::Launch()
  		BString signature("application/");
  		signature << Name();
  
 -		return _Launch(signature.String(), NULL, 0, NULL, &environment[0]);
-+		const int32 kSignatureLaunchRetries = 720;
++		// An app launched by signature can legitimately be missing for a
++		// moment at boot: the volume it lives on may still be mounting, and
++		// the roster then answers APP_NOT_FOUND for something that is about
++		// to exist. Retrying covers that. The bound matters, though -- a
++		// signature for an app that genuinely is not installed must not hold
++		// the boot up, so cap this at fifteen seconds rather than the three
++		// minutes it was, and say so once, so a real miss is visible in the
++		// syslog instead of looking like a hang.
++		const int32 kSignatureLaunchRetries = 60;
 +		const bigtime_t kSignatureLaunchRetryInterval = 250000;
-+		status_t status;
++		status_t status = B_OK;
 +		for (int32 i = 0; i < kSignatureLaunchRetries; i++) {
 +			status = _Launch(signature.String(), NULL, 0, NULL,
 +				&environment[0]);
 +			if (status != B_LAUNCH_FAILED_APP_NOT_FOUND)
 +				break;
++			if (i == 0) {
++				debug_printf("launch_daemon: %s not found yet, waiting for it "
++					"(up to %" B_PRId32 " s)\n", signature.String(),
++					(int32)(kSignatureLaunchRetries
++						* kSignatureLaunchRetryInterval / 1000000));
++			}
 +			snooze(kSignatureLaunchRetryInterval);
++		}
++		if (status == B_LAUNCH_FAILED_APP_NOT_FOUND) {
++			debug_printf("launch_daemon: giving up on %s: not installed\n",
++				signature.String());
 +		}
 +		return status;
  	}
  
  	// Build argument vector
 diff --git a/src/servers/launch/LaunchDaemon.cpp b/src/servers/launch/LaunchDaemon.cpp
-index 750382b861..88b612bbbc 100644
+index 750382b861..8d3bcd5eaf 100644
 --- a/src/servers/launch/LaunchDaemon.cpp
 +++ b/src/servers/launch/LaunchDaemon.cpp
-@@ -1563,13 +1563,29 @@ LaunchDaemon::_AddRunTargets(BMessage& message)
+@@ -1563,13 +1563,38 @@ LaunchDaemon::_AddRunTargets(BMessage& message)
  void
  LaunchDaemon::_AddRunTargets(BMessage& message, const char* name)
  {
 -	BMessage targets;
 -	if (name != NULL && message.FindMessage(name, &targets) != B_OK)
--		return;
 +	// A "run" block may name its targets directly, with no if/then wrapper:
 +	//
 +	//	run {
@@ -6222,6 +6206,15 @@ index 750382b861..88b612bbbc 100644
 +		if (message.FindMessage(name, &targetsStorage) != B_OK)
 +			return;
 +		targets = &targetsStorage;
++	} else if (message.HasMessage("if") || message.HasMessage("then")
++			|| message.HasMessage("else")) {
++		// Only the direct form has its targets in the block itself. A block
++		// that carries if/then/else keeps them in those sub-messages, and
++		// reading the block as well would add the targets the condition was
++		// supposed to choose between -- measured: a stock image then stalled
++		// before package_daemon, having started something the condition had
++		// ruled out.
+ 		return;
 +	}
  
  	const char* target;
@@ -6233,18 +6226,10 @@ index 750382b861..88b612bbbc 100644
  	}
  }
 diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
-index 42bae2a7da..0d142e5629 100644
+index 42bae2a7da..b1d8f38f76 100644
 --- a/src/servers/net/AutoconfigLooper.cpp
 +++ b/src/servers/net/AutoconfigLooper.cpp
-@@ -18,6 +18,7 @@
- #include <sys/socket.h>
- #include <sys/sockio.h>
- 
-+#include <NetworkDevice.h>
- #include <NetworkInterface.h>
- #include <NetworkNotifications.h>
- 
-@@ -26,6 +27,22 @@
+@@ -26,6 +26,22 @@
  
  
  static const uint32 kMsgReadyToRun = 'rdyr';
@@ -6267,7 +6252,7 @@ index 42bae2a7da..0d142e5629 100644
  
  
  AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
-@@ -34,7 +51,9 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+@@ -34,7 +50,9 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
  	fDevice(device),
  	fCurrentClient(NULL),
  	fLastMediaStatus(0),
@@ -6278,45 +6263,44 @@ index 42bae2a7da..0d142e5629 100644
  {
  	BMessage ready(kMsgReadyToRun);
  	PostMessage(&ready);
-@@ -194,18 +213,59 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+@@ -194,18 +212,58 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
  
  		case B_NETWORK_WLAN_SCANNED:
  		{
 -			if (fJoiningNetwork || (fLastMediaStatus & IFM_ACTIVE) != 0) {
 -				// We already have a link or are already joining.
 +			if ((fLastMediaStatus & IFM_ACTIVE) != 0) {
-+				// We already have a link -- but if it's to an open network,
-+				// that's very likely not a network anyone actually asked
-+				// for: net80211's default candidate scan (which runs before
-+				// any specific network has been requested yet) only
-+				// considers open APs, since IEEE80211_F_PRIVACY isn't set
-+				// on the vap until a real join request configures it. On
-+				// hardware that ends up racing that default scan against
-+				// this looper's own join attempts, the interface can come
-+				// up already "connected" to some unrelated open AP in range
-+				// well before the real (password-protected) target network
-+				// was ever tried, and a plain link-active check like this
-+				// used to treat that as "done" forever. Only actually skip
-+				// here if the current link looks like a deliberate one.
-+				uint32 authenticationMode = B_NETWORK_AUTHENTICATION_NONE;
-+				BNetworkDevice device(fDevice);
-+				wireless_network network;
-+				uint32 cookie = 0;
-+				if (device.GetNextAssociatedNetwork(cookie, network) == B_OK)
-+					authenticationMode = network.authentication_mode;
-+
-+				if (authenticationMode != B_NETWORK_AUTHENTICATION_NONE)
-+					break;
-+			}
-+
++				// We already have a link.
++				//
++				// This used to make an exception for links to *open*
++				// networks, on the theory that such a link was probably not
++				// one anyone asked for: net80211's candidate scan would
++				// auto-join before any specific network had been requested,
++				// and because IEEE80211_F_PRIVACY is unset until a real join
++				// request configures it, the only candidates it could pick
++				// were open APs. So an unconfigured interface could come up
++				// "connected" to some unrelated open AP and this check would
++				// treat that as done forever.
++				//
++				// That is fixed where it belongs now -- sta_pick_bss() in
++				// ieee80211_scan_sta.c refuses to auto-join at all until a
++				// desired SSID has been set -- which leaves the exception
++				// here with nothing to fix and one real cost: a link to an
++				// open network the user chose deliberately (a guest or cafe
++				// network, which is most of them) is not distinguishable
++				// from the accidental kind. Re-joining on every completed
++				// scan deauthenticates that working link over and over.
+ 				break;
+ 			}
+ 
 +			if (fJoiningNetwork
 +					&& system_time() - fJoiningNetworkSince
 +						< fJoinNetworkRetryTimeout) {
 +				// A join attempt is still within its grace period; give it
 +				// a chance to complete instead of overlapping another one.
- 				break;
- 			}
- 
++				break;
++			}
++
 +			if (fJoiningNetwork) {
 +				// This is a retry: the previous attempt used up its whole
 +				// window without producing a link. Back off before the next
@@ -6885,7 +6869,7 @@ index f52f068155..8535aafea9 100644
  get_drive_parameters(uint8 drive, drive_parameters *parameters)
  {
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 68acf3f830..11540a95bb 100644
+index 68acf3f830..0da96ec9d3 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
 @@ -10,6 +10,7 @@
@@ -6911,7 +6895,7 @@ index 68acf3f830..11540a95bb 100644
  #include "mmu.h"
  #include "acpi.h"
  
-@@ -379,6 +382,751 @@ smp_init_other_cpus(void)
+@@ -379,6 +382,757 @@ smp_init_other_cpus(void)
  }
  
  
@@ -7332,8 +7316,8 @@ index 68acf3f830..11540a95bb 100644
 +
 +// The deliberate-reboot reroll is only ever correct on the machine it was
 +// characterised on, and it is actively harmful elsewhere.
-+static bool
-+reroll_is_for_this_machine(void)
++bool
++smp_early_wake_supported(void)
 +{
 +	cpuid_info info;
 +	if (get_current_cpuid(&info, 1, 0) != B_OK)
@@ -7362,6 +7346,12 @@ index 68acf3f830..11540a95bb 100644
 +void
 +smp_wake_other_cpus_early(void)
 +{
++	// Parking an AP from the loader, and the deliberate reboots that back it
++	// up, exist for one machine's very narrow wake window. Everywhere else the
++	// kernel's own AP start works and this only adds risk, so do nothing.
++	if (!smp_early_wake_supported())
++		return;
++
 +	if (gKernelArgs.arch_args.apic_phys == 0 || gKernelArgs.num_cpus < 2)
 +		return;
 +
@@ -7517,7 +7507,7 @@ index 68acf3f830..11540a95bb 100644
 +	// this machine could not even re-configure, having no setup UI), and
 +	// nothing in this system arms RTC alarms. A magic high nibble keeps a
 +	// stale byte from a previous OS from being mistaken for a count.
-+	if (!reroll_is_for_this_machine()) {
++	if (!smp_early_wake_supported()) {
 +		dprintf("smp: early wake: AP unresponsive, and the deliberate-reboot "
 +			"reroll is gated off on this machine; continuing with one CPU\n");
 +	} else {
@@ -7663,7 +7653,7 @@ index 68acf3f830..11540a95bb 100644
  void
  smp_boot_other_cpus(void (*entryFunc)(void))
  {
-@@ -401,10 +1149,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -401,10 +1155,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  	uint32 trampolineStack = 0x9e000;
  #endif
  
@@ -7696,7 +7686,7 @@ index 68acf3f830..11540a95bb 100644
  	// boot the cpus
  	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
  		uint32 *finalStack;
-@@ -412,6 +1181,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -412,6 +1187,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		uint32 config;
  		uint32 numStartups;
  		uint32 j;
@@ -7704,7 +7694,7 @@ index 68acf3f830..11540a95bb 100644
  
  		// set this stack up
  		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
-@@ -422,15 +1192,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -422,15 +1198,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  				/ sizeof(uint32)) - 1;
  		*tempStack = (uint32)entryFunc;
  
@@ -7720,7 +7710,7 @@ index 68acf3f830..11540a95bb 100644
  		// put a gdt descriptor at the bottom of the stack
  		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT
  		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;
-@@ -444,78 +1205,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -444,78 +1211,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
  			DPL_KERNEL);
  
@@ -7978,7 +7968,7 @@ index 68acf3f830..11540a95bb 100644
  	}
  
  	TRACE(("done trampolining\n"));
-@@ -527,6 +1408,40 @@ smp_add_safemode_menus(Menu *menu)
+@@ -527,6 +1414,40 @@ smp_add_safemode_menus(Menu *menu)
  {
  	MenuItem *item;
  
@@ -8020,14 +8010,15 @@ index 68acf3f830..11540a95bb 100644
  		menu->AddItem(item = new(nothrow) MenuItem("Disable IO-APIC"));
  		item->SetType(MENU_ITEM_MARKABLE);
 diff --git a/src/system/boot/platform/bios_ia32/smp.h b/src/system/boot/platform/bios_ia32/smp.h
-index 4acda1622d..17d14bdf70 100644
+index 4acda1622d..4aa8bc5356 100644
 --- a/src/system/boot/platform/bios_ia32/smp.h
 +++ b/src/system/boot/platform/bios_ia32/smp.h
-@@ -18,6 +18,7 @@ extern "C" {
+@@ -18,6 +18,8 @@ extern "C" {
  #endif
  
  extern void smp_init(void);
-+extern void smp_wake_other_cpus_early(void);
++extern bool smp_early_wake_supported(void);
++void smp_wake_other_cpus_early(void);
  extern void smp_init_other_cpus(void);
  extern void smp_boot_other_cpus(void (*entryFunc)(void));
  
@@ -8116,78 +8107,60 @@ index 33a5ced675..ce4cc1b66a 100644
  	movl   %eax,%cr3        # set the page dir
  	
 diff --git a/src/system/boot/platform/bios_ia32/start.cpp b/src/system/boot/platform/bios_ia32/start.cpp
-index a651487cad..9c2099a5fe 100644
+index a651487cad..fa3e0e8d6e 100644
 --- a/src/system/boot/platform/bios_ia32/start.cpp
 +++ b/src/system/boot/platform/bios_ia32/start.cpp
-@@ -183,24 +183,78 @@ _start(void)
- 	args.heap_size = 0;
+@@ -184,23 +184,66 @@ _start(void)
  	args.arguments = NULL;
  
-+	// Stage timing, to find where the time before the SIPI actually goes.
-+	// The TSC counts from processor reset, so the first reading is how long
-+	// the BIOS spent in POST before the loader got control at all -- time no
-+	// change to this loader can recover.
-+	uint64 tscStart, tscSerial, tscInterrupts, tscCpu, tscMmu, tscAcpi, tscSmp;
-+	asm volatile ("rdtsc" : "=A" (tscStart));
-+
  	serial_init();
 -	serial_enable();
-+	//serial_enable();
-+	asm volatile ("rdtsc" : "=A" (tscSerial));
  	interrupts_init();
 -	console_init();
-+	asm volatile ("rdtsc" : "=A" (tscInterrupts));
++
++	// Only one machine needs the AP wake pulled ahead of everything that is not
++	// strictly required for it: its firmware will start a second CPU only within
++	// a window a few seconds wide from power-on. Buying that time costs the
++	// console, which then comes up after the wake instead of before it -- so on
++	// any machine that hangs in SMP bring-up there would be nothing on screen to
++	// say so. Everywhere else, keep upstream's order.
++	const bool earlyWake = smp_early_wake_supported();
++
++	if (!earlyWake)
++		console_init();
++
  	cpu_init();
-+	asm volatile ("rdtsc" : "=A" (tscCpu));
  	mmu_init();
-+	asm volatile ("rdtsc" : "=A" (tscMmu));
  	debug_init_post_mmu();
 +
-+	// Everything from here to smp_wake_other_cpus_early() is on the critical
-+	// path to the SIPI, because the window in which this machine will start an
-+	// AP at all is only a few seconds wide from power-on. Only what the wake
-+	// genuinely needs runs first: cpu_init() for CPUID, mmu_init() to map the
-+	// local APIC, and acpi_init() because smp_init() reads the MADT.
-+	//
-+	// console_init() (which switches video mode), check_for_boot_keys() (which
-+	// polls the keyboard) and apm_init() were all ahead of the wake and none of
-+	// them is needed by it, so they now run afterwards. Waking with the early
-+	// path alone was still landing on the edge of the window and failing most
-+	// boots with load_symbols on; this buys back the time they were spending.
-+	acpi_init();
-+	asm volatile ("rdtsc" : "=A" (tscAcpi));
-+	smp_init();
-+	asm volatile ("rdtsc" : "=A" (tscSmp));
-+	smp_wake_other_cpus_early();
++	if (earlyWake) {
++		// Only what the wake genuinely needs runs first: cpu_init() for CPUID,
++		// mmu_init() to map the local APIC, and acpi_init() because smp_init()
++		// reads the MADT. console_init() (a video mode switch),
++		// check_for_boot_keys() (polls the keyboard) and apm_init() are not
++		// needed by it and now follow it.
++		uint64 tscAcpi, tscSmp;
++		acpi_init();
++		asm volatile ("rdtsc" : "=A" (tscAcpi));
++		smp_init();
++		asm volatile ("rdtsc" : "=A" (tscSmp));
++		smp_wake_other_cpus_early();
 +
-+	// Printed only now: dprintf() is itself expensive enough to move the
-+	// numbers it would be reporting. 1330000 ticks is 1 ms at 1.33 GHz.
-+	// Convert with the loader's own PIT-calibrated clock rather than an
-+	// assumed clock rate. system_time() is valid once cpu_init() has run
-+	// calculate_cpu_conversion_factor(); reading it together with the TSC
-+	// gives the ratio needed to date the stages that ran before that.
-+	uint64 tscNow;
-+	asm volatile ("rdtsc" : "=A" (tscNow));
-+	uint64 usNow = (uint64)system_time();
++		// Printed only now: dprintf() is expensive enough to move the numbers
++		// it would be reporting. Converted with the loader's own PIT-calibrated
++		// clock rather than an assumed rate.
++		uint64 tscNow;
++		asm volatile ("rdtsc" : "=A" (tscNow));
++		uint64 usNow = (uint64)system_time();
++		dprintf("smp: stage ms -- acpi %" B_PRIu32 " smp_init %" B_PRIu32
++			" (uptime now %" B_PRIu32 " ms)\n",
++			(uint32)((((uint64)(tscSmp - tscAcpi)) * usNow / tscNow) / 1000ULL),
++			(uint32)((((uint64)(tscNow - tscSmp)) * usNow / tscNow) / 1000ULL),
++			(uint32)(usNow / 1000ULL));
 +
-+	#define TSC_TO_MS(t) ((uint32)((((uint64)(t)) * usNow / tscNow) / 1000ULL))
++		console_init();
++	}
 +
-+	dprintf("smp: stage ms -- bios_post %" B_PRIu32 " serial %" B_PRIu32
-+		" interrupts %" B_PRIu32 " cpu %" B_PRIu32 " mmu %" B_PRIu32
-+		" acpi %" B_PRIu32 " smp_init %" B_PRIu32 " (uptime now %" B_PRIu32
-+		" ms)\n",
-+		TSC_TO_MS(tscStart),
-+		TSC_TO_MS(tscSerial - tscStart),
-+		TSC_TO_MS(tscInterrupts - tscSerial),
-+		TSC_TO_MS(tscCpu - tscInterrupts),
-+		TSC_TO_MS(tscMmu - tscCpu),
-+		TSC_TO_MS(tscAcpi - tscMmu),
-+		TSC_TO_MS(tscSmp - tscAcpi),
-+		(uint32)(usNow / 1000ULL));
-+
-+	#undef TSC_TO_MS
-+
-+	console_init();
  	parse_multiboot_commandline(&args);
  
  	// reading the keyboard doesn't seem to work in graphics mode
@@ -8201,6 +8174,12 @@ index a651487cad..9c2099a5fe 100644
  	apm_init();
 -	acpi_init();
 -	smp_init();
++
++	if (!earlyWake) {
++		acpi_init();
++		smp_init();
++	}
++
  	hpet_init();
  	dump_multiboot_info();
  	main(&args);
@@ -8623,10 +8602,39 @@ index 2b8a8128d6..7d8dc18cac 100644
 -		asm volatile ("nop");
 -}
 diff --git a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp b/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
-index 9435811872..64064e554c 100644
+index 9435811872..19a659ba84 100644
 --- a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
 +++ b/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
-@@ -296,8 +296,8 @@ choose_link_device_configurations(acpi_module_info* acpi,
+@@ -292,12 +292,37 @@ choose_link_device_configurations(acpi_module_info* acpi,
+ 
+ 		irqUsage[chosenDescriptor.irq] += link->used_by.Count();
+ 
++		// A PCI interrupt pin is level triggered and active low by
++		// definition, whatever the link device's resource descriptor claims:
++		// that descriptor is an ISA-style IRQ resource template, and plenty of
++		// firmwares leave it saying edge/active-high because nothing ever read
++		// it back. Upstream already ignores it for the hardwired case -- see
++		// the noSource branch in read_irq_routing_table_entry(), which forces
++		// exactly these two values -- and the wire is the same whether the
++		// interrupt arrives through a fixed GSI or through a PIRQ router.
++		//
++		// Say so in the log when the firmware disagreed, though. This is a
++		// global override, and if it ever turns out to be wrong on some
++		// machine -- a PRT entry routing something that is not a real PCI
++		// INTx line -- that machine should cost one syslog line to diagnose
++		// rather than a bisection.
++		if (chosenDescriptor.polarity != B_LOW_ACTIVE_POLARITY
++				|| chosenDescriptor.trigger_mode != B_LEVEL_TRIGGERED) {
++			dprintf("acpi_irq_routing: link device reported irq %u as %s %s, "
++				"configuring it as level triggered active low anyway (PCI "
++				"INTx)\n", chosenDescriptor.irq,
++				chosenDescriptor.trigger_mode == B_LEVEL_TRIGGERED
++					? "level triggered" : "edge triggered",
++				chosenDescriptor.polarity == B_HIGH_ACTIVE_POLARITY
++					? "active high" : "active low");
++		}
++
+ 		for (int j = 0; j < link->used_by.Count(); j++) {
  			irq_routing_entry* irqEntry = link->used_by.ElementAt(j);
  			irqEntry->needs_configuration = j == 0; // only configure once
  			irqEntry->irq = chosenDescriptor.irq;
@@ -9571,6 +9579,40 @@ index f42bbd69df..23a324954d 100644
  
  private:
  			thread_id			fWriterThread;
+diff --git a/src/system/kernel/vm/VMAnonymousCache.cpp b/src/system/kernel/vm/VMAnonymousCache.cpp
+index 0571e30b99..8839ddd05c 100644
+--- a/src/system/kernel/vm/VMAnonymousCache.cpp
++++ b/src/system/kernel/vm/VMAnonymousCache.cpp
+@@ -1255,6 +1255,16 @@ VMAnonymousCache::_MergePagesSmallerConsumer(VMAnonymousCache* source)
+ 			ASSERT_PRINT(sourcePage->WiredCount() == 0
+ 					&& sourcePage->mappings.IsEmpty(),
+ 				"sourcePage: %p, page: %p", sourcePage, page);
++			// A page that has been written to is MODIFIED, and vm_page_free_etc()
++			// refuses those: it cannot tell which modified queue the page is on.
++			// VMCache::Delete() and _FreePageRange() both clear the state first;
++			// these two merge paths did not, and an anonymous page shadowed by a
++			// consumer is exactly the kind that is dirty. Observed as a panic in
++			// vm_page_free_etc() reached from here during team teardown.
++			if (sourcePage->State() == PAGE_STATE_MODIFIED) {
++				sourcePage->modified = false;
++				vm_page_set_state(sourcePage, PAGE_STATE_CACHED);
++			}
+ 			source->RemovePage(sourcePage);
+ 			vm_page_free_etc(source, sourcePage, &reservation);
+ 		}
+@@ -1307,6 +1317,12 @@ VMAnonymousCache::_MergeSwapPages(VMAnonymousCache* source)
+ 					if (page != NULL) {
+ 						DEBUG_PAGE_ACCESS_START(page);
+ 						ASSERT_PRINT(!page->busy, "page: %p", page);
++						// Same reason as in _MergePagesSmallerConsumer(): a dirty
++						// page cannot go straight to the free queue.
++						if (page->State() == PAGE_STATE_MODIFIED) {
++							page->modified = false;
++							vm_page_set_state(page, PAGE_STATE_CACHED);
++						}
+ 						source->RemovePage(page);
+ 						vm_page_free(source, page);
+ 					}
 diff --git a/src/system/kernel/vm/vm_page_writer.cpp b/src/system/kernel/vm/vm_page_writer.cpp
 index 5f64ffaa03..60991a0022 100644
 --- a/src/system/kernel/vm/vm_page_writer.cpp
