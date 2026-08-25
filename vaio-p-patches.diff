@@ -2439,7 +2439,7 @@ index edeba186d9..bfd203eea2 100644
  	mode &= info.shared_info->dpms_capabilities;
  
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
-index 3f3670c14f..121a9ec261 100644
+index 3f3670c14f..1f0c0da49e 100644
 --- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 +++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_ath.c
 @@ -72,6 +72,8 @@
@@ -2451,7 +2451,7 @@ index 3f3670c14f..121a9ec261 100644
  #include <net/if.h>
  #include <net/if_var.h>
  #include <net/if_dl.h>
-@@ -2504,6 +2506,75 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2504,6 +2506,148 @@ ath_bmiss_proc(void *arg, int pending)
  
  	ath_beacon_miss(sc);
  
@@ -2511,23 +2511,96 @@ index 3f3670c14f..121a9ec261 100644
 +	 * D3 may not come back at all until the machine is rebooted. So keep it
 +	 * to the device it was measured on: AR928X, 168c:002a.
 +	 */
-+	if (!associated && sc->sc_bmiss_count >= 3
++	/*
++	 * Once per boot, and only after restoring config space by hand.
++	 *
++	 * As first written this could not work, and on 2026-08-25 it was caught
++	 * doing the opposite of recovery: it fired, and everything from there to
++	 * the reboot is "bb hang detected (0x4), resetting" over and over. The
++	 * adapter never came back -- twice in one day, each time taking the
++	 * network out for the rest of the session.
++	 *
++	 * Haiku's pci_set_powerstate() is not FreeBSD's. It writes the PMCSR and
++	 * returns (src/libs/compat/freebsd_network/pci.cpp): there is no
++	 * pci_cfg_save()/pci_cfg_restore() around the transition the way newbus
++	 * does it. So coming out of D3 the device header is back at power-on
++	 * defaults and the BARs this driver mapped its registers through are
++	 * gone. Every register access after that reads open bus, which is exactly
++	 * what an unbroken run of bb hangs looks like.
++	 *
++	 * Hence: save the header, put it back, and check that the device answers.
++	 * Then re-initialise properly -- the ATH_RESET_NOLOSS below preserves the
++	 * link and assumes the chip kept its state, which after a power cycle it
++	 * certainly has not.
++	 *
++	 * And at most once. If a power cycle does not rescue the adapter, another
++	 * one will not either, and each attempt is a fresh chance to leave the
++	 * card unreachable until reboot.
++	 */
++	if (!associated && sc->sc_bmiss_count >= 3 && !sc->sc_did_power_cycle
 +	    && pci_get_vendor(sc->sc_dev) == 0x168c
 +	    && pci_get_device(sc->sc_dev) == 0x002a) {
++		uint32_t config[16];
++		uint32_t id;
++		int i;
++
++		sc->sc_did_power_cycle = 1;
 +		device_printf(sc->sc_dev,
 +		    "repeated beacon miss recovery, power-cycling the "
 +		    "adapter\n");
++
++		/* The whole type 0 header: BARs, command, cache line, latency. */
++		for (i = 0; i < 16; i++)
++			config[i] = pci_read_config(sc->sc_dev, i * 4, 4);
++
 +		pci_set_powerstate(sc->sc_dev, PCI_POWERSTATE_D3);
 +		DELAY(50000);
 +		pci_set_powerstate(sc->sc_dev, PCI_POWERSTATE_D0);
++
++		/* Skip 0x00 (IDs) and 0x08 (class/revision): both read-only. */
++		for (i = 0; i < 16; i++) {
++			if (i == 0 || i == 2)
++				continue;
++			pci_write_config(sc->sc_dev, i * 4, config[i], 4);
++		}
 +		pci_enable_busmaster(sc->sc_dev);
++
++		/*
++		 * Confirm the device is answering before trusting it. An ID that
++		 * no longer reads back means the header did not take and nothing
++		 * after this is going to work; say so, rather than leaving a
++		 * silent failure to be pieced together from a reboot.
++		 */
++		id = pci_read_config(sc->sc_dev, 0x00, 4);
++		if (id != config[0]) {
++			device_printf(sc->sc_dev,
++			    "adapter did not return from D3 (id reads 0x%08x, "
++			    "expected 0x%08x); wireless is down until reboot\n",
++			    id, config[0]);
++		}
++
 +		sc->sc_bmiss_count = 0;
++
++		/*
++		 * Full re-init: the chip kept nothing across the power cycle.
++		 * HAL_RESET_FORCE_COLD, not HAL_RESET_COLD -- the latter belongs
++		 * to a different, unnamed enum in ah.h and is not one of the
++		 * HAL_RESET_TYPE values ath_reset() takes.
++		 */
++		ath_reset(sc, ATH_RESET_FULL, HAL_RESET_FORCE_COLD);
++		ieee80211_beacon_miss(&sc->sc_ic);
++		sc->sc_syncbeacon = 1;
++
++		ATH_LOCK(sc);
++		ath_power_restore_power_state(sc);
++		ATH_UNLOCK(sc);
++		return;
 +	}
 +
  	/*
  	 * Do a reset upon any beacon miss event.
  	 *
-@@ -2516,8 +2587,8 @@ ath_bmiss_proc(void *arg, int pending)
+@@ -2516,8 +2660,8 @@ ath_bmiss_proc(void *arg, int pending)
  		    "bb hang detected (0x%x), resetting\n", hangs);
  	} else {
  		ath_reset(sc, ATH_RESET_NOLOSS, HAL_RESET_FORCE_COLD);
@@ -2538,16 +2611,21 @@ index 3f3670c14f..121a9ec261 100644
  	/* Force a beacon resync, in case they've drifted */
  	sc->sc_syncbeacon = 1;
 diff --git a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
-index 8302153b47..abcec9befd 100644
+index 8302153b47..eb05df258a 100644
 --- a/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
 +++ b/src/add-ons/kernel/drivers/network/wlan/atheroswifi/dev/ath/if_athvar.h
-@@ -595,6 +595,11 @@ struct ath_softc {
+@@ -595,6 +595,16 @@ struct ath_softc {
  	void 			(*sc_node_cleanup)(struct ieee80211_node *);
  	void 			(*sc_node_free)(struct ieee80211_node *);
  	device_t		sc_dev;
 +	int			sc_bmiss_count;	/* consecutive bmiss recoveries */
 +	int			sc_bmiss_last_tick;
 +	int			sc_bmiss_first_tick;
++	int			sc_did_power_cycle;
++		/* The D3/D0 escalation in ath_bmiss_proc() is allowed once per
++		   boot. A power cycle that fails to bring the adapter back
++		   cannot be improved on by repeating it, and each attempt is
++		   another opportunity to lose the card until reboot. */
 +		/* when the current run of recoveries started, so a burst can be
 +		   told from a condition that persists -- see ath_bmiss_proc() */
  	HAL_BUS_TAG		sc_st;		/* bus space tag */
