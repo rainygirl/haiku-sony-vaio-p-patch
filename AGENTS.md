@@ -6,7 +6,7 @@ Install and build instructions live in [`README.md`](README.md). This file is ev
 
 ## Patch baseline
 
-These patches are derived against, and verified on, nightly commit **`8b91c532fa` (hrev99002+148, 2026-08-15)**. `build-vaio-p-iso.sh` pins that exact commit rather than following `master`: haiku.git moves several times a day, and an unpinned build silently mixes an untested upstream state into an ISO whose entire purpose is booting one specific fragile machine. `HAIKU_GIT_REF=master` overrides it. They were originally written against the 2026-07-21 source; the earlier `r1beta6`-based version of the diff is in this file's git history.
+These patches are derived against, and verified on, nightly commit **`88b7b8b350` (hrev99002+209, 2026-08-24)**. `build-vaio-p-iso.sh` pins that exact commit rather than following `master`: haiku.git moves several times a day, and an unpinned build silently mixes an untested upstream state into an ISO whose entire purpose is booting one specific fragile machine. `HAIKU_GIT_REF=master` overrides it. They were originally written against the 2026-07-21 source; the earlier `r1beta6`-based version of the diff is in this file's git history.
 
 Some of the underlying bugs (e.g. the ACPICA Global Lock init race, ACPI IRQ trigger/polarity, PCI unaligned config access, the PS/2 multiplexer port-probing timeout, the USBKit `SetAlternate()` bug, the UHCI halt-recovery gap, all of the EHCI isochronous fixes, the UVC frame-index bug, and the SMP AP bring-up retry) are generic correctness issues, not VAIO-P-specific — they may already be fixed upstream by the time you apply this against a newer checkout. If a patch fails to apply, check whether it's already fixed before re-deriving it.
 
@@ -1415,7 +1415,7 @@ touch the same code.
 
 Note that `wt-new`, which the exported diff is generated from and which
 `generated.vaio-pin/Jamfile` points `HAIKU_TOP` at, sits on the **master** line
-(`8b91c532fa`), not on `r1beta6`. The beta6 rebase therefore does not affect
+(`88b7b8b350`), not on `r1beta6`. The beta6 rebase therefore does not affect
 either `vaio-p-patches.diff` or the ISO; those two lines are maintained in
 parallel and a fix has to be landed on both.
 
@@ -1453,7 +1453,7 @@ retrying the race. It fired once in 2h32m here, and has not fired in earlier
 multi-hour runs, so it is rare rather than deterministic.
 
 Both source trees in `/Volumes/HaikuBuild` already carry the fix -- `wt-new` at
-`8b91c532fa` (master, which the ISO is built from) and `haiku` after the rebase
+`88b7b8b350` (master, which the ISO is built from) and `haiku` after the rebase
 onto `origin/r1beta6`. **Only the installed kernel lacks it**, because that image
 was built on 2026-07-28 (`hrev99002+46`), eleven days before the fix landed. So
 the next ISO built from either tree resolves this with no patch work needed.

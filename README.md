@@ -43,7 +43,7 @@ cd tools/vaio-p
 ### Environment variables
 
 - `SKIP_CROSS_TOOLS=1` : Skip rebuilding the cross-compiler if it already exists (useful when only a patch changed — the cross-tools build alone takes ~1-1.5 hours).
-- `HAIKU_GIT_REF` : Branch/tag/commit of haiku.git to check out. Defaults to the pinned nightly commit `8b91c532fa` (see "Patch baseline" in [`AGENTS.md`](AGENTS.md)). Set it to `master` to track the tip instead; the patch may or may not still apply there.
+- `HAIKU_GIT_REF` : Branch/tag/commit of haiku.git to check out. Defaults to the pinned nightly commit `88b7b8b350` (see "Patch baseline" in [`AGENTS.md`](AGENTS.md)). Set it to `master` to track the tip instead; the patch may or may not still apply there.
 - `JOBS` : Parallelism for `configure`/`jam`. Defaults to `nproc`.
 
 ### Why `configure --distro-compatibility official`

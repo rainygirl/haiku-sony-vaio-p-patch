@@ -6,7 +6,7 @@ English version: [`AGENTS.md`](AGENTS.md).
 
 ## 패치 기준 시점
 
-이 패치들은 nightly 커밋 **`8b91c532fa`(hrev99002+148, 2026년 8월 15일)** 기준으로 작성하고 검증했습니다. `build-vaio-p-iso.sh`는 `master`를 따라가지 않고 이 커밋을 고정합니다 — haiku.git은 하루에도 여러 번 움직이는데, 고정하지 않으면 "특정 까다로운 기기 한 대에서 부팅되는 것"이 전부인 ISO에 검증되지 않은 업스트림 상태가 조용히 섞여 들어갑니다. `HAIKU_GIT_REF=master`로 덮어쓸 수 있습니다. 최초 작성은 2026년 7월 21일 소스 기준이었고, `r1beta6` 기준의 이전 diff는 이 파일의 git 히스토리에 남아 있습니다.
+이 패치들은 nightly 커밋 **`88b7b8b350`(hrev99002+209, 2026년 8월 24일)** 기준으로 작성하고 검증했습니다. `build-vaio-p-iso.sh`는 `master`를 따라가지 않고 이 커밋을 고정합니다 — haiku.git은 하루에도 여러 번 움직이는데, 고정하지 않으면 "특정 까다로운 기기 한 대에서 부팅되는 것"이 전부인 ISO에 검증되지 않은 업스트림 상태가 조용히 섞여 들어갑니다. `HAIKU_GIT_REF=master`로 덮어쓸 수 있습니다. 최초 작성은 2026년 7월 21일 소스 기준이었고, `r1beta6` 기준의 이전 diff는 이 파일의 git 히스토리에 남아 있습니다.
 
 일부 버그(ACPICA Global Lock 초기화 순서 문제, ACPI IRQ 트리거/극성, PCI 미정렬 config 접근, PS/2 멀티플렉서 포트 프로브 타임아웃, USBKit `SetAlternate()` 버그, UHCI halt 복구 미구현, EHCI isochronous 버그 일체, UVC frame index 버그, SMP AP 기동 재시도 등)는 VAIO P 전용이 아닌 범용 정합성 버그라서, 새 체크아웃을 받을 시점에는 이미 공식 소스에서 고쳐져 있을 수 있습니다. 패치가 적용되지 않으면 먼저 이미 수정됐는지 확인한 뒤 다시 작성해 주세요.
 

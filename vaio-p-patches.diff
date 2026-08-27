@@ -1,5 +1,5 @@
 diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
-index 873b97c49a..6203e94160 100644
+index 9bae1739c6..8c0cb3e324 100644
 --- a/build/jam/DefaultBuildProfiles
 +++ b/build/jam/DefaultBuildProfiles
 @@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
@@ -14,9 +14,40 @@ index 873b97c49a..6203e94160 100644
  				}
  			}
  
-@@ -161,6 +166,16 @@ rule DefineDefaultBuildProfiles
+@@ -159,8 +164,46 @@ rule DefineDefaultBuildProfiles
+ 				gcc2 @{
+ 					nano_x86@secondary_x86
  					p7zip_x86@secondary_x86
- 					xz_utils_x86@secondary_x86
+-					xz_utils_x86@secondary_x86
++					# Personal additions: dependencies for the vim_x86 and
++					# python3.14_x86 packages injected below as plain files
++					# into /system/packages (those two are newer than the
++					# pinned build-packages snapshot, so they can't come in
++					# through the normal repository path). Checked ALL of
++					# vim_x86's and python3.14_x86's `requires:` lines
++					# against what the pinned snapshot actually provides
++					# (via `package list -i`) up front, rather than
++					# discovering mismatches one boot at a time: of the
++					# combined dependency set, four -- xz_utils_x86,
++					# expat_x86, gettext_x86_libintl, zlib_x86 -- were
++					# stale enough in the pinned snapshot to fail with
++					# "nothing provides" at boot (their SONAME/ABI
++					# compat baseline had moved on since the snapshot was
++					# last synced), so those four are NOT listed here;
++					# current versions of each are injected as plain
++					# files below instead, alongside vim_x86/python3.14_x86
++					# themselves. Everything else below already satisfies
++					# both packages' requirements as pinned.
++					file
++					bzip2_x86@secondary_x86
++					gcc_x86_syslibs@secondary_x86
++					libedit_x86@secondary_x86
++					libffi_x86@secondary_x86
++					libiconv_x86@secondary_x86
++					ncurses6_x86@secondary_x86
++					openssl3_x86@secondary_x86
++					sqlite_x86@secondary_x86
++					zstd_x86@secondary_x86
  				}@
 +				# harfbuzz isn't in the default nightly image, so gcc2's
 +				# libfreetype -- which was linked against it -- logs
@@ -31,6 +62,62 @@ index 873b97c49a..6203e94160 100644
  				;
  			AddHaikuImageSourcePackages
  				nano
+@@ -169,6 +212,55 @@ rule DefineDefaultBuildProfiles
+ 
+ 			AddOptionalHaikuImagePackages Development Git ;
+ 
++			# Personal additions: vim and python3.14 are newer than the
++			# pinned build-packages snapshot (their .hpkg files were
++			# fetched by hand from the live HaikuPorts repository), so
++			# drop them into /system/packages as plain files; with no
++			# packages activation file on a fresh image, packagefs
++			# activates everything found in that directory at boot. Their
++			# library/command dependencies are pulled in through the
++			# regular repository path above.
++			local vaioPExtraPackages =
++				vim_x86-9.1.1618-1-x86_gcc2.hpkg
++				python3.14_x86-3.14.6-2-x86_gcc2.hpkg
++				expat_x86-2.8.2-1-x86_gcc2.hpkg
++				gettext_x86_libintl-1.0-1-x86_gcc2.hpkg
++				xz_utils_x86-5.8.3-1-x86_gcc2.hpkg
++				zlib_x86-1.3.2-1-x86_gcc2.hpkg
++				# zlib_x86_devel-1.3.1-4 is pulled in transitively by the
++				# Development optional package group and requires
++				# EXACTLY zlib_x86==1.3.1 -- so bumping zlib_x86 above to
++				# 1.3.2 to satisfy python3.14_x86 broke it the other way.
++				# Bring in the matching 1.3.2 devel package too so both
++				# halves agree.
++				zlib_x86_devel-1.3.2-1-x86_gcc2.hpkg ;
++			# Derived from HAIKU_TOP rather than written out, so this works
++			# wherever the tree is checked out. It used to be the absolute
++			# /haiku-build/vaio-p-packages, which is where the build
++			# container mounts this volume -- correct there and nowhere
++			# else, so the image target simply could not be made outside
++			# that container ("don't know how to make
++			# vim_x86-...-x86_gcc2.hpkg", once per file). The packages
++			# directory sits beside the source tree in both places, which
++			# is what this expresses.
++			SEARCH on $(vaioPExtraPackages)
++				= [ FDirName $(HAIKU_TOP) .. vaio-p-packages ] ;
++
++			# And only for a build that actually has an x86_gcc2 secondary
++			# architecture. Every file here is an x86_gcc2 package: the
++			# repository packages above are already gated behind gcc2 @{ }@
++			# for that reason, but this injection was not, so a plain x86 or
++			# x86_64 image got a set of packages whose architecture it does
++			# not have. They cannot resolve at boot, and there is nothing
++			# for them to be a dependency of.
++			if x86_gcc2 in $(HAIKU_PACKAGING_ARCHS) {
++				AddFilesToHaikuImage system packages
++					: $(vaioPExtraPackages) ;
++			} else {
++				Echo "vaio-p: skipping the x86_gcc2 package injection,"
++					"HAIKU_PACKAGING_ARCHS is $(HAIKU_PACKAGING_ARCHS)" ;
++			}
++
+ 			# WebPositive can only built for x86_gcc2, x86 and x86_64
+ 			if $(HAIKU_PACKAGING_ARCHS) in x86_gcc2 x86 x86_64 {
+ 				AddOptionalHaikuImagePackages WebPositive ;
 diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
 index cb649a080c..5974d85d23 100644
 --- a/build/jam/images/definitions/regular
@@ -99,6 +186,24 @@ index 8195ada16b..ba9e21fb77 100644
  	;
  
  if $(TARGET_ARCH) = x86 || $(TARGET_ARCH) = x86_64 {
+diff --git a/data/launch/user b/data/launch/user
+index d15a4d19e3..7aa9e8f44d 100644
+--- a/data/launch/user
++++ b/data/launch/user
+@@ -32,6 +32,13 @@ target desktop {
+ 		no_safemode
+ 	}
+ 
++	service x-vnd.Haiku-bluetooth_server {
++		launch /system/servers/bluetooth_server
++		no_safemode
++		on initial_volumes_mounted
++		requires x-vnd.Be-TSKB
++	}
++
+ 	job user-bootscript {
+ 		launch /bin/sh ~/config/settings/boot/UserBootscript
+ 	}
 diff --git a/data/system/data/firmware/intel-ucode/06-1c-02 b/data/system/data/firmware/intel-ucode/06-1c-02
 new file mode 100644
 index 0000000000000000000000000000000000000000..db30b527acac77bd773d7b83acbf60c82743debc
@@ -462,67 +567,11 @@ index 0000000000..5b5572699c
 +
 +
 +#endif	/* _BACKLIGHT_MODULE_H */
-diff --git a/headers/private/kernel/arch/x86/arch_kernel_args.h b/headers/private/kernel/arch/x86/arch_kernel_args.h
-index 694ef851a2..91be4cd561 100644
---- a/headers/private/kernel/arch/x86/arch_kernel_args.h
-+++ b/headers/private/kernel/arch/x86/arch_kernel_args.h
-@@ -20,8 +20,8 @@
- // kernel args
- typedef struct {
- 	// architecture specific
--	uint32	_unused1; // previously: system_time_cv_factor
--	uint64	_unused2; // previously: cpu_clock_speed
-+	uint32	system_time_cv_factor;
-+	uint64	cpu_clock_speed;
- 	uint32	phys_pgdir;
- 	uint64	vir_pgdir;
- 	uint32	num_pgtables;
-diff --git a/headers/private/kernel/arch/x86/timer.h b/headers/private/kernel/arch/x86/timer.h
-index 7c4d340804..9219f9ef7b 100644
---- a/headers/private/kernel/arch/x86/timer.h
-+++ b/headers/private/kernel/arch/x86/timer.h
-@@ -1,17 +1,13 @@
--/*
-- * Copyright 2026, Haiku, Inc. All rights reserved.
-- * Distributed under the terms of the MIT License.
-- */
-+/* 
-+** Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
-+** Distributed under the terms of the NewOS License.
-+*/
- #ifndef _KERNEL_ARCH_X86_TIMER
- #define _KERNEL_ARCH_X86_TIMER
- 
--
--extern uint32 gSystemTimeConversionFactor;
--extern int64 gCPUClockSpeed;
--
--
--void x86_init_tsc(kernel_args* args);
--
-+#define ISA_TIMER_MODULE_NAME "timers/x86/isa/v1"
-+#define APIC_TIMER_MODULE_NAME "timers/x86/apic/v1"
-+#define HPET_TIMER_MODULE_NAME "timers/x86/hpet/v1"
- 
- #endif
- 
-diff --git a/headers/private/kernel/boot/arch/x86/arch_cpu.h b/headers/private/kernel/boot/arch/x86/arch_cpu.h
-index 25fd7c1102..62e1c88c45 100644
---- a/headers/private/kernel/boot/arch/x86/arch_cpu.h
-+++ b/headers/private/kernel/boot/arch/x86/arch_cpu.h
-@@ -17,6 +17,7 @@ extern "C" {
- #endif
- 
- 
-+void determine_cpu_conversion_factor(uint8 channel);
- status_t boot_arch_cpu_init(void);
- void arch_ucode_load(BootVolume& volume);
- 
 diff --git a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
-index d3ceae1c5d..c1dc30408c 100644
+index a34a24dfe9..403a52384e 100644
 --- a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
 +++ b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
-@@ -462,7 +462,6 @@ bluetooth_std_ops(int32 op, ...)
+@@ -465,7 +465,6 @@ bluetooth_std_ops(int32 op, ...)
  			mutex_init(&sListLock, "bluetooth devices");
  
  			// status = InitializeAclConnectionThread();
@@ -581,10 +630,10 @@ index ab68836056..f88332b1a0 100644
      return_ACPI_STATUS (Status);
  }
 diff --git a/src/add-ons/kernel/bus_managers/pci/pci.cpp b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-index f3da703e64..23b213b357 100644
+index 597047bd1f..b892ef39ed 100644
 --- a/src/add-ons/kernel/bus_managers/pci/pci.cpp
 +++ b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-@@ -1620,13 +1620,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1792,13 +1792,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -618,7 +667,7 @@ index f3da703e64..23b213b357 100644
  	status_t status = (*info->controller->read_pci_config)(info->controller_cookie,
  		bus, device, function, offset, size, value);
  	if (status != B_OK) {
-@@ -1676,13 +1694,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1848,13 +1866,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -2640,6 +2689,24 @@ index b929cd9759..b3bf398fce 100644
  SubInclude HAIKU_TOP src add-ons kernel drivers power amd_thermal ;
  SubInclude HAIKU_TOP src add-ons kernel drivers power pch_thermal ;
 +SubInclude HAIKU_TOP src add-ons kernel drivers power sony_ec ;
+diff --git a/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp b/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp
+index dbe94dc8db..b6ebe17afc 100644
+--- a/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp
++++ b/src/add-ons/kernel/drivers/power/acpi_lid/acpi_lid.cpp
+@@ -118,6 +118,13 @@ acpi_lid_read(void* _cookie, off_t position, void *buf, size_t* num_bytes)
+ 	if (*num_bytes < 1)
+ 		return B_IO_ERROR;
+ 
++	// Note: deliberately no "position > 0 means EOF" check here. The consumer
++	// (power_daemon's LidMonitor) keeps a single descriptor open and reads from
++	// it once per notification, so its file position keeps advancing. With an
++	// EOF check, every read after the first one returned 0 bytes without ever
++	// clearing "updated" below -- leaving the select pool permanently
++	// signalled, which spun power_daemon at 100% CPU from the first lid-open
++	// onwards. acpi_button has always worked this way.
+ 	if (user_memcpy(buf, &device->last_status, sizeof(uint8)) < B_OK)
+ 		return B_BAD_ADDRESS;
+ 
 diff --git a/src/add-ons/kernel/drivers/power/sony_ec/Jamfile b/src/add-ons/kernel/drivers/power/sony_ec/Jamfile
 new file mode 100644
 index 0000000000..f7d6080a04
@@ -3435,39 +3502,6 @@ index 0000000000..8e2760c67c
 +	(module_info *)&sSonyEcBacklightModule,
 +	NULL
 +};
-diff --git a/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp b/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
-index 85a13ce8cd..3340a457c2 100644
---- a/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
-+++ b/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
-@@ -527,13 +527,27 @@ EndpointManager::Unbind(TCPEndpoint* endpoint)
- 	TRACE(("EndpointManager::Unbind(%p)\n", endpoint));
- 	T(Unbind(endpoint));
- 
--	if (endpoint == NULL || !endpoint->IsBound()) {
-+	if (endpoint == NULL) {
- 		TRACE(("  endpoint is unbound.\n"));
- 		return B_BAD_VALUE;
- 	}
- 
-+	// The bound check has to happen under the write lock: it reads the local
-+	// address' sa_len, and the code below clears that same field under the
-+	// lock. Checked before taking the lock (as this used to), two concurrent
-+	// Unbind() calls could both pass the check, serialize on the lock, and
-+	// the loser then panicked on the failed hash removal ("bound endpoint %p
-+	// not in hash!") -- observed on a Sony VAIO P the first day its second
-+	// logical CPU actually ran: thread 109 "sshd" tearing down a TCPEndpoint
-+	// on CPU 1 while its socket was concurrently freed. Unreachable with one
-+	// CPU, which is why it survived this long.
- 	WriteLocker _(fLock);
- 
-+	if (!endpoint->IsBound()) {
-+		TRACE(("  endpoint is unbound.\n"));
-+		return B_BAD_VALUE;
-+	}
-+
- 	if (!fEndpointHash.Remove(endpoint))
- 		panic("bound endpoint %p not in hash!", endpoint);
- 
 diff --git a/src/add-ons/kernel/power/cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/Jamfile
 index 81306a7e6b..01097bf66c 100644
 --- a/src/add-ons/kernel/power/cpufreq/Jamfile
@@ -5517,173 +5551,6 @@ index 6156d5ece5..6aa280af88 100644
  			status_t			_LaunchFinishScript(BPath& path);
  
  			status_t			_PerformInstall(partition_id sourcePartitionID,
-diff --git a/src/kits/app/Roster.cpp b/src/kits/app/Roster.cpp
-index 13131e1c31..925fecc9ea 100644
---- a/src/kits/app/Roster.cpp
-+++ b/src/kits/app/Roster.cpp
-@@ -404,6 +404,121 @@ query_for_app(const char* signature, entry_ref* appRef)
- }
- 
- 
-+/*!	Returns whether the file at \a ref carries the application signature
-+	\a signature.
-+*/
-+static bool
-+app_has_signature(const entry_ref& ref, const char* signature)
-+{
-+	BFile file;
-+	if (file.SetTo(&ref, B_READ_ONLY) != B_OK)
-+		return false;
-+
-+	BAppFileInfo appFileInfo;
-+	if (appFileInfo.SetTo(&file) != B_OK)
-+		return false;
-+
-+	char foundSignature[B_MIME_TYPE_LENGTH];
-+	if (appFileInfo.GetSignature(foundSignature) != B_OK)
-+		return false;
-+
-+	// Matched case-insensitively, as query_for_app() does on its second pass.
-+	return strcasecmp(foundSignature, signature) == 0;
-+}
-+
-+
-+/*!	Searches the standard application directories for an application with the
-+	given \a signature.
-+
-+	The last resort when query_for_app() could not look anywhere. That function
-+	only searches volumes that both know queries and carry a BEOS:APP_SIG
-+	index, and skips every other volume deliberately -- so on a system booted
-+	from a live ISO9660 session it searches nothing at all and reports
-+	B_LAUNCH_FAILED_APP_NOT_FOUND.
-+
-+	That case is not hypothetical: app hints in the MIME database are written
-+	when the image is built and name paths on the *build* machine, so they
-+	never resolve on the booted system. Together, a stale hint and an
-+	unqueryable boot volume made every signature-based launch fail on a live
-+	medium -- which is how FirstBootPrompt, and with it the whole installer,
-+	silently failed to appear while the desktop itself came up fine.
-+
-+	\a hintName, when not NULL and not empty, is the file name taken from the
-+	stale app hint. It is tried directly in each directory first, which costs
-+	a couple of stat() calls instead of a full directory scan in the case that
-+	matters -- the hint's path is wrong, but its file name is not.
-+*/
-+static status_t
-+find_app_in_standard_directories(const char* signature, const char* hintName,
-+	entry_ref* appRef)
-+{
-+	if (signature == NULL || appRef == NULL)
-+		return B_BAD_VALUE;
-+
-+	const directory_which kDirectories[] = {
-+		B_SYSTEM_APPS_DIRECTORY,
-+		B_SYSTEM_PREFERENCES_DIRECTORY,
-+		B_SYSTEM_BIN_DIRECTORY,
-+		B_SYSTEM_SERVERS_DIRECTORY,
-+		B_SYSTEM_NONPACKAGED_BIN_DIRECTORY,
-+		B_USER_APPS_DIRECTORY,
-+		B_USER_NONPACKAGED_BIN_DIRECTORY,
-+	};
-+	const size_t kDirectoryCount
-+		= sizeof(kDirectories) / sizeof(kDirectories[0]);
-+
-+	// The name from the stale hint, tried directly.
-+	if (hintName != NULL && hintName[0] != '\0') {
-+		for (size_t i = 0; i < kDirectoryCount; i++) {
-+			BPath path;
-+			if (find_directory(kDirectories[i], &path) != B_OK)
-+				continue;
-+			if (path.Append(hintName) != B_OK)
-+				continue;
-+
-+			BEntry entry;
-+			entry_ref ref;
-+			if (entry.SetTo(path.Path(), true) != B_OK || !entry.IsFile()
-+				|| entry.GetRef(&ref) != B_OK) {
-+				continue;
-+			}
-+
-+			if (app_has_signature(ref, signature)
-+				&& can_app_be_used(&ref) == B_OK) {
-+				*appRef = ref;
-+				return B_OK;
-+			}
-+		}
-+	}
-+
-+	// Otherwise scan them.
-+	for (size_t i = 0; i < kDirectoryCount; i++) {
-+		BPath path;
-+		if (find_directory(kDirectories[i], &path) != B_OK)
-+			continue;
-+
-+		BDirectory directory;
-+		if (directory.SetTo(path.Path()) != B_OK)
-+			continue;
-+
-+		entry_ref ref;
-+		while (directory.GetNextRef(&ref) == B_OK) {
-+			BEntry entry;
-+			if (entry.SetTo(&ref, true) != B_OK || !entry.IsFile())
-+				continue;
-+
-+			if (app_has_signature(ref, signature)
-+				&& can_app_be_used(&ref) == B_OK) {
-+				*appRef = ref;
-+				return B_OK;
-+			}
-+		}
-+	}
-+
-+	return B_LAUNCH_FAILED_APP_NOT_FOUND;
-+}
-+
-+
- //	#pragma mark - app_info
- 
- 
-@@ -2506,6 +2621,7 @@ BRoster::_TranslateType(const char* mimeType, BMimeType* appMeta,
- 
- 		// Check, whether the signature is installed and has an app hint
- 		bool appFound = false;
-+		BString staleHintName;
- 		if (error == B_OK && appMeta->GetAppHint(appRef) == B_OK) {
- 			// Resolve symbolic links, if necessary
- 			BEntry entry;
-@@ -2513,16 +2629,30 @@ BRoster::_TranslateType(const char* mimeType, BMimeType* appMeta,
- 				&& entry.GetRef(appRef) == B_OK) {
- 				appFound = true;
- 			} else {
--				// Bad app hint -- remove it
-+				// Bad app hint -- remember the file name it named before
-+				// dropping it, the directory search below can use it.
-+				staleHintName = appRef->name;
- 				appMeta->SetAppHint(NULL);
- 			}
- 		}
- 
- 		// In case there is no app hint or it is invalid, we need to query for
- 		// the app.
--		if (error == B_OK && !appFound)
-+		if (error == B_OK && !appFound) {
- 			error = query_for_app(appMeta->Type(), appRef);
- 
-+			if (error != B_OK) {
-+				// The query searches only volumes carrying a BEOS:APP_SIG
-+				// index and silently skips the rest, so on a live ISO9660
-+				// session it had nowhere to look. Search the standard
-+				// application directories before giving up.
-+				if (find_app_in_standard_directories(appMeta->Type(),
-+						staleHintName.String(), appRef) == B_OK) {
-+					error = B_OK;
-+				}
-+			}
-+		}
-+
- 		if (error == B_OK)
- 			error = appFile->SetTo(appRef, B_READ_ONLY);
- 
 diff --git a/src/kits/device/USBEndpoint.cpp b/src/kits/device/USBEndpoint.cpp
 index fd0d629f67..c07874ea8d 100644
 --- a/src/kits/device/USBEndpoint.cpp
@@ -6479,462 +6346,6 @@ index 948b9b4d6f..d1b1225f3c 100644
  };
  
  #endif	// AUTOCONFIG_LOOPER_H
-diff --git a/src/system/boot/arch/arm64/arch_cpu.cpp b/src/system/boot/arch/arm64/arch_cpu.cpp
-index 90ab3c7f60..d2d9a11059 100644
---- a/src/system/boot/arch/arm64/arch_cpu.cpp
-+++ b/src/system/boot/arch/arm64/arch_cpu.cpp
-@@ -28,3 +28,31 @@ arch_ucode_load(BootVolume& volume)
- {
- 	// Yes, we have no bananas!
- }
-+
-+
-+extern "C" bigtime_t
-+system_time()
-+{
-+
-+	#warning Implement system_time in ARM64 bootloader!
-+	//https://en.wikipedia.org/wiki/Time_Stamp_Counter
-+	// read system time register:  cntpct_el0 / cntvct_el0
-+	// frequency of the system timer can be discovered by reading cntfrq_el0
-+	// https://wiki.osdev.org/ARMv7_Generic_Timers#CNTPCT
-+
-+	uint64_t ticks;
-+	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(ticks));
-+	//conversion factor stuff
-+	return ticks;
-+	//return u64_mul_u64_fp32_64(ticks, ns_per_cntpct);
-+}
-+
-+
-+extern "C" void
-+spin(bigtime_t microseconds)
-+{
-+	auto time = system_time();
-+
-+	while ((system_time() - time) < microseconds)
-+		asm volatile ("yield;");
-+}
-diff --git a/src/system/boot/arch/riscv64/arch_cpu.cpp b/src/system/boot/arch/riscv64/arch_cpu.cpp
-index ab1518c90e..89eb07bff5 100644
---- a/src/system/boot/arch/riscv64/arch_cpu.cpp
-+++ b/src/system/boot/arch/riscv64/arch_cpu.cpp
-@@ -54,3 +54,20 @@ arch_ucode_load(BootVolume& volume)
- {
- 	// NOP on riscv currently
- }
-+
-+
-+extern "C" bigtime_t
-+system_time()
-+{
-+	// TODO: units conversion
-+	return CpuTime();
-+}
-+
-+
-+extern "C" void
-+spin(bigtime_t microseconds)
-+{
-+	bigtime_t time = system_time();
-+	while ((system_time() - time) < microseconds)
-+		asm volatile ("nop;");
-+}
-diff --git a/src/system/boot/arch/x86/arch_cpu.cpp b/src/system/boot/arch/x86/arch_cpu.cpp
-index 2e30916043..a130843372 100644
---- a/src/system/boot/arch/x86/arch_cpu.cpp
-+++ b/src/system/boot/arch/x86/arch_cpu.cpp
-@@ -23,6 +23,351 @@
- 
- #include <string.h>
- 
-+#include <x86intrin.h>
-+
-+
-+uint32 gTimeConversionFactor;
-+
-+// PIT definitions
-+#define TIMER_CLKNUM_HZ					(14318180 / 12)
-+
-+// PIT IO Ports
-+#define PIT_CHANNEL_PORT_BASE			0x40
-+#define PIT_CONTROL						0x43
-+
-+// Channel selection
-+#define PIT_SELECT_CHANNEL_SHIFT		6
-+
-+// Access mode
-+#define PIT_ACCESS_LATCH_COUNTER		(0 << 4)
-+#define PIT_ACCESS_LOW_BYTE_ONLY		(1 << 4)
-+#define PIT_ACCESS_HIGH_BYTE_ONLY		(2 << 4)
-+#define PIT_ACCESS_LOW_THEN_HIGH_BYTE	(3 << 4)
-+
-+// Operating modes
-+#define PIT_MODE_INTERRUPT_ON_0			(0 << 1)
-+#define PIT_MODE_HARDWARE_COUNTDOWN		(1 << 1)
-+#define PIT_MODE_RATE_GENERATOR			(2 << 1)
-+#define PIT_MODE_SQUARE_WAVE_GENERATOR	(3 << 1)
-+#define PIT_MODE_SOFTWARE_STROBE		(4 << 1)
-+#define PIT_MODE_HARDWARE_STROBE		(5 << 1)
-+
-+// BCD/Binary mode
-+#define PIT_BINARY_MODE					0
-+#define PIT_BCD_MODE					1
-+
-+// Channel 2 control (speaker)
-+#define PIT_CHANNEL_2_CONTROL			0x61
-+#define PIT_CHANNEL_2_GATE_HIGH			0x01
-+#define PIT_CHANNEL_2_SPEAKER_OFF_MASK	~0x02
-+
-+// Maximum values
-+#define MAX_QUICK_SAMPLES				20
-+#define MAX_SLOW_SAMPLES				20
-+	// TODO: These are arbitrary. They are here to avoid spinning indefinitely
-+	// if the TSC just isn't stable and we can't get our desired error range.
-+
-+
-+#ifdef __SIZEOF_INT128__
-+typedef unsigned __int128 uint128;
-+#else
-+struct uint128 {
-+	uint128(uint64 low, uint64 high = 0)
-+		:
-+		low(low),
-+		high(high)
-+	{
-+	}
-+
-+	bool operator<(const uint128& other) const
-+	{
-+		return high < other.high || (high == other.high && low < other.low);
-+	}
-+
-+	bool operator<=(const uint128& other) const
-+	{
-+		return !(other < *this);
-+	}
-+
-+	uint128 operator<<(int count) const
-+	{
-+		if (count == 0)
-+			return *this;
-+
-+		if (count >= 128)
-+			return 0;
-+
-+		if (count >= 64)
-+			return uint128(0, low << (count - 64));
-+
-+		return uint128(low << count, (high << count) | (low >> (64 - count)));
-+	}
-+
-+	uint128 operator>>(int count) const
-+	{
-+		if (count == 0)
-+			return *this;
-+
-+		if (count >= 128)
-+			return 0;
-+
-+		if (count >= 64)
-+			return uint128(high >> (count - 64), 0);
-+
-+		return uint128((low >> count) | (high << (64 - count)), high >> count);
-+	}
-+
-+	uint128 operator+(const uint128& other) const
-+	{
-+		uint64 resultLow = low + other.low;
-+		return uint128(resultLow,
-+			high + other.high + (resultLow < low ? 1 : 0));
-+	}
-+
-+	uint128 operator-(const uint128& other) const
-+	{
-+		uint64 resultLow = low - other.low;
-+		return uint128(resultLow,
-+			high - other.high - (resultLow > low ? 1 : 0));
-+	}
-+
-+	uint128 operator*(uint32 other) const
-+	{
-+		uint64 resultMid = (low >> 32) * other;
-+		uint64 resultLow = (low & 0xffffffff) * other + (resultMid << 32);
-+		return uint128(resultLow,
-+			high * other + (resultMid >> 32)
-+				+ (resultLow < resultMid << 32 ? 1 : 0));
-+	}
-+
-+	uint128 operator/(const uint128& other) const
-+	{
-+		int shift = 0;
-+		uint128 shiftedDivider = other;
-+		while (shiftedDivider.high >> 63 == 0 && shiftedDivider < *this) {
-+			shiftedDivider = shiftedDivider << 1;
-+			shift++;
-+		}
-+
-+		uint128 result = 0;
-+		uint128 temp = *this;
-+		for (; shift >= 0; shift--, shiftedDivider = shiftedDivider >> 1) {
-+			if (shiftedDivider <= temp) {
-+				result = result + (uint128(1) << shift);
-+				temp = temp - shiftedDivider;
-+			}
-+		}
-+
-+		return result;
-+	}
-+
-+	operator uint64() const
-+	{
-+		return low;
-+	}
-+
-+private:
-+	uint64	low;
-+	uint64	high;
-+};
-+#endif
-+
-+
-+static inline uint64_t
-+rdtsc_fenced()
-+{
-+	// RDTSC is not serializing, nor does it drain the instruction stream.
-+	// RDTSCP does, but is not available everywhere. Other OSes seem to use
-+	// "CPUID" rather than MFENCE/LFENCE for serializing here during boot.
-+	asm volatile ("cpuid" : : : "eax", "ebx", "ecx", "edx");
-+
-+	return __rdtsc();
-+}
-+
-+
-+static inline void
-+calibration_loop(uint8 desiredHighByte, uint8 channel, uint64& tscDelta,
-+	double& conversionFactor, uint16& expired)
-+{
-+	uint8 select = channel << PIT_SELECT_CHANNEL_SHIFT;
-+	out8(select | PIT_ACCESS_LOW_THEN_HIGH_BYTE | PIT_MODE_INTERRUPT_ON_0
-+		| PIT_BINARY_MODE, PIT_CONTROL);
-+
-+	// Fill in count of 0xffff, low then high byte
-+	uint8 channelPort = PIT_CHANNEL_PORT_BASE + channel;
-+	out8(0xff, channelPort);
-+	out8(0xff, channelPort);
-+
-+	// Read the count back once to delay the start. This ensures that we've
-+	// waited long enough for the counter to actually start counting down, as
-+	// this only happens on the next clock cycle after reload.
-+	in8(channelPort);
-+	in8(channelPort);
-+
-+	// We're expecting the PIT to be at the starting position (high byte 0xff)
-+	// as we just programmed it, but if it isn't we wait for it to wrap.
-+	uint8 startLow;
-+	uint8 startHigh;
-+	do {
-+		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
-+		startLow = in8(channelPort);
-+		startHigh = in8(channelPort);
-+	} while (startHigh != 255);
-+
-+	// Read in the first TSC value
-+	uint64 startTSC = rdtsc_fenced();
-+
-+	// Wait for the PIT to count down to our desired value
-+	uint8 endLow;
-+	uint8 endHigh;
-+	do {
-+		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
-+		endLow = in8(channelPort);
-+		endHigh = in8(channelPort);
-+	} while (endHigh > desiredHighByte);
-+
-+	// And read the second TSC value
-+	uint64 endTSC = rdtsc_fenced();
-+
-+	tscDelta = endTSC - startTSC;
-+	expired = ((startHigh << 8) | startLow) - ((endHigh << 8) | endLow);
-+	conversionFactor = (double)tscDelta / (double)expired;
-+}
-+
-+
-+static void
-+calculate_cpu_conversion_factor(uint8 channel)
-+{
-+	// When using channel 2, enable the input and disable the speaker.
-+	if (channel == 2) {
-+		uint8 control = in8(PIT_CHANNEL_2_CONTROL);
-+		control &= PIT_CHANNEL_2_SPEAKER_OFF_MASK;
-+		control |= PIT_CHANNEL_2_GATE_HIGH;
-+		out8(control, PIT_CHANNEL_2_CONTROL);
-+	}
-+
-+	uint64 tscDeltaQuick, tscDeltaSlower, tscDeltaSlow;
-+	double conversionFactorQuick, conversionFactorSlower, conversionFactorSlow;
-+	uint16 expired;
-+
-+	uint32 quickSampleCount = 1;
-+	uint32 slowSampleCount = 1;
-+
-+quick_sample:
-+	calibration_loop(224, channel, tscDeltaQuick, conversionFactorQuick,
-+		expired);
-+
-+slower_sample:
-+	calibration_loop(192, channel, tscDeltaSlower, conversionFactorSlower,
-+		expired);
-+
-+	double deviation = conversionFactorQuick / conversionFactorSlower;
-+	if (deviation < 0.99 || deviation > 1.01) {
-+		// We might have been hit by a SMI or were otherwise stalled
-+		if (quickSampleCount++ < MAX_QUICK_SAMPLES)
-+			goto quick_sample;
-+	}
-+
-+	// Slow sample
-+	calibration_loop(128, channel, tscDeltaSlow, conversionFactorSlow,
-+		expired);
-+
-+	deviation = conversionFactorSlower / conversionFactorSlow;
-+	if (deviation < 0.99 || deviation > 1.01) {
-+		// We might have been hit by a SMI or were otherwise stalled
-+		if (slowSampleCount++ < MAX_SLOW_SAMPLES)
-+			goto slower_sample;
-+	}
-+
-+	// Scale the TSC delta to timer units
-+	tscDeltaSlow *= TIMER_CLKNUM_HZ;
-+
-+	uint64 clockSpeed = tscDeltaSlow / expired;
-+	gTimeConversionFactor = ((uint128(expired) * uint32(1000000)) << 32)
-+		/ uint128(tscDeltaSlow);
-+
-+#ifdef TRACE_CPU
-+	if (clockSpeed > 1000000000LL) {
-+		dprintf("CPU at %lld.%03Ld GHz\n", clockSpeed / 1000000000LL,
-+			(clockSpeed % 1000000000LL) / 1000000LL);
-+	} else {
-+		dprintf("CPU at %lld.%03Ld MHz\n", clockSpeed / 1000000LL,
-+			(clockSpeed % 1000000LL) / 1000LL);
-+	}
-+#endif
-+
-+	gKernelArgs.arch_args.system_time_cv_factor = gTimeConversionFactor;
-+	gKernelArgs.arch_args.cpu_clock_speed = clockSpeed;
-+	//dprintf("factors: %lu %llu\n", gTimeConversionFactor, clockSpeed);
-+
-+	if (quickSampleCount > 1) {
-+		dprintf("needed %" B_PRIu32 " quick samples for TSC calibration\n",
-+			quickSampleCount);
-+	}
-+
-+	if (slowSampleCount > 1) {
-+		dprintf("needed %" B_PRIu32 " slow samples for TSC calibration\n",
-+			slowSampleCount);
-+	}
-+
-+	if (channel == 2) {
-+		// Set the gate low again
-+		out8(in8(PIT_CHANNEL_2_CONTROL) & ~PIT_CHANNEL_2_GATE_HIGH,
-+			PIT_CHANNEL_2_CONTROL);
-+	}
-+}
-+
-+
-+void
-+determine_cpu_conversion_factor(uint8 channel)
-+{
-+	// Before using the calibration loop, check if we are on a hypervisor.
-+	cpuid_info info;
-+	if (get_current_cpuid(&info, 1, 0) == B_OK
-+			&& (info.regs.ecx & IA32_FEATURE_EXT_HYPERVISOR) != 0) {
-+		get_current_cpuid(&info, 0x40000000, 0);
-+		const uint32 maxVMM = info.regs.eax;
-+
-+		if (maxVMM >= 0x40000010) {
-+			get_current_cpuid(&info, 0x40000010, 0);
-+
-+			uint64 clockSpeed = uint64(info.regs.eax) * 1000;
-+			gTimeConversionFactor = (uint64(1000) << 32) / info.regs.eax;
-+
-+			gKernelArgs.arch_args.system_time_cv_factor = gTimeConversionFactor;
-+			gKernelArgs.arch_args.cpu_clock_speed = clockSpeed;
-+
-+			dprintf("TSC frequency read from hypervisor CPUID leaf\n");
-+			return;
-+		}
-+
-+		if (maxVMM >= 0x40000003) {
-+			// Hyper-V does not implement the standard hypervisor timing interface
-+			// "Hv#1" here indicates Hyper-V
-+			get_current_cpuid(&info, 0x40000001, 0);
-+			if (info.regs.eax == 0x31237648) {
-+				// Check for HV_X64_MSR_TSC_FREQUENCY presence
-+				// TSC frequency is represented in Hz
-+				get_current_cpuid(&info, 0x40000003, 0);
-+				if ((info.regs.eax & (1 << 11)) != 0) {
-+					uint64 clockSpeed = x86_read_msr(0x40000022);
-+					if (clockSpeed > 0) {
-+						gTimeConversionFactor = (uint64(1000000) << 32) / clockSpeed;
-+
-+						gKernelArgs.arch_args.system_time_cv_factor = gTimeConversionFactor;
-+						gKernelArgs.arch_args.cpu_clock_speed = clockSpeed;
-+
-+						dprintf("TSC frequency read from Hyper-V MSR\n");
-+						return;
-+					}
-+				}
-+			}
-+		}
-+	}
-+
-+	calculate_cpu_conversion_factor(channel);
-+}
-+
- 
- void
- ucode_load(BootVolume& volume)
-@@ -90,6 +435,26 @@ ucode_load(BootVolume& volume)
- }
- 
- 
-+extern "C" bigtime_t
-+system_time()
-+{
-+	uint64 tsc = rdtsc_fenced();
-+	uint64 lo = (uint32)tsc;
-+	uint64 hi = tsc >> 32;
-+	return ((lo * gTimeConversionFactor) >> 32) + hi * gTimeConversionFactor;
-+}
-+
-+
-+extern "C" void
-+spin(bigtime_t microseconds)
-+{
-+	bigtime_t time = system_time();
-+
-+	while ((system_time() - time) < microseconds)
-+		asm volatile ("pause;");
-+}
-+
-+
- extern "C" status_t
- boot_arch_cpu_init()
- {
-diff --git a/src/system/boot/platform/bios_ia32/Jamfile b/src/system/boot/platform/bios_ia32/Jamfile
-index c8893e4372..ca0a16c793 100644
---- a/src/system/boot/platform/bios_ia32/Jamfile
-+++ b/src/system/boot/platform/bios_ia32/Jamfile
-@@ -39,7 +39,6 @@ for platform in [ MultiBootSubDirSetup bios_ia32 ] {
- 			smp.cpp
- 			smp_trampoline.S
- 			support.S
--			timer.cpp
- 			video.cpp
- 			apm.cpp
- 			interrupts.cpp
 diff --git a/src/system/boot/platform/bios_ia32/bios.h b/src/system/boot/platform/bios_ia32/bios.h
 index df0ab58757..461c944179 100644
 --- a/src/system/boot/platform/bios_ia32/bios.h
@@ -6947,43 +6358,69 @@ index df0ab58757..461c944179 100644
  
  #ifdef __cplusplus
  }
-diff --git a/src/system/boot/platform/bios_ia32/cpu.cpp b/src/system/boot/platform/bios_ia32/cpu.cpp
-index 4bcb0acf55..8185a62023 100644
---- a/src/system/boot/platform/bios_ia32/cpu.cpp
-+++ b/src/system/boot/platform/bios_ia32/cpu.cpp
-@@ -65,6 +65,8 @@ cpu_init()
- 	if (check_cpu_features() != B_OK)
- 		panic("You need a Pentium or higher in order to boot!\n");
+diff --git a/src/system/boot/platform/bios_ia32/debug.cpp b/src/system/boot/platform/bios_ia32/debug.cpp
+index 4df7424eaf..3793422a13 100644
+--- a/src/system/boot/platform/bios_ia32/debug.cpp
++++ b/src/system/boot/platform/bios_ia32/debug.cpp
+@@ -26,8 +26,21 @@
  
-+	determine_cpu_conversion_factor(0);
-+
- 	gKernelArgs.num_cpus = 1;
- 		// this will eventually be corrected later on
+ static const char* const kDebugSyslogSignature = "Haiku syslog";
+ 
+-static char sBuffer[16384];
++// Everything dprintf()s before debug_cleanup() runs is accumulated here, and
++// only what fits is handed to the kernel. 16 KB was not enough on this
++// machine: the PCI scan in smp_early_usb_handoff(), acpi_init() and smp_init()
++// between them fill it before smp_wake_other_cpus_early() gets to say anything,
++// so every message about the wake -- the whole reason for the code -- was
++// dropped, and dropped silently. That made the SMI masking impossible to
++// verify from the syslog and sent me looking at the on-screen output instead.
++//
++// It cannot simply write to sDebugSyslogBuffer as soon as that exists:
++// debug_init_post_mmu() recovers the *previous* session's log into the same
++// ring, and debug_cleanup() is what extracts it. So a flat buffer is
++// structurally necessary here; it just has to be big enough.
++static char sBuffer[65536];
+ static uint32 sBufferPosition;
++static bool sBufferTruncated = false;
+ 
+ static ring_buffer* sDebugSyslogBuffer = NULL;
+ static bool sPostCleanup = false;
+@@ -41,6 +54,19 @@ syslog_write(const char* buffer, size_t length)
+ 	} else if (sBufferPosition + length < sizeof(sBuffer)) {
+ 		memcpy(sBuffer + sBufferPosition, buffer, length);
+ 		sBufferPosition += length;
++	} else if (!sBufferTruncated) {
++		// Say so once, in the space deliberately left for it, rather than
++		// letting the log simply stop mid-boot with no indication that
++		// anything is missing. Silent truncation is how the loader's account
++		// of its own SMP bring-up went missing on this machine.
++		sBufferTruncated = true;
++		const char* marker = "\n[boot loader syslog buffer full; "
++			"later output dropped]\n";
++		size_t markerLength = strlen(marker);
++		if (sBufferPosition + markerLength < sizeof(sBuffer)) {
++			memcpy(sBuffer + sBufferPosition, marker, markerLength);
++			sBufferPosition += markerLength;
++		}
+ 	}
  }
+ 
 diff --git a/src/system/boot/platform/bios_ia32/devices.cpp b/src/system/boot/platform/bios_ia32/devices.cpp
-index f52f068155..8535aafea9 100644
+index f52f068155..484279715d 100644
 --- a/src/system/boot/platform/bios_ia32/devices.cpp
 +++ b/src/system/boot/platform/bios_ia32/devices.cpp
-@@ -238,6 +238,39 @@ get_ext_drive_parameters(uint8 drive, drive_parameters *targetParameters)
+@@ -238,6 +238,31 @@ get_ext_drive_parameters(uint8 drive, drive_parameters *targetParameters)
  }
  
  
-+/*!	Whether EDD reports the boot drive on an ATA interface.
++/*!	Whether the drive the BIOS booted us from is an ATA device.
 +
-+	Exists for one caller: the loader's pre-wake EHCI BIOS handoff
-+	(smp_early_usb_handoff() in smp.cpp), which must never run when the boot
-+	medium is read through the BIOS's own USB machinery -- killing the BIOS's
-+	USB SMIs while it still had INT 13h reads to serve broke the very next
-+	partition scan on real hardware (bytes_per_sector came back 0 and
-+	BIOSDrive::ReadAt() died on a divide error, "Boot Loader Death Land").
-+	Only an explicit EDD 3.0 answer of "ATA" (which also covers ATAPI)
-+	counts; USB, anything else, or any failure to answer means "not safe",
-+	so the default is to skip.
-+
-+	Uses only gBootDriveID (set by shell.S from DL before any C code) and a
-+	BIOS call, so it is safe long before platform device init.
++	smp_early_usb_handoff() needs this: taking USB away from the BIOS is only
++	safe when the BIOS's USB machinery is not what INT 13h is reading the boot
++	volume through. Booting from a USB stick it is, so the handoff is skipped
++	and the AP wake has to live with the BIOS perturbing its timing.
 +*/
-+extern "C" bool
++bool
 +platform_boot_drive_is_ata(void)
 +{
 +	drive_parameters parameters;
@@ -7005,7 +6442,7 @@ index f52f068155..8535aafea9 100644
  get_drive_parameters(uint8 drive, drive_parameters *parameters)
  {
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 68acf3f830..0da96ec9d3 100644
+index 68acf3f830..98b64a4bc9 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
 @@ -10,6 +10,7 @@
@@ -7031,7 +6468,7 @@ index 68acf3f830..0da96ec9d3 100644
  #include "mmu.h"
  #include "acpi.h"
  
-@@ -379,6 +382,757 @@ smp_init_other_cpus(void)
+@@ -379,6 +382,862 @@ smp_init_other_cpus(void)
  }
  
  
@@ -7271,6 +6708,18 @@ index 68acf3f830..0da96ec9d3 100644
 +{
 +}
 +
++
++static void
++smp_mask_global_smi(void)
++{
++}
++
++
++static void
++smp_restore_global_smi(void)
++{
++}
++
 +#else	// !_PXE_ENV
 +
 +// Raw PCI configuration mechanism 1. The loader has no PCI module; these
@@ -7409,6 +6858,92 @@ index 68acf3f830..0da96ec9d3 100644
 +	}
 +}
 +
++
++
++static uint16 sSmiEnPort = 0;
++static uint32 sSavedSmiEn = 0;
++
++
++/*!	Stops the chipset generating SMIs for the length of the wake.
++
++	The EHCI handoff above removes one SMI source. It is not the only one: the
++	chipset can also raise SMIs for power management, GPEs and the TCO timer,
++	and every SMI takes *both* logical processors of this single-core-plus-HT
++	part into SMM. While the firmware is servicing one, the sibling cannot be
++	starting, which is exactly what the failed boots look like from here -- the
++	AP never executes its first instruction and the APIC reports no error.
++
++	GBL_SMI_EN (bit 0 of SMI_EN, at PMBASE+0x30 on this chipset, PMBASE being
++	the I/O BAR at LPC config offset 0x40) gates all of them. It is cleared
++	only across the INIT/SIPI attempts and put back immediately afterwards:
++	leaving the firmware without SMIs for the whole session would cost it
++	thermal and battery handling.
++*/
++static void
++smp_mask_global_smi(void)
++{
++	// Find the LPC bridge by its ID rather than assuming a slot: this chipset
++	// does not put it where the ICH convention would.
++	uint8 lpcBus = 0, lpcDevice = 0xff, lpcFunction = 0;
++	for (uint8 device = 0; device < 32 && lpcDevice == 0xff; device++) {
++		for (uint8 function = 0; function < 8; function++) {
++			if (pci_cfg_read(0, device, function, 0x00, 4) == 0x81198086) {
++				lpcDevice = device;
++				lpcFunction = function;
++				break;
++			}
++		}
++	}
++	if (lpcDevice == 0xff) {
++		dprintf("smp: no SCH LPC bridge found; leaving SMI sources alone\n");
++		return;
++	}
++
++	// Report the base-address candidates instead of guessing which offset
++	// holds the power-management block on this part.
++	dprintf("smp: LPC 8086:8119 at %u:%u:%u, cfg 0x40..0x4c = %#" B_PRIx32
++		" %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 "\n",
++		lpcBus, lpcDevice, lpcFunction,
++		pci_cfg_read(lpcBus, lpcDevice, lpcFunction, 0x40, 4),
++		pci_cfg_read(lpcBus, lpcDevice, lpcFunction, 0x44, 4),
++		pci_cfg_read(lpcBus, lpcDevice, lpcFunction, 0x48, 4),
++		pci_cfg_read(lpcBus, lpcDevice, lpcFunction, 0x4c, 4));
++
++	uint32 pmbase = pci_cfg_read(lpcBus, lpcDevice, lpcFunction, 0x40, 4);
++	if ((pmbase & 1) == 0) {
++		dprintf("smp: LPC cfg 0x40 is not an I/O base; not touching SMI_EN\n");
++		return;
++	}
++	uint16 base = (uint16)(pmbase & 0xff80);
++	if (base == 0)
++		return;
++
++	sSmiEnPort = base + 0x30;
++	sSavedSmiEn = in32(sSmiEnPort);
++	dprintf("smp: chipset SMI_EN at %#x reads %#" B_PRIx32 "%s\n",
++		sSmiEnPort, sSavedSmiEn,
++		(sSavedSmiEn & 1) != 0
++			? " -- GBL_SMI_EN set, clearing it for the wake"
++			: " -- GBL_SMI_EN already clear");
++
++	if ((sSavedSmiEn & 1) == 0) {
++		sSmiEnPort = 0;
++		return;
++	}
++	out32(sSavedSmiEn & ~(uint32)1, sSmiEnPort);
++}
++
++
++static void
++smp_restore_global_smi(void)
++{
++	if (sSmiEnPort == 0)
++		return;
++	out32(sSavedSmiEn, sSmiEnPort);
++	dprintf("smp: chipset SMI_EN restored to %#" B_PRIx32 "\n", sSavedSmiEn);
++	sSmiEnPort = 0;
++}
++
 +#endif	// !_PXE_ENV
 +
 +
@@ -7494,6 +7029,9 @@ index 68acf3f830..0da96ec9d3 100644
 +	// Silence the BIOS's USB SMIs before the first INIT goes out -- see the
 +	// function's comment for why this decides whether the AP starts at all.
 +	smp_early_usb_handoff();
++
++	// ... and then the rest of the chipset's SMI sources, for the wake only.
++	smp_mask_global_smi();
 +
 +	if (gKernelArgs.arch_args.apic == NULL) {
 +		gKernelArgs.arch_args.apic = (void *)mmu_map_physical_memory(
@@ -7590,6 +7128,10 @@ index 68acf3f830..0da96ec9d3 100644
 +
 +		sStalledAttempts += sStallSliceCount != 0 ? 1 : 0;
 +	}
++
++	// The AP has either started or it is not going to; either way the firmware
++	// gets its SMIs back before anything else runs.
++	smp_restore_global_smi();
 +
 +	// Give the firmware-mediated path a moment beyond the IPI one: if the AP
 +	// comes back through the BIOS and the 40:67 pointer, it does so on the
@@ -7789,7 +7331,7 @@ index 68acf3f830..0da96ec9d3 100644
  void
  smp_boot_other_cpus(void (*entryFunc)(void))
  {
-@@ -401,10 +1155,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -401,10 +1260,31 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  	uint32 trampolineStack = 0x9e000;
  #endif
  
@@ -7822,7 +7364,7 @@ index 68acf3f830..0da96ec9d3 100644
  	// boot the cpus
  	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
  		uint32 *finalStack;
-@@ -412,6 +1187,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -412,6 +1292,7 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		uint32 config;
  		uint32 numStartups;
  		uint32 j;
@@ -7830,7 +7372,7 @@ index 68acf3f830..0da96ec9d3 100644
  
  		// set this stack up
  		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;
-@@ -422,15 +1198,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -422,15 +1303,6 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  				/ sizeof(uint32)) - 1;
  		*tempStack = (uint32)entryFunc;
  
@@ -7846,7 +7388,7 @@ index 68acf3f830..0da96ec9d3 100644
  		// put a gdt descriptor at the bottom of the stack
  		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT
  		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;
-@@ -444,78 +1211,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -444,78 +1316,198 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		set_segment_descriptor(&tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,
  			DPL_KERNEL);
  
@@ -8104,7 +7646,7 @@ index 68acf3f830..0da96ec9d3 100644
  	}
  
  	TRACE(("done trampolining\n"));
-@@ -527,6 +1414,40 @@ smp_add_safemode_menus(Menu *menu)
+@@ -527,6 +1519,40 @@ smp_add_safemode_menus(Menu *menu)
  {
  	MenuItem *item;
  
@@ -8243,10 +7785,10 @@ index 33a5ced675..ce4cc1b66a 100644
  	movl   %eax,%cr3        # set the page dir
  	
 diff --git a/src/system/boot/platform/bios_ia32/start.cpp b/src/system/boot/platform/bios_ia32/start.cpp
-index a651487cad..fa3e0e8d6e 100644
+index ab4d055082..7bd4b5b27c 100644
 --- a/src/system/boot/platform/bios_ia32/start.cpp
 +++ b/src/system/boot/platform/bios_ia32/start.cpp
-@@ -184,23 +184,66 @@ _start(void)
+@@ -182,12 +182,51 @@ _start(void)
  	args.arguments = NULL;
  
  	serial_init();
@@ -8300,12 +7842,8 @@ index a651487cad..fa3e0e8d6e 100644
  	parse_multiboot_commandline(&args);
  
  	// reading the keyboard doesn't seem to work in graphics mode
- 	// (maybe a bochs problem)
- 	sBootOptions = check_for_boot_keys();
--//	if (sBootOptions & BOOT_OPTION_DEBUG_OUTPUT)
--//		serial_enable();
-+	if (sBootOptions & BOOT_OPTION_DEBUG_OUTPUT)
-+		serial_enable();
+@@ -197,8 +236,12 @@ _start(void)
+ //		serial_enable();
  
  	apm_init();
 -	acpi_init();
@@ -8319,72 +7857,6 @@ index a651487cad..fa3e0e8d6e 100644
  	hpet_init();
  	dump_multiboot_info();
  	main(&args);
-diff --git a/src/system/boot/platform/bios_ia32/timer.cpp b/src/system/boot/platform/bios_ia32/timer.cpp
-deleted file mode 100644
-index 7edf10046a..0000000000
---- a/src/system/boot/platform/bios_ia32/timer.cpp
-+++ /dev/null
-@@ -1,60 +0,0 @@
--/*
-- * Copyright 2026, Haiku, Inc.. All rights reserved.
-- * Distributed under the terms of the MIT License.
-- */
--
--#include <KernelExport.h>
--#include <kernel.h>
--
--#include "bios.h"
--
--
--static uint64
--get_ticks()
--{
--	struct bios_regs regs;
--	regs.eax = 0x00;
--	call_bios(0x1A, &regs);
--	if ((regs.flags & CARRY_FLAG) != 0)
--		return 0;
--
--	const uint64 kTicksPerDay = 0x1800b0;
--	return (((regs.ecx << 16) | regs.edx) + regs.eax * kTicksPerDay);
--}
--
--
--extern "C" bigtime_t
--system_time()
--{
--	uint64 ticks = get_ticks();
--
--	// Convert to microseconds. Algebraically simplified version of:
--	// ticks * (1000 * 1000) / (kTicksPerDay / (24 * 60 * 60))
--	return (ticks * 1080000000) / 19663;
--}
--
--
--extern "C" void
--spin(bigtime_t microseconds)
--{
--	struct bios_regs regs;
--	regs.eax = 0x8600;
--	regs.edx = microseconds & 0xFFFF;
--	regs.ecx = microseconds << 16;
--	call_bios(0x15, &regs);
--
--	if ((regs.flags & CARRY_FLAG) != 0) {
--		// Fall back to INT 1A. (Unfortunately this has a granularity of ~54.9ms.)
--		uint64 target = get_ticks();
--		if (target == 0)
--			return;
--
--		uint64 ticks = HOWMANY(microseconds, 55 * 1000);
--		if (ticks < 2)
--			ticks = 2;
--
--		target += ticks;
--		while (get_ticks() < target)
--			asm volatile("pause");
--	}
--}
 diff --git a/src/system/boot/platform/bios_ia32/video.cpp b/src/system/boot/platform/bios_ia32/video.cpp
 index 30b5b69088..ba3a5ffdd3 100644
 --- a/src/system/boot/platform/bios_ia32/video.cpp
@@ -8403,340 +7875,6 @@ index 30b5b69088..ba3a5ffdd3 100644
  	sMode = sDefaultMode;
  	return B_OK;
  }
-diff --git a/src/system/boot/platform/efi/arch/arm/Jamfile b/src/system/boot/platform/efi/arch/arm/Jamfile
-index 4ce4c95a2b..565e3f06a9 100644
---- a/src/system/boot/platform/efi/arch/arm/Jamfile
-+++ b/src/system/boot/platform/efi/arch/arm/Jamfile
-@@ -25,6 +25,7 @@ for platform in [ MultiBootSubDirSetup efi ] {
- 			entry.S
- 			cache.S
- 			relocation_func.cpp
-+			arch_cpu.cpp
- 			arch_dtb.cpp
- 			arch_mmu.cpp
- 			arch_smp.cpp
-diff --git a/src/system/boot/platform/efi/arch/arm/arch_cpu.cpp b/src/system/boot/platform/efi/arch/arm/arch_cpu.cpp
-new file mode 100644
-index 0000000000..433f9228d2
---- /dev/null
-+++ b/src/system/boot/platform/efi/arch/arm/arch_cpu.cpp
-@@ -0,0 +1,31 @@
-+/*
-+ * Copyright 2012-2022, Haiku, Inc. All rights reserved.
-+ * Distributed under the terms of the MIT License.
-+ *
-+ * Copyright 2004-2005, Axel Dörfler, axeld@pinc-software.de. All rights reserved.
-+ * Distributed under the terms of the MIT License.
-+ */
-+
-+
-+#include "cpu.h"
-+#include "efi_platform.h"
-+
-+#include <OS.h>
-+#include <boot/platform.h>
-+#include <boot/arch/arm/arch_cpu.h>
-+
-+
-+bigtime_t
-+system_time()
-+{
-+	#warning Implement system_time in ARM bootloader!
-+	static bigtime_t sSystemTimeCounter = 0;
-+	return sSystemTimeCounter++;
-+}
-+
-+
-+void
-+spin(bigtime_t microseconds)
-+{
-+	kBootServices->Stall(microseconds);
-+}
-diff --git a/src/system/boot/platform/efi/arch/x86/arch_smp.cpp b/src/system/boot/platform/efi/arch/x86/arch_smp.cpp
-index 82460be728..20f087b829 100644
---- a/src/system/boot/platform/efi/arch/x86/arch_smp.cpp
-+++ b/src/system/boot/platform/efi/arch/x86/arch_smp.cpp
-@@ -15,15 +15,12 @@
- 
- #include <kernel.h>
- #include <safemode.h>
--
- #include <boot/platform.h>
- #include <boot/stage2.h>
- #include <boot/menu.h>
--
- #include <arch/x86/apic.h>
- #include <arch/x86/arch_cpu.h>
- #include <arch/x86/arch_system_info.h>
--#include <arch/x86/arch_hpet.h>
- 
- #include "mmu.h"
- #include "acpi.h"
-@@ -38,7 +35,6 @@
- #	define TRACE(x...) ;
- #endif
- 
--
- void copy_trampoline_code(uint64 trampolineCode, uint64 trampolineStack);
- void prepare_trampoline_args(uint64 trampolineCode, uint64 trampolineStack,
- 	uint32 pagedir, uint64 kernelEntry, addr_t virtKernelArgs,
-@@ -48,30 +44,6 @@ uint32 get_sentinel(uint64 trampolineStack);
- static bool sX2APIC = false;
- 
- 
--static void
--hpet_spin(bigtime_t microseconds)
--{
--	// Other CPUs are booted after ExitBootServices, so we can't use spin().
--	// Use the HPET (which we conveniently don't need to calibrate) instead.
--	static hpet_regs* hpet = NULL;
--	if (hpet == NULL) {
--		platform_kernel_address_to_bootloader_address(gKernelArgs.arch_args.hpet.Get(),
--			(void**)&hpet);
--	}
--
--	uint64 originalConfig = hpet->config;
--	hpet->config |= HPET_CONF_MASK_ENABLED;
--
--	uint64 end = hpet->u0.counter64
--		+ ((microseconds * 1000000000ULL) / HPET_GET_PERIOD(hpet));
--	while (hpet->u0.counter64 < end)
--		asm volatile("pause");
--
--	hpet->config = originalConfig;
--}
--#define spin hpet_spin
--
--
- static uint32
- apic_read(uint32 offset)
- {
-@@ -85,7 +57,6 @@ apic_write(uint32 offset, uint32 data)
- 	*(volatile uint32 *)((addr_t)gKernelArgs.arch_args.apic_phys + offset) = data;
- }
- 
--
- static uint32
- apic_error_status()
- {
-@@ -347,7 +318,7 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
- 			spin(200);
- 
- 			while (!apic_interrupt_delivered())
--				asm volatile ("pause");
-+				asm volatile ("pause;");
- 		}
- 
- 		// Wait for the trampoline code to clear the final stack location.
-diff --git a/src/system/boot/platform/efi/arch/x86/arch_timer.cpp b/src/system/boot/platform/efi/arch/x86/arch_timer.cpp
-index 00106dd53d..8dbe031ee6 100644
---- a/src/system/boot/platform/efi/arch/x86/arch_timer.cpp
-+++ b/src/system/boot/platform/efi/arch/x86/arch_timer.cpp
-@@ -19,5 +19,9 @@
- void
- arch_timer_init(void)
- {
-+	// use PIT channel 2 for the calibration loop
-+	// as channel 0 is reserved for the UEFI firmware
-+	determine_cpu_conversion_factor(2);
-+
- 	hpet_init();
- }
-diff --git a/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp b/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp
-index 6da6158f97..73049e288f 100644
---- a/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp
-+++ b/src/system/boot/platform/efi/arch/x86_64/arch_timer.cpp
-@@ -19,5 +19,6 @@
- void
- arch_timer_init(void)
- {
-+	determine_cpu_conversion_factor(2);
- 	hpet_init();
- }
-diff --git a/src/system/boot/platform/efi/timer.cpp b/src/system/boot/platform/efi/timer.cpp
-index 0e6515ab94..25f89b3a7b 100644
---- a/src/system/boot/platform/efi/timer.cpp
-+++ b/src/system/boot/platform/efi/timer.cpp
-@@ -1,60 +1,31 @@
- /*
-- * Copyright 2026, Haiku, Inc. All rights reserved.
-+ * Copyright 2008, Dustin Howett, dustin.howett@gmail.com. All rights reserved.
-+ * Copyright 2004-2010, Axel Dörfler, axeld@pinc-software.de.
-  * Distributed under the terms of the MIT License.
-+ *
-+ * Copyright 2001, Travis Geiselbrecht. All rights reserved.
-+ * Distributed under the terms of the NewOS License.
- */
- 
-+
- #include "timer.h"
- 
-+#include <string.h>
- #include <KernelExport.h>
- 
- #include "arch_timer.h"
--#include "efi_platform.h"
--
--
--static bigtime_t sSystemTime = 0;
--static efi_event sSystemTimeTickEvent;
--
--
--EFIAPI static void
--system_time_tick(efi_event, void*)
--{
--	sSystemTime += 50 * 1000; /* 50ms, in microseconds */
--}
--
--
--bigtime_t
--system_time()
--{
--	// EFI does not have any mechanism to fetch a current time with a guaranteed
--	// subsecond precision, so use a timer event. To avoid unnecessary overhead,
--	// we limit it to 50ms granularity, and only start it when first needed.
--	if (sSystemTimeTickEvent == NULL) {
--		efi_status status = kBootServices->CreateEvent(EVT_TIMER | EVT_NOTIFY_SIGNAL,
--			TPL_CALLBACK, system_time_tick, NULL, &sSystemTimeTickEvent);
--		if (status == EFI_SUCCESS) {
--			status = kBootServices->SetTimer(sSystemTimeTickEvent, TimerPeriodic,
--				500000 /* 50ms, in 100ns units */);
--		}
--		if (status != EFI_SUCCESS)
--			panic("Can't start system_time event!");
--	}
--
--	return sSystemTime;
--}
--
--
--void
--spin(bigtime_t microseconds)
--{
--	kBootServices->Stall(microseconds);
--}
- 
- 
--// #pragma mark -
-+//#define TRACE_TIMER
-+#ifdef TRACE_TIMER
-+#	define TRACE(x) dprintf x
-+#else
-+#	define TRACE(x) ;
-+#endif
- 
- 
- void
--timer_init()
-+timer_init(void)
- {
- 	arch_timer_init();
- }
-diff --git a/src/system/boot/platform/generic/video_splash.cpp b/src/system/boot/platform/generic/video_splash.cpp
-index 5b5931c912..a600f3064d 100644
---- a/src/system/boot/platform/generic/video_splash.cpp
-+++ b/src/system/boot/platform/generic/video_splash.cpp
-@@ -14,7 +14,15 @@
- #include <boot/platform/generic/video.h>
- #include <boot/platform/generic/video_blitter.h>
- 
-+// <boot/images.h> defines every splash image as a static array. This
-+// distribution draws no logo, so the two kSplashLogo* arrays are unused while
-+// the icons and the palette are still needed. An unused static is fatal under
-+// -Werror, so suppress that one diagnostic for this include instead of keeping
-+// dead drawing code -- which also keeps the logo data out of the loader.
-+#pragma GCC diagnostic push
-+#pragma GCC diagnostic ignored "-Wunused-variable"
- #include <boot/images.h>
-+#pragma GCC diagnostic pop
- #include <boot/platform/generic/video_splash.h>
- 
- #include <stdio.h>
-@@ -133,41 +141,14 @@ video_display_splash(addr_t frameBuffer)
- 	for (; pos < size; pos++)
- 		*(char*)(frameBuffer + pos) = 0;
- 
--	uint8* uncompressedLogo = NULL;
--	unsigned int uncompressedSize = kSplashLogoWidth * kSplashLogoHeight;
--	switch (gKernelArgs.frame_buffer.depth) {
--		case 8:
--			platform_set_palette(k8BitPalette);
--			uncompressedLogo = (uint8*)malloc(uncompressedSize);
--			if (uncompressedLogo == NULL)
--				return B_NO_MEMORY;
--
--			uncompress(kSplashLogo8BitCompressedImage,
--				sizeof(kSplashLogo8BitCompressedImage), uncompressedLogo,
--				uncompressedSize);
--		break;
--		default: // 24 bits is assumed here
--			uncompressedSize *= 3;
--			uncompressedLogo = (uint8*)malloc(uncompressedSize);
--			if (uncompressedLogo == NULL)
--				return B_NO_MEMORY;
-+	// This distribution does not use the Haiku logo, so none is drawn and the
-+	// boot screen stays blank apart from the progress icons below. The 8-bit
-+	// palette the logo path used to install is still needed for those icons.
-+	if (gKernelArgs.frame_buffer.depth == 8)
-+		platform_set_palette(k8BitPalette);
- 
--			uncompress(kSplashLogo24BitCompressedImage,
--				sizeof(kSplashLogo24BitCompressedImage), uncompressedLogo,
--				uncompressedSize);
--		break;
--	}
--
--	// TODO: support 4-bit indexed version of the images!
--
--	// render splash logo
- 	int width, height, x, y;
--	compute_splash_logo_placement(gKernelArgs.frame_buffer.width, gKernelArgs.frame_buffer.height,
--		width, height, x, y);
--	video_blit_image(frameBuffer, uncompressedLogo, width, height,
--		kSplashLogoWidth, x, y);
--
--	free(uncompressedLogo);
-+	unsigned int uncompressedSize;
- 
- 	const uint8* lowerHalfIconImage;
- 	uncompressedSize = kSplashIconsWidth * kSplashIconsHeight;
-diff --git a/src/system/boot/platform/pxe_ia32/Jamfile b/src/system/boot/platform/pxe_ia32/Jamfile
-index a8c4e7bd96..49ce6b7c28 100644
---- a/src/system/boot/platform/pxe_ia32/Jamfile
-+++ b/src/system/boot/platform/pxe_ia32/Jamfile
-@@ -33,7 +33,6 @@ local bios_ia32_src =
- 	acpi.cpp
- 	smp.cpp
- 	support.S
--	timer.cpp
- 	video.cpp
- 	apm.cpp
- 	interrupts.cpp
-diff --git a/src/system/boot/platform/riscv/cpu.cpp b/src/system/boot/platform/riscv/cpu.cpp
-index 2b8a8128d6..7d8dc18cac 100644
---- a/src/system/boot/platform/riscv/cpu.cpp
-+++ b/src/system/boot/platform/riscv/cpu.cpp
-@@ -47,20 +47,3 @@ platform_load_ucode(BootVolume& volume)
- {
- 	// we have no ucode
- }
--
--
--extern "C" bigtime_t
--system_time()
--{
--	// TODO: units conversion
--	return CpuTime();
--}
--
--
--extern "C" void
--spin(bigtime_t microseconds)
--{
--	bigtime_t time = system_time();
--	while ((system_time() - time) < microseconds)
--		asm volatile ("nop");
--}
 diff --git a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp b/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
 index 9435811872..19a659ba84 100644
 --- a/src/system/kernel/arch/generic/acpi_irq_routing_table.cpp
@@ -8781,794 +7919,6 @@ index 9435811872..19a659ba84 100644
  		}
  
  		delete link;
-diff --git a/src/system/kernel/arch/x86/arch_cpu.cpp b/src/system/kernel/arch/x86/arch_cpu.cpp
-index c635793b60..683b06b58c 100644
---- a/src/system/kernel/arch/x86/arch_cpu.cpp
-+++ b/src/system/kernel/arch/x86/arch_cpu.cpp
-@@ -33,7 +33,6 @@
- 
- #include <arch_system_info.h>
- #include <arch/x86/apic.h>
--#include <arch/x86/timer.h>
- #include <boot/kernel_args.h>
- 
- #include "paging/X86PagingStructures.h"
-@@ -1500,6 +1499,117 @@ detect_amdc1e_noarat()
- }
- 
- 
-+static void
-+init_tsc_with_cpuid(kernel_args* args, uint32* conversionFactor)
-+{
-+	cpu_ent* cpu = get_cpu_struct();
-+	if (cpu->arch.vendor != VENDOR_INTEL)
-+		return;
-+
-+	uint32 model = (cpu->arch.extended_model << 4) | cpu->arch.model;
-+	cpuid_info cpuid;
-+	get_current_cpuid(&cpuid, 0, 0);
-+	uint32 maxBasicLeaf = cpuid.eax_0.max_eax;
-+	if (maxBasicLeaf < IA32_CPUID_LEAF_TSC)
-+		return;
-+
-+	get_current_cpuid(&cpuid, IA32_CPUID_LEAF_TSC, 0);
-+	if (cpuid.regs.eax == 0 || cpuid.regs.ebx == 0)
-+		return;
-+	uint32 khz = cpuid.regs.ecx / 1000;
-+	uint32 denominator = cpuid.regs.eax;
-+	uint32 numerator = cpuid.regs.ebx;
-+	if (khz == 0 && model == 0x5f) {
-+		// CPUID_LEAF_FREQUENCY isn't supported, hardcoding
-+		khz = 25000;
-+	}
-+
-+	if (khz == 0 && maxBasicLeaf >= IA32_CPUID_LEAF_FREQUENCY) {
-+		// for these CPUs the base frequency is also the tsc frequency
-+		get_current_cpuid(&cpuid, IA32_CPUID_LEAF_FREQUENCY, 0);
-+		khz = cpuid.regs.eax * 1000 * denominator / numerator;
-+	}
-+	if (khz == 0)
-+		return;
-+
-+	dprintf("CPU: using TSC frequency from CPUID\n");
-+	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
-+	// or (1000 << 32) / (tsc freq in kHz)
-+	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
-+	// overwrite the bootloader value
-+	args->arch_args.system_time_cv_factor = *conversionFactor;
-+}
-+
-+
-+static void
-+init_tsc_with_msr(kernel_args* args, uint32* conversionFactor)
-+{
-+	cpu_ent* cpuEnt = get_cpu_struct();
-+	if (cpuEnt->arch.vendor != VENDOR_AMD)
-+		return;
-+
-+	uint32 family = cpuEnt->arch.family + cpuEnt->arch.extended_family;
-+	if (family < 0x10)
-+		return;
-+	uint64 value = x86_read_msr(MSR_F10H_HWCR);
-+	if ((value & HWCR_TSCFREQSEL) == 0)
-+		return;
-+
-+	value = x86_read_msr(MSR_F10H_PSTATEDEF(0));
-+	if ((value & PSTATEDEF_EN) == 0)
-+		return;
-+	if (family != 0x17 && family != 0x19)
-+		return;
-+
-+	uint64 khz = 200 * 1000;
-+	uint32 denominator = (value >> 8) & 0x3f;
-+	if (denominator < 0x8 || denominator > 0x2c)
-+		return;
-+	if (denominator > 0x1a && (denominator % 2) == 1)
-+		return;
-+	uint32 numerator = value & 0xff;
-+	if (numerator < 0x10)
-+		return;
-+
-+	dprintf("CPU: using TSC frequency from MSR %" B_PRIu64 "\n", khz * numerator / denominator);
-+	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
-+	// or (1000 << 32) / (tsc freq in kHz)
-+	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
-+	// overwrite the bootloader value
-+	args->arch_args.system_time_cv_factor = *conversionFactor;
-+}
-+
-+
-+static void
-+init_tsc(kernel_args* args)
-+{
-+	// init the TSC -> system_time() conversion factors
-+
-+	// try to find the TSC frequency with CPUID
-+	uint32 conversionFactor = args->arch_args.system_time_cv_factor;
-+	init_tsc_with_cpuid(args, &conversionFactor);
-+	init_tsc_with_msr(args, &conversionFactor);
-+	uint64 conversionFactorNsecs = (uint64)conversionFactor * 1000;
-+
-+#ifdef __x86_64__
-+	// The x86_64 system_time() implementation uses 64-bit multiplication and
-+	// therefore shifting is not necessary for low frequencies (it's also not
-+	// too likely that there'll be any x86_64 CPUs clocked under 1GHz).
-+	__x86_setup_system_time((uint64)conversionFactor << 32,
-+		conversionFactorNsecs);
-+#else
-+	if (conversionFactorNsecs >> 32 != 0) {
-+		// the TSC frequency is < 1 GHz, which forces us to shift the factor
-+		__x86_setup_system_time(conversionFactor, conversionFactorNsecs >> 16,
-+			true);
-+	} else {
-+		// the TSC frequency is >= 1 GHz
-+		__x86_setup_system_time(conversionFactor, conversionFactorNsecs, false);
-+	}
-+#endif
-+}
-+
-+
- status_t
- arch_cpu_init_percpu(kernel_args* args, int cpu)
- {
-@@ -1507,6 +1617,15 @@ arch_cpu_init_percpu(kernel_args* args, int cpu)
- 	load_microcode(cpu);
- 	detect_cpu(cpu);
- 
-+	if (cpu == 0) {
-+		init_tsc(args);
-+
-+		if (detect_amdc1e_noarat())
-+			gCpuIdleFunc = amdc1e_noarat_idle;
-+		else
-+			gCpuIdleFunc = halt_idle;
-+	}
-+
- 	if (x86_check_feature(IA32_FEATURE_MCE, FEATURE_COMMON))
- 		x86_write_cr4(x86_read_cr4() | IA32_CR4_MCE);
- 
-@@ -1581,13 +1700,6 @@ arch_cpu_init(kernel_args* args)
- 	// Initialize descriptor tables.
- 	x86_descriptors_init(args);
- 
--	x86_init_tsc(args);
--
--	if (detect_amdc1e_noarat())
--		gCpuIdleFunc = amdc1e_noarat_idle;
--	else
--		gCpuIdleFunc = halt_idle;
--
- 	return B_OK;
- }
- 
-diff --git a/src/system/kernel/arch/x86/arch_debug.cpp b/src/system/kernel/arch/x86/arch_debug.cpp
-index fce986e810..acb6bfbb6b 100644
---- a/src/system/kernel/arch/x86/arch_debug.cpp
-+++ b/src/system/kernel/arch/x86/arch_debug.cpp
-@@ -10,7 +10,6 @@
- 
- 
- #include <arch/debug.h>
--#include <arch/x86/timer.h>
- 
- #include <x86intrin.h>
- #include <stdio.h>
-@@ -1414,7 +1413,7 @@ arch_debug_init(kernel_args* args)
- {
- 	// Store the TSC frequency in kHz.
- 	sDebugSnoozeConversionFactor =
--		(uint64(1000) << 32) / gSystemTimeConversionFactor;
-+		(uint64(1000) << 32) / args->arch_args.system_time_cv_factor;
- 	if (x86_check_feature(IA32_FEATURE_AMD_EXT_MWAITX, FEATURE_EXT_AMD_ECX))
- 		sDebugSnooze = debug_snooze_mwaitx;
- 	if (x86_check_feature(IA32_FEATURE_WAITPKG, FEATURE_7_ECX))
-@@ -1437,3 +1436,4 @@ arch_debug_init(kernel_args* args)
- 
- 	return B_NO_ERROR;
- }
-+
-diff --git a/src/system/kernel/arch/x86/arch_real_time_clock.cpp b/src/system/kernel/arch/x86/arch_real_time_clock.cpp
-index 516581ae9e..1689866fc8 100644
---- a/src/system/kernel/arch/x86/arch_real_time_clock.cpp
-+++ b/src/system/kernel/arch/x86/arch_real_time_clock.cpp
-@@ -7,7 +7,7 @@
- 
- 
- #include <arch/real_time_clock.h>
--#include <arch/x86/timer.h>
-+#include <arch/cpu.h>
- #include <boot/kernel_args.h>
- 
- #include <real_time_clock.h>
-@@ -180,7 +180,7 @@ status_t
- arch_rtc_init(struct kernel_args *args, struct real_time_data *data)
- {
- 	data->arch_data.system_time_conversion_factor
--		= gSystemTimeConversionFactor;
-+		= args->arch_args.system_time_cv_factor;
- 	return B_OK;
- }
- 
-diff --git a/src/system/kernel/arch/x86/arch_system_info.cpp b/src/system/kernel/arch/x86/arch_system_info.cpp
-index f77c4fc004..587b770967 100644
---- a/src/system/kernel/arch/x86/arch_system_info.cpp
-+++ b/src/system/kernel/arch/x86/arch_system_info.cpp
-@@ -5,7 +5,6 @@
- 
- 
- #include <arch/system_info.h>
--#include <arch/x86/timer.h>
- 
- #include <string.h>
- 
-@@ -21,6 +20,7 @@
- 
- static enum cpu_vendor sCPUVendor;
- static uint32 sCPUModel;
-+static int64 sCPUClockSpeed;
- 
- 
- struct get_cpuid_args {
-@@ -98,7 +98,19 @@ arch_system_info_init(struct kernel_args *args)
- 		| (cpu->arch.extended_model << 16) | (cpu->arch.type << 12)
- 		| (cpu->arch.family << 8) | (cpu->arch.model << 4) | cpu->arch.stepping;
- 
--	// gCPUClockSpeed is initialized by arch_timer.
-+	sCPUClockSpeed = args->arch_args.cpu_clock_speed;
-+	if (cpu->arch.vendor == VENDOR_INTEL) {
-+		cpuid_info cpuid;
-+		get_current_cpuid(&cpuid, 0, 0);
-+		uint32 maxBasicLeaf = cpuid.eax_0.max_eax;
-+		if (maxBasicLeaf >= 0x16) {
-+			get_current_cpuid(&cpuid, 0x16, 0);
-+			if (cpuid.regs.eax != 0) {
-+				sCPUClockSpeed = cpuid.regs.eax * 1000000LL;
-+				dprintf("found clock speed with CPUID.16h\n");
-+			}
-+		}
-+	}
- 	return B_OK;
- }
- 
-@@ -124,7 +136,7 @@ arch_fill_topology_node(cpu_topology_node_info* node, int32 cpu)
- 
- 		case B_TOPOLOGY_CORE:
- 			node->data.core.model = sCPUModel;
--			node->data.core.default_frequency = gCPUClockSpeed;
-+			node->data.core.default_frequency = sCPUClockSpeed;
- 			break;
- 
- 		default:
-@@ -153,7 +165,7 @@ get_frequency_for(void *_frequency, int cpu)
- 	if (mperf2 == mperf)
- 		*frequency = 0;
- 	else {
--		*frequency = (aperf2 - aperf) * gCPUClockSpeed / (mperf2 - mperf);
-+		*frequency = (aperf2 - aperf) * sCPUClockSpeed / (mperf2 - mperf);
- 		gCPU[cpu].arch.mperf_prev = mperf2;
- 		gCPU[cpu].arch.aperf_prev = aperf2;
- 		gCPU[cpu].arch.perf_timestamp = timestamp2;
-@@ -168,7 +180,7 @@ arch_get_frequency(uint64 *frequency, int32 cpu)
- 	if (x86_check_feature(IA32_FEATURE_APERFMPERF, FEATURE_6_ECX))
- 		call_single_cpu_sync(cpu, get_frequency_for, frequency);
- 	else
--		*frequency = gCPUClockSpeed;
-+		*frequency = sCPUClockSpeed;
- 
- 	return B_OK;
- }
-diff --git a/src/system/kernel/arch/x86/arch_timer.cpp b/src/system/kernel/arch/x86/arch_timer.cpp
-index 705df65092..6397927a44 100644
---- a/src/system/kernel/arch/x86/arch_timer.cpp
-+++ b/src/system/kernel/arch/x86/arch_timer.cpp
-@@ -1,24 +1,29 @@
- /*
-- * Copyright 2005, Axel Dörfler, axeld@pinc-software.de.
-- * Copyright 2026, Haiku, Inc. All rights reserved.
-+ * Copyright 2005, Axel Dörfler, axeld@pinc-software.de. All rights reserved.
-  * Distributed under the terms of the MIT License.
-  *
-  * Copyright 2001, Travis Geiselbrecht. All rights reserved.
-  * Distributed under the terms of the NewOS License.
-  */
- 
--#include <arch/timer.h>
--#include <arch_system_info.h>
- 
--#include <cpu.h>
-+#include <boot/stage2.h>
-+#include <kernel.h>
-+
-+#include <arch/int.h>
-+#include <arch/cpu.h>
-+
-+#include <console.h>
-+#include <debug.h>
- #include <timer.h>
- #include <interrupts.h>
-+#include <safemode.h>
-+
-+#include <arch/timer.h>
- 
- #include <arch/x86/smp_priv.h>
- #include <arch/x86/timer.h>
- 
--#include <x86intrin.h>
--
- 
- //#define TRACE_TIMER
- #ifdef TRACE_TIMER
-@@ -41,7 +46,6 @@ static timer_info *sTimers[] = {
- 
- static timer_info *sTimer = NULL;
- 
--
- void
- arch_timer_set_hardware_timer(bigtime_t timeout)
- {
-@@ -113,462 +117,3 @@ arch_init_timer(kernel_args *args)
- 	return 0;
- }
- 
--
--// #pragma mark -
--
--
--uint32 gSystemTimeConversionFactor;
--int64 gCPUClockSpeed;
--
--
--// PIT definitions
--#define TIMER_CLKNUM_HZ					(14318180 / 12)
--
--// PIT IO Ports
--#define PIT_CHANNEL_PORT_BASE			0x40
--#define PIT_CONTROL						0x43
--
--// Channel selection
--#define PIT_SELECT_CHANNEL_SHIFT		6
--
--// Access mode
--#define PIT_ACCESS_LATCH_COUNTER		(0 << 4)
--#define PIT_ACCESS_LOW_BYTE_ONLY		(1 << 4)
--#define PIT_ACCESS_HIGH_BYTE_ONLY		(2 << 4)
--#define PIT_ACCESS_LOW_THEN_HIGH_BYTE	(3 << 4)
--
--// Operating modes
--#define PIT_MODE_INTERRUPT_ON_0			(0 << 1)
--#define PIT_MODE_HARDWARE_COUNTDOWN		(1 << 1)
--#define PIT_MODE_RATE_GENERATOR			(2 << 1)
--#define PIT_MODE_SQUARE_WAVE_GENERATOR	(3 << 1)
--#define PIT_MODE_SOFTWARE_STROBE		(4 << 1)
--#define PIT_MODE_HARDWARE_STROBE		(5 << 1)
--
--// BCD/Binary mode
--#define PIT_BINARY_MODE					0
--#define PIT_BCD_MODE					1
--
--// Channel 2 control (speaker)
--#define PIT_CHANNEL_2_CONTROL			0x61
--#define PIT_CHANNEL_2_GATE_HIGH			0x01
--#define PIT_CHANNEL_2_SPEAKER_OFF_MASK	~0x02
--
--// Maximum values
--#define MAX_QUICK_SAMPLES				20
--#define MAX_SLOW_SAMPLES				20
--	// TODO: These are arbitrary. They are here to avoid spinning indefinitely
--	// if the TSC just isn't stable and we can't get our desired error range.
--
--
--#ifdef __SIZEOF_INT128__
--typedef unsigned __int128 uint128;
--#else
--struct uint128 {
--	uint128(uint64 low, uint64 high = 0)
--		:
--		low(low),
--		high(high)
--	{
--	}
--
--	bool operator<(const uint128& other) const
--	{
--		return high < other.high || (high == other.high && low < other.low);
--	}
--
--	bool operator<=(const uint128& other) const
--	{
--		return !(other < *this);
--	}
--
--	uint128 operator<<(int count) const
--	{
--		if (count == 0)
--			return *this;
--
--		if (count >= 128)
--			return 0;
--
--		if (count >= 64)
--			return uint128(0, low << (count - 64));
--
--		return uint128(low << count, (high << count) | (low >> (64 - count)));
--	}
--
--	uint128 operator>>(int count) const
--	{
--		if (count == 0)
--			return *this;
--
--		if (count >= 128)
--			return 0;
--
--		if (count >= 64)
--			return uint128(high >> (count - 64), 0);
--
--		return uint128((low >> count) | (high << (64 - count)), high >> count);
--	}
--
--	uint128 operator+(const uint128& other) const
--	{
--		uint64 resultLow = low + other.low;
--		return uint128(resultLow,
--			high + other.high + (resultLow < low ? 1 : 0));
--	}
--
--	uint128 operator-(const uint128& other) const
--	{
--		uint64 resultLow = low - other.low;
--		return uint128(resultLow,
--			high - other.high - (resultLow > low ? 1 : 0));
--	}
--
--	uint128 operator*(uint32 other) const
--	{
--		uint64 resultMid = (low >> 32) * other;
--		uint64 resultLow = (low & 0xffffffff) * other + (resultMid << 32);
--		return uint128(resultLow,
--			high * other + (resultMid >> 32)
--				+ (resultLow < resultMid << 32 ? 1 : 0));
--	}
--
--	uint128 operator/(const uint128& other) const
--	{
--		int shift = 0;
--		uint128 shiftedDivider = other;
--		while (shiftedDivider.high >> 63 == 0 && shiftedDivider < *this) {
--			shiftedDivider = shiftedDivider << 1;
--			shift++;
--		}
--
--		uint128 result = 0;
--		uint128 temp = *this;
--		for (; shift >= 0; shift--, shiftedDivider = shiftedDivider >> 1) {
--			if (shiftedDivider <= temp) {
--				result = result + (uint128(1) << shift);
--				temp = temp - shiftedDivider;
--			}
--		}
--
--		return result;
--	}
--
--	operator uint64() const
--	{
--		return low;
--	}
--
--private:
--	uint64	low;
--	uint64	high;
--};
--#endif
--
--
--static inline uint64_t
--rdtsc_fenced()
--{
--	// RDTSC is not serializing, nor does it drain the instruction stream.
--	// RDTSCP does, but is not available everywhere. Other OSes seem to use
--	// "CPUID" rather than MFENCE/LFENCE for serializing here during boot.
--	asm volatile ("cpuid" : : : "eax", "ebx", "ecx", "edx");
--
--	return __rdtsc();
--}
--
--
--static inline void
--calibration_loop(uint8 desiredHighByte, uint8 channel, uint64& tscDelta,
--	double& conversionFactor, uint16& expired)
--{
--	uint8 select = channel << PIT_SELECT_CHANNEL_SHIFT;
--	out8(select | PIT_ACCESS_LOW_THEN_HIGH_BYTE | PIT_MODE_INTERRUPT_ON_0
--		| PIT_BINARY_MODE, PIT_CONTROL);
--
--	// Fill in count of 0xffff, low then high byte
--	uint8 channelPort = PIT_CHANNEL_PORT_BASE + channel;
--	out8(0xff, channelPort);
--	out8(0xff, channelPort);
--
--	// Read the count back once to delay the start. This ensures that we've
--	// waited long enough for the counter to actually start counting down, as
--	// this only happens on the next clock cycle after reload.
--	in8(channelPort);
--	in8(channelPort);
--
--	// We're expecting the PIT to be at the starting position (high byte 0xff)
--	// as we just programmed it, but if it isn't we wait for it to wrap.
--	uint8 startLow;
--	uint8 startHigh;
--	do {
--		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
--		startLow = in8(channelPort);
--		startHigh = in8(channelPort);
--	} while (startHigh != 255);
--
--	// Read in the first TSC value
--	uint64 startTSC = rdtsc_fenced();
--
--	// Wait for the PIT to count down to our desired value
--	uint8 endLow;
--	uint8 endHigh;
--	do {
--		out8(select | PIT_ACCESS_LATCH_COUNTER, PIT_CONTROL);
--		endLow = in8(channelPort);
--		endHigh = in8(channelPort);
--	} while (endHigh > desiredHighByte);
--
--	// And read the second TSC value
--	uint64 endTSC = rdtsc_fenced();
--
--	tscDelta = endTSC - startTSC;
--	expired = ((startHigh << 8) | startLow) - ((endHigh << 8) | endLow);
--	conversionFactor = (double)tscDelta / (double)expired;
--}
--
--
--static void
--calculate_cpu_conversion_factor(uint8 channel, uint32* conversionFactor)
--{
--	// When using channel 2, enable the input and disable the speaker.
--	if (channel == 2) {
--		uint8 control = in8(PIT_CHANNEL_2_CONTROL);
--		control &= PIT_CHANNEL_2_SPEAKER_OFF_MASK;
--		control |= PIT_CHANNEL_2_GATE_HIGH;
--		out8(control, PIT_CHANNEL_2_CONTROL);
--	}
--
--	uint64 tscDeltaQuick, tscDeltaSlower, tscDeltaSlow;
--	double conversionFactorQuick, conversionFactorSlower, conversionFactorSlow;
--	uint16 expired;
--
--	uint32 quickSampleCount = 1;
--	uint32 slowSampleCount = 1;
--
--quick_sample:
--	calibration_loop(224, channel, tscDeltaQuick, conversionFactorQuick,
--		expired);
--
--slower_sample:
--	calibration_loop(192, channel, tscDeltaSlower, conversionFactorSlower,
--		expired);
--
--	double deviation = conversionFactorQuick / conversionFactorSlower;
--	if (deviation < 0.99 || deviation > 1.01) {
--		// We might have been hit by a SMI or were otherwise stalled
--		if (quickSampleCount++ < MAX_QUICK_SAMPLES)
--			goto quick_sample;
--	}
--
--	// Slow sample
--	calibration_loop(128, channel, tscDeltaSlow, conversionFactorSlow,
--		expired);
--
--	deviation = conversionFactorSlower / conversionFactorSlow;
--	if (deviation < 0.99 || deviation > 1.01) {
--		// We might have been hit by a SMI or were otherwise stalled
--		if (slowSampleCount++ < MAX_SLOW_SAMPLES)
--			goto slower_sample;
--	}
--
--	// Scale the TSC delta to timer units
--	tscDeltaSlow *= TIMER_CLKNUM_HZ;
--
--	uint64 clockSpeed = tscDeltaSlow / expired;
--	*conversionFactor = ((uint128(expired) * uint32(1000000)) << 32)
--		/ uint128(tscDeltaSlow);
--
--#ifdef TRACE_TIMER
--	if (clockSpeed > 1000000000LL) {
--		dprintf("CPU at %lld.%03Ld GHz\n", clockSpeed / 1000000000LL,
--			(clockSpeed % 1000000000LL) / 1000000LL);
--	} else {
--		dprintf("CPU at %lld.%03Ld MHz\n", clockSpeed / 1000000LL,
--			(clockSpeed % 1000000LL) / 1000LL);
--	}
--#endif
--
--	gCPUClockSpeed = clockSpeed;
--	//dprintf("factors: %lu %llu\n", gTimeConversionFactor, clockSpeed);
--
--#ifdef TRACE_TIMER
--	if (quickSampleCount > 1) {
--		dprintf("needed %" B_PRIu32 " quick samples for TSC calibration\n",
--			quickSampleCount);
--	}
--
--	if (slowSampleCount > 1) {
--		dprintf("needed %" B_PRIu32 " slow samples for TSC calibration\n",
--			slowSampleCount);
--	}
--#endif
--
--	if (channel == 2) {
--		// Set the gate low again
--		out8(in8(PIT_CHANNEL_2_CONTROL) & ~PIT_CHANNEL_2_GATE_HIGH,
--			PIT_CHANNEL_2_CONTROL);
--	}
--
--	dprintf("CPU: TSC frequency calibrated via PIT: %" B_PRIu32 "\n", *conversionFactor);
--}
--
--
--static void
--init_tsc_with_cpuid(kernel_args* args, uint32* conversionFactor)
--{
--	cpu_ent* cpu = get_cpu_struct();
--	if (cpu->arch.vendor != VENDOR_INTEL)
--		return;
--
--	uint32 model = (cpu->arch.extended_model << 4) | cpu->arch.model;
--	cpuid_info cpuid;
--	get_current_cpuid(&cpuid, 0, 0);
--	uint32 maxBasicLeaf = cpuid.eax_0.max_eax;
--	if (maxBasicLeaf < IA32_CPUID_LEAF_TSC)
--		return;
--
--	get_current_cpuid(&cpuid, IA32_CPUID_LEAF_TSC, 0);
--	if (cpuid.regs.eax == 0 || cpuid.regs.ebx == 0)
--		return;
--	uint32 khz = cpuid.regs.ecx / 1000;
--	uint32 denominator = cpuid.regs.eax;
--	uint32 numerator = cpuid.regs.ebx;
--	if (khz == 0 && model == 0x5f) {
--		// CPUID_LEAF_FREQUENCY isn't supported, hardcoding
--		khz = 25000;
--	}
--
--	if (khz == 0 && maxBasicLeaf >= IA32_CPUID_LEAF_FREQUENCY) {
--		// for these CPUs the base frequency is also the tsc frequency
--		get_current_cpuid(&cpuid, IA32_CPUID_LEAF_FREQUENCY, 0);
--		khz = cpuid.regs.eax * 1000 * denominator / numerator;
--	}
--	if (khz == 0)
--		return;
--
--	dprintf("CPU: using TSC frequency from CPUID\n");
--	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
--	// or (1000 << 32) / (tsc freq in kHz)
--	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
--}
--
--
--static void
--init_tsc_with_msr(kernel_args* args, uint32* conversionFactor)
--{
--	cpu_ent* cpuEnt = get_cpu_struct();
--	if (cpuEnt->arch.vendor != VENDOR_AMD)
--		return;
--
--	uint32 family = cpuEnt->arch.family + cpuEnt->arch.extended_family;
--	if (family < 0x10)
--		return;
--	uint64 value = x86_read_msr(MSR_F10H_HWCR);
--	if ((value & HWCR_TSCFREQSEL) == 0)
--		return;
--
--	value = x86_read_msr(MSR_F10H_PSTATEDEF(0));
--	if ((value & PSTATEDEF_EN) == 0)
--		return;
--	if (family != 0x17 && family != 0x19)
--		return;
--
--	uint64 khz = 200 * 1000;
--	uint32 denominator = (value >> 8) & 0x3f;
--	if (denominator < 0x8 || denominator > 0x2c)
--		return;
--	if (denominator > 0x1a && (denominator % 2) == 1)
--		return;
--	uint32 numerator = value & 0xff;
--	if (numerator < 0x10)
--		return;
--
--	dprintf("CPU: using TSC frequency from MSR %" B_PRIu64 "\n", khz * numerator / denominator);
--	// compute for microseconds as follows (1000000 << 32) / (tsc freq in Hz),
--	// or (1000 << 32) / (tsc freq in kHz)
--	*conversionFactor = (1000ULL << 32) / (khz * numerator / denominator);
--}
--
--
--static void
--init_tsc_on_hypervisor(kernel_args* args, uint32* conversionFactor)
--{
--	cpuid_info info;
--	if (get_current_cpuid(&info, 1, 0) != B_OK
--			|| (info.regs.ecx & IA32_FEATURE_EXT_HYPERVISOR) == 0)
--		return;
--
--	get_current_cpuid(&info, 0x40000000, 0);
--	const uint32 maxVMM = info.regs.eax;
--
--	if (maxVMM >= 0x40000010) {
--		get_current_cpuid(&info, 0x40000010, 0);
--
--		uint64 clockSpeed = uint64(info.regs.eax) * 1000;
--		*conversionFactor = (uint64(1000) << 32) / info.regs.eax;
--
--		gCPUClockSpeed = clockSpeed;
--
--		dprintf("CPU: TSC frequency read from hypervisor CPUID leaf\n");
--		return;
--	}
--
--	if (maxVMM >= 0x40000003) {
--		// Hyper-V does not implement the standard hypervisor timing interface
--		// "Hv#1" here indicates Hyper-V
--		get_current_cpuid(&info, 0x40000001, 0);
--		if (info.regs.eax == 0x31237648) {
--			// Check for HV_X64_MSR_TSC_FREQUENCY presence
--			// TSC frequency is represented in Hz
--			get_current_cpuid(&info, 0x40000003, 0);
--			if ((info.regs.eax & (1 << 11)) != 0) {
--				uint64 clockSpeed = x86_read_msr(0x40000022);
--				if (clockSpeed > 0) {
--					*conversionFactor = (uint64(1000000) << 32) / clockSpeed;
--
--					gCPUClockSpeed = clockSpeed;
--
--					dprintf("CPU: TSC frequency read from Hyper-V MSR\n");
--					return;
--				}
--			}
--		}
--	}
--}
--
--
--void
--x86_init_tsc(kernel_args* args)
--{
--	// init the TSC -> system_time() conversion factors
--
--	// try to find the TSC frequency with CPUID
--	uint32 conversionFactor = 0;
--	init_tsc_with_cpuid(args, &conversionFactor);
--	init_tsc_with_msr(args, &conversionFactor);
--	init_tsc_on_hypervisor(args, &conversionFactor);
--	if (conversionFactor == 0)
--		calculate_cpu_conversion_factor(2, &conversionFactor);
--
--	gSystemTimeConversionFactor = conversionFactor;
--
--	uint64 conversionFactorNsecs = (uint64)conversionFactor * 1000;
--
--#ifdef __x86_64__
--	// The x86_64 system_time() implementation uses 64-bit multiplication and
--	// therefore shifting is not necessary for low frequencies (it's also not
--	// too likely that there'll be any x86_64 CPUs clocked under 1GHz).
--	__x86_setup_system_time((uint64)conversionFactor << 32,
--		conversionFactorNsecs);
--#else
--	if (conversionFactorNsecs >> 32 != 0) {
--		// the TSC frequency is < 1 GHz, which forces us to shift the factor
--		__x86_setup_system_time(conversionFactor, conversionFactorNsecs >> 16,
--			true);
--	} else {
--		// the TSC frequency is >= 1 GHz
--		__x86_setup_system_time(conversionFactor, conversionFactorNsecs, false);
--	}
--#endif
--}
 diff --git a/src/system/kernel/arch/x86/ioapic.cpp b/src/system/kernel/arch/x86/ioapic.cpp
 index 576d492921..cf242a82ba 100644
 --- a/src/system/kernel/arch/x86/ioapic.cpp
@@ -9691,18 +8041,6 @@ index 45e7fb785a..277f055149 100644
  	if (partitions.IsEmpty()) {
  		panic("did not find any boot partitions! @! syslog | tail 15");
  	}
-diff --git a/src/system/kernel/timer.cpp b/src/system/kernel/timer.cpp
-index b6cde90c3a..ed9b54ada6 100644
---- a/src/system/kernel/timer.cpp
-+++ b/src/system/kernel/timer.cpp
-@@ -444,7 +444,6 @@ void
- spin(bigtime_t microseconds)
- {
- 	bigtime_t target = system_time() + microseconds;
--	ASSERT(target > microseconds);
- 
- 	while (system_time() < target)
- 		cpu_pause();
 diff --git a/src/system/kernel/vm/ModifiedPageQueue.h b/src/system/kernel/vm/ModifiedPageQueue.h
 index f42bbd69df..23a324954d 100644
 --- a/src/system/kernel/vm/ModifiedPageQueue.h
@@ -9715,42 +8053,8 @@ index f42bbd69df..23a324954d 100644
  
  private:
  			thread_id			fWriterThread;
-diff --git a/src/system/kernel/vm/VMAnonymousCache.cpp b/src/system/kernel/vm/VMAnonymousCache.cpp
-index 0571e30b99..8839ddd05c 100644
---- a/src/system/kernel/vm/VMAnonymousCache.cpp
-+++ b/src/system/kernel/vm/VMAnonymousCache.cpp
-@@ -1255,6 +1255,16 @@ VMAnonymousCache::_MergePagesSmallerConsumer(VMAnonymousCache* source)
- 			ASSERT_PRINT(sourcePage->WiredCount() == 0
- 					&& sourcePage->mappings.IsEmpty(),
- 				"sourcePage: %p, page: %p", sourcePage, page);
-+			// A page that has been written to is MODIFIED, and vm_page_free_etc()
-+			// refuses those: it cannot tell which modified queue the page is on.
-+			// VMCache::Delete() and _FreePageRange() both clear the state first;
-+			// these two merge paths did not, and an anonymous page shadowed by a
-+			// consumer is exactly the kind that is dirty. Observed as a panic in
-+			// vm_page_free_etc() reached from here during team teardown.
-+			if (sourcePage->State() == PAGE_STATE_MODIFIED) {
-+				sourcePage->modified = false;
-+				vm_page_set_state(sourcePage, PAGE_STATE_CACHED);
-+			}
- 			source->RemovePage(sourcePage);
- 			vm_page_free_etc(source, sourcePage, &reservation);
- 		}
-@@ -1307,6 +1317,12 @@ VMAnonymousCache::_MergeSwapPages(VMAnonymousCache* source)
- 					if (page != NULL) {
- 						DEBUG_PAGE_ACCESS_START(page);
- 						ASSERT_PRINT(!page->busy, "page: %p", page);
-+						// Same reason as in _MergePagesSmallerConsumer(): a dirty
-+						// page cannot go straight to the free queue.
-+						if (page->State() == PAGE_STATE_MODIFIED) {
-+							page->modified = false;
-+							vm_page_set_state(page, PAGE_STATE_CACHED);
-+						}
- 						source->RemovePage(page);
- 						vm_page_free(source, page);
- 					}
 diff --git a/src/system/kernel/vm/vm_page_writer.cpp b/src/system/kernel/vm/vm_page_writer.cpp
-index 5f64ffaa03..60991a0022 100644
+index 194c67fca7..64343646a2 100644
 --- a/src/system/kernel/vm/vm_page_writer.cpp
 +++ b/src/system/kernel/vm/vm_page_writer.cpp
 @@ -565,13 +565,17 @@ ModifiedPageQueue::_PageWriter()

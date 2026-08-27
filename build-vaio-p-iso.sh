@@ -91,7 +91,7 @@ fi
 # Bumping it is a deliberate act -- re-derive the patch against the new
 # commit, rebuild, and confirm the machine still boots before committing
 # the new value. Override with HAIKU_GIT_REF=master to track the tip.
-HAIKU_GIT_REF="${HAIKU_GIT_REF:-8b91c532fa}"
+HAIKU_GIT_REF="${HAIKU_GIT_REF:-88b7b8b350}"
 
 log "Checking out haiku.git ref: $HAIKU_GIT_REF"
 git -C haiku fetch origin master

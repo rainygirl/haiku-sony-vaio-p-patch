@@ -43,7 +43,7 @@ cd tools/vaio-p
 ### 환경 변수
 
 - `SKIP_CROSS_TOOLS=1` : 크로스컴파일러가 이미 빌드되어 있으면 재빌드를 생략합니다 (패치만 수정하고 다시 빌드할 때 유용하며, 크로스툴 빌드에만 1~1.5시간이 소요됩니다).
-- `HAIKU_GIT_REF` : 체크아웃할 haiku.git의 브랜치/태그/커밋입니다. 기본값은 고정된 nightly 커밋 `8b91c532fa`입니다([`AGENTS.ko.md`](AGENTS.ko.md)의 "패치 기준 시점" 참고). `master`로 두면 최신 tip을 따라가지만, 패치가 그대로 적용될지는 보장되지 않습니다.
+- `HAIKU_GIT_REF` : 체크아웃할 haiku.git의 브랜치/태그/커밋입니다. 기본값은 고정된 nightly 커밋 `88b7b8b350`입니다([`AGENTS.ko.md`](AGENTS.ko.md)의 "패치 기준 시점" 참고). `master`로 두면 최신 tip을 따라가지만, 패치가 그대로 적용될지는 보장되지 않습니다.
 - `JOBS` : `configure`/`jam` 병렬 작업 수입니다. 기본값은 `nproc`입니다.
 
 ### `configure --distro-compatibility official`을 주는 이유
