@@ -1,0 +1,98 @@
+diff --git a/src/apps/codycam/VideoConsumer.cpp b/src/apps/codycam/VideoConsumer.cpp
+index 5c56f60d0b..2095d2330b 100644
+--- a/src/apps/codycam/VideoConsumer.cpp
++++ b/src/apps/codycam/VideoConsumer.cpp
+@@ -63,6 +63,7 @@ VideoConsumer::VideoConsumer(const char* name, BView* view,
+ 	fMyLatency(20000),
+ 	fWindow(NULL),
+ 	fView(view),
++	fNextOwnBitmapIndex(0),
+ 	fOurBuffers(false),
+ 	fBuffers(NULL),
+ 	fTimeToFtp(false),
+@@ -570,9 +571,26 @@ VideoConsumer::HandleEvent(const media_timed_event* event, bigtime_t lateness,
+ 						index++;
+ 
+ 				if (index == 3) {
+-					// no, buffers belong to consumer
++					// The buffer belongs to the producer, not to one of
++					// our own fBitmap[]/fBufferMap[] slots (this is the
++					// normal case for this webcam producer, which always
++					// creates and owns its own BBufferGroup -- see
++					// VideoProducer::Connect()). Rotate through our 3
++					// bitmap slots here too, the same as the "our
++					// buffers" case below effectively does by construction
++					// (BBufferGroup handing back a different slot each
++					// time). Hardcoding index=0 here instead used the
++					// exact same single bitmap for every single frame,
++					// with no synchronization between the memcpy()
++					// below overwriting it and DrawBitmap() further down
++					// still reading it for the *previous* frame -- a
++					// real tearing race, confirmed to produce a
++					// persistent, loss-independent combing/torn look
++					// that survived every capture-pipeline-level fix
++					// attempted today.
+ 					fOurBuffers = false;
+-					index = 0;
++					index = fNextOwnBitmapIndex;
++					fNextOwnBitmapIndex = (fNextOwnBitmapIndex + 1) % 3;
+ 				}
+ 
+ 				if (fFtpComplete && fTimeToFtp) {
+@@ -611,7 +629,43 @@ VideoConsumer::HandleEvent(const media_timed_event* event, bigtime_t lateness,
+ 								*p = (*p >> 3) & 0x1f1f1f1f;
+ 						}
+ 
+-						fView->DrawBitmap(fBitmap[index], fView->Bounds());
++						// DrawBitmap(bitmap, destRect) stretches the source
++						// to exactly fill destRect with no regard for
++						// its own aspect ratio. Passing fView->Bounds()
++						// directly stretched every captured frame (e.g.
++						// 320x240, 4:3) to whatever shape the view
++						// happens to be (commonly wider/narrower than
++						// 4:3), distorting the image -- most noticeably
++						// as a vertical stretch when the view is taller
++						// relative to its width than the source frame.
++						// Letterbox/pillarbox into the largest
++						// same-aspect-ratio rect centered in the view
++						// instead, so the image is scaled but never
++						// distorted.
++						BRect viewBounds = fView->Bounds();
++						BRect bitmapBounds = fBitmap[index]->Bounds();
++						float destRect_width = viewBounds.Width();
++						float destRect_height = viewBounds.Height();
++						if (bitmapBounds.Width() > 0
++							&& bitmapBounds.Height() > 0
++							&& viewBounds.Width() > 0
++							&& viewBounds.Height() > 0) {
++							float bitmapAspect = bitmapBounds.Width()
++								/ bitmapBounds.Height();
++							float viewAspect = viewBounds.Width()
++								/ viewBounds.Height();
++							if (viewAspect > bitmapAspect)
++								destRect_width = viewBounds.Height() * bitmapAspect;
++							else if (viewAspect < bitmapAspect)
++								destRect_height = viewBounds.Width() / bitmapAspect;
++						}
++						BRect destRect(0, 0, destRect_width - 1,
++							destRect_height - 1);
++						destRect.OffsetBy(
++							(viewBounds.Width() - destRect_width) / 2.0f,
++							(viewBounds.Height() - destRect_height) / 2.0f);
++
++						fView->DrawBitmap(fBitmap[index], destRect);
+ 						fWindow->Unlock();
+ 					}
+ 				}
+diff --git a/src/apps/codycam/VideoConsumer.h b/src/apps/codycam/VideoConsumer.h
+index 0416e1cd4e..67393b831d 100644
+--- a/src/apps/codycam/VideoConsumer.h
++++ b/src/apps/codycam/VideoConsumer.h
+@@ -137,6 +137,7 @@ private:
+ 			BWindow*			fWindow;
+ 			BView*				fView;
+ 			BBitmap*			fBitmap[3];
++			uint32				fNextOwnBitmapIndex;
+ 			bool				fOurBuffers;
+ 			BBufferGroup*		fBuffers;
+ 			BBuffer*			fBufferMap[3];

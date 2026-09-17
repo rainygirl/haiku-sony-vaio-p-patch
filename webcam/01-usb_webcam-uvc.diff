@@ -1,0 +1,969 @@
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 0e067c49cd..5afe292084 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <OS.h>
+ #include <Autolock.h>
++#include <new>
+ 
+ //#define DEBUG_WRITE_DUMP
+ //#define DEBUG_DISCARD_DATA
+@@ -44,8 +45,17 @@ CamDevice::CamDevice(CamDeviceAddon &_addon, BUSBDevice* _device)
+ 	  fSupportedDeviceIndex(-1),
+ 	  fChipIsBigEndian(false),
+ 	  fTransferEnabled(false),
+-	  fLocker("WebcamDeviceLock")
+-{
++	  fLocker("WebcamDeviceLock"),
++	  fIsoPipelineReady(false),
++	  fIsoConsumerThread(-1),
++	  fIsoNumPacketDescriptors(0),
++	  fIsoMaxPacketSize(0)
++{
++	fIsoBufferReady[0] = fIsoBufferReady[1] = -1;
++	fIsoBufferFree[0] = fIsoBufferFree[1] = -1;
++	fIsoBuffer[0] = fIsoBuffer[1] = NULL;
++	fIsoPacketDescriptors[0] = fIsoPacketDescriptors[1] = NULL;
++	fIsoTransferLen[0] = fIsoTransferLen[1] = 0;
+ 	// fill in the generic flavor
+ 	_addon.WebCamAddOn()->FillDefaultFlavorInfo(&fFlavorInfo);
+ 	// if we use id matching, cache the index to the list
+@@ -74,6 +84,18 @@ CamDevice::~CamDevice()
+ {
+ 	close(fDumpFD);
+ 	free(fBuffer);
++	free(fIsoBuffer[0]);
++	free(fIsoBuffer[1]);
++	delete[] fIsoPacketDescriptors[0];
++	delete[] fIsoPacketDescriptors[1];
++	if (fIsoBufferReady[0] >= 0)
++		delete_sem(fIsoBufferReady[0]);
++	if (fIsoBufferReady[1] >= 0)
++		delete_sem(fIsoBufferReady[1]);
++	if (fIsoBufferFree[0] >= 0)
++		delete_sem(fIsoBufferFree[0]);
++	if (fIsoBufferFree[1] >= 0)
++		delete_sem(fIsoBufferFree[1]);
+ 	if (fDeframer)
+ 		delete fDeframer;
+ }
+@@ -155,8 +177,20 @@ CamDevice::StartTransfer()
+ 	PRINT((CH "()" CT));
+ 	if (fTransferEnabled)
+ 		return EALREADY;
+-	fPumpThread = spawn_thread(_DataPumpThread, "USB Webcam Data Pump", 50,
+-		this);
++	// The isochronous pump loop is latency-sensitive: each
++	// IsochronousTransfer() call is synchronous and only one is ever
++	// outstanding, so the camera keeps transmitting into microframes
++	// during the gap between one call returning and the next being
++	// submitted, and whatever it sends in that gap is lost (visible as
++	// the periodic green-line/noise artifacts during capture). At normal
++	// priority, this thread can be held off the CPU by other work (e.g.
++	// JPEG decode on the receiving end) for long enough to widen that
++	// gap noticeably. B_REAL_TIME_DISPLAY_PRIORITY is what Haiku intends
++	// for exactly this kind of continuous, time-sensitive capture/display
++	// work, so the thread gets back onto the CPU and resubmits as soon as
++	// each transfer completes instead of waiting its turn.
++	fPumpThread = spawn_thread(_DataPumpThread, "USB Webcam Data Pump",
++		B_REAL_TIME_DISPLAY_PRIORITY, this);
+ 	if (fPumpThread < B_OK)
+ 		return fPumpThread;
+ 	if (fSensor)
+@@ -188,6 +222,22 @@ CamDevice::StopTransfer()
+ 	wait_for_thread(fPumpThread, &err);
+ 	fLocker.Lock();
+ 
++	if (fIsoPipelineReady) {
++		// The producer (fPumpThread, just joined above) is done issuing
++		// new isochronous requests, but IsoConsumerThread() may still be
++		// blocked waiting on fIsoBufferReady[]. Deleting the semaphores
++		// makes that acquire_sem() return an error instead of blocking
++		// forever, so the consumer notices and exits.
++		delete_sem(fIsoBufferReady[0]);
++		delete_sem(fIsoBufferReady[1]);
++		wait_for_thread(fIsoConsumerThread, &err);
++		delete_sem(fIsoBufferFree[0]);
++		delete_sem(fIsoBufferFree[1]);
++		fIsoBufferReady[0] = fIsoBufferReady[1] = -1;
++		fIsoBufferFree[0] = fIsoBufferFree[1] = -1;
++		fIsoPipelineReady = false;
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -564,13 +614,111 @@ CamDevice::DataPumpThread()
+ 	}
+ #ifdef SUPPORT_ISO
+ 	else if (SupportsIsochronous()) {
+-		int numPacketDescriptors = 16;
+-		usb_iso_packet_descriptor packetDescriptors[numPacketDescriptors];
+-		
+-		// Initialize packetDescriptor request lengths
+-		for (int i = 0; i<numPacketDescriptors; i++)
+-			packetDescriptors[i].request_length = 256;	
++		// 24 packets = 3 EHCI itds per isochronous submission (each itd
++		// covers up to 8 microframe transactions -- see ehci.cpp's
++		// SubmitIsochronous), cutting the number of round trips per video
++		// frame roughly 3x versus one itd (8 packets) per call. This used
++		// to crash the kernel: EHCI::FinishIsochronousTransfers froze all
++		// of a multi-itd transfer's descriptors at once when the last one
++		// was found, but only that last one had actually been unlinked
++		// from its own per-frame chain (fItdEntries[]) -- the earlier
++		// itds got freed while still linked into whichever other frame
++		// slots they occupied, corrupting those chains and eventually
++		// use-after-freeing when the finisher thread scanned one of them
++		// again. Fixed at the root in ehci.cpp/ehci.h (isochronous_
++		// transfer_data now tracks first_frame, so completion can unlink
++		// every descriptor from its own slot before freeing it), so it's
++		// safe to use more than one itd per submission again.
++		int numPacketDescriptors = 24;
++
++		// Size each packet request -- and the buffers backing them -- to
++		// the endpoint's actual max payload instead of a fixed 256 bytes.
++		// BUSBEndpoint::MaxPacketSize() returns the raw wMaxPacketSize
++		// descriptor field, which for high-bandwidth isochronous endpoints
++		// packs an 11-bit base size (bits 0-10) and a transactions-per-
++		// microframe multiplier minus one (bits 11-12) -- NOT a plain byte
++		// count. Using the raw value directly (e.g. 5076 on this camera)
++		// overflows the EHCI iTD's 12-bit per-transaction length field,
++		// corrupting the descriptor's status bits before the transfer even
++		// runs -- which is why isochronous transfers were completing with
++		// 0 bytes every time. Decode it properly; the result (e.g. 980 * 3
++		// = 2940 bytes) matches the endpoint's real negotiated payload
++		// size and fits the length field.
++		size_t maxPacketSize = 256;
++		if (fIsoIn != NULL && fIsoIn->MaxPacketSize() > 0) {
++			uint16 rawMaxPacketSize = fIsoIn->MaxPacketSize();
++			size_t baseSize = rawMaxPacketSize & 0x7ff;
++			size_t transactionsPerMicroframe = ((rawMaxPacketSize >> 11) & 0x3) + 1;
++			maxPacketSize = baseSize * transactionsPerMicroframe;
++		}
++		size_t neededBufferLen = maxPacketSize * numPacketDescriptors;
++
++		// Pipeline the capture across two buffers/descriptor sets, handed
++		// off to a second thread (IsoConsumerThread) that does the
++		// memcpy- and deframer-logic work of splitting each completed
++		// transfer's packets out to fDataInput. That used to happen right
++		// here, in between one blocking IsochronousTransfer() call and
++		// the next -- widening the gap during which the camera keeps
++		// transmitting into microframes nothing is listening to. With two
++		// buffers, this thread can resubmit into the *other* buffer
++		// immediately once a transfer completes, instead of waiting on
++		// that processing first.
++		if (!fIsoPipelineReady || fIsoNumPacketDescriptors != numPacketDescriptors
++				|| fIsoMaxPacketSize != maxPacketSize) {
++			for (int b = 0; b < 2; b++) {
++				uint8* newBuffer = (uint8*)realloc(fIsoBuffer[b], neededBufferLen);
++				if (newBuffer != NULL)
++					fIsoBuffer[b] = newBuffer;
++
++				usb_iso_packet_descriptor* newDescriptors
++					= new(std::nothrow) usb_iso_packet_descriptor[numPacketDescriptors];
++				delete[] fIsoPacketDescriptors[b];
++				fIsoPacketDescriptors[b] = newDescriptors;
++				for (int i = 0; i < numPacketDescriptors; i++)
++					fIsoPacketDescriptors[b][i].request_length = (int16)maxPacketSize;
++
++				if (fIsoBufferFree[b] < 0) {
++					// Starts at 0 (not free), not 1: both buffers are
++					// used immediately by the priming QueueIsochronous()
++					// calls below (unconditionally, without acquiring
++					// this semaphore first), so by the time the main
++					// loop's first requeue attempt checks whether it's
++					// safe to overwrite a buffer, that permit must not
++					// already be sitting there unearned -- it has to
++					// come only from the consumer actually finishing
++					// with that buffer's data.
++					fIsoBufferFree[b] = create_sem(0, "iso buffer free");
++				}
++				if (fIsoBufferReady[b] < 0)
++					fIsoBufferReady[b] = create_sem(0, "iso buffer ready");
++			}
++			fIsoNumPacketDescriptors = numPacketDescriptors;
++			fIsoMaxPacketSize = maxPacketSize;
++			fIsoPipelineReady = true;
++
++			fIsoConsumerThread = spawn_thread(_IsoConsumerThread,
++				"USB Webcam Iso Consumer", B_REAL_TIME_DISPLAY_PRIORITY - 1,
++				this);
++			resume_thread(fIsoConsumerThread);
++		}
+ 
++		// Prime the pipeline: get both buffers' transfers queued with the
++		// host controller before waiting on either. Buffer 1's
++		// QueueIsochronous() call below runs while buffer 0's transfer is
++		// still outstanding, which is what lets the controller schedule
++		// it immediately following buffer 0's range instead of leaving a
++		// gap (see the class comment on fIsoPipelineReady).
++		int32 requestId[2] = { -1, -1 };
++		if (fIsoIn != NULL) {
++			requestId[0] = fIsoIn->QueueIsochronous(fIsoBuffer[0],
++				neededBufferLen, fIsoPacketDescriptors[0],
++				numPacketDescriptors);
++			requestId[1] = fIsoIn->QueueIsochronous(fIsoBuffer[1],
++				neededBufferLen, fIsoPacketDescriptors[1],
++				numPacketDescriptors);
++		}
++
++		int cur = 0;
+ 		while (fTransferEnabled) {
+ 			ssize_t len = -1;
+ 			BAutolock lock(fLocker);
+@@ -578,40 +726,62 @@ CamDevice::DataPumpThread()
+ 				break;
+ 			if (!fIsoIn)
+ 				break;
++			if (requestId[cur] < 0) {
++				// Couldn't even get this buffer's transfer queued
++				// (e.g. transient allocation failure) -- nothing to
++				// wait for.
++				PRINT((CH ": QueueIsochronous failed for buffer %d" CT, cur));
++				break;
++			}
+ #ifndef DEBUG_DISCARD_INPUT
+-			len = fIsoIn->IsochronousTransfer(fBuffer, fBufferLen, packetDescriptors,
+-				numPacketDescriptors);
++			len = fIsoIn->WaitIsochronous(requestId[cur]);
+ #endif
++			// Waited on and consumed -- not outstanding anymore until
++			// (if) the requeue below succeeds. Tracking this precisely
++			// is what lets the drain step after the loop know exactly
++			// which of the two buffers (if any) still has a request the
++			// kernel hasn't finished with yet, however this loop ends up
++			// exiting.
++			requestId[cur] = -1;
++			fIsoTransferLen[cur] = len;
++
++			if (len <= 0)
++				PRINT((CH ": IsoIn: %s" CT, strerror(len)));
+ 
+-			//PRINT((CH ": got %d bytes" CT, len));
+-#ifdef DEBUG_WRITE_DUMP
+-			write(fDumpFD, fBuffer, len);
+-#endif
+-#ifdef DEBUG_READ_DUMP
+-			if ((len = read(fDumpFD, fBuffer, fBufferLen)) < fBufferLen)
+-				lseek(fDumpFD, 0LL, SEEK_SET);
++			// Hand this buffer's just-completed data to the consumer...
++			release_sem(fIsoBufferReady[cur]);
++
++			// ...then, once the consumer is done with whatever was
++			// previously in this buffer (from the last time it was used,
++			// two cycles ago), requeue it. This happens while the
++			// *other* buffer's transfer (queued last cycle, or in the
++			// priming step above) is still outstanding -- the whole
++			// point of interleaving queue/wait this way instead of
++			// waiting for both before requeuing either.
++			if (acquire_sem(fIsoBufferFree[cur]) != B_OK)
++				break;
++#ifndef DEBUG_DISCARD_INPUT
++			requestId[cur] = fIsoIn->QueueIsochronous(fIsoBuffer[cur],
++				neededBufferLen, fIsoPacketDescriptors[cur],
++				numPacketDescriptors);
+ #endif
+ 
+-			if (len <= 0) {
+-				PRINT((CH ": IsoIn: %s" CT, strerror(len)));
+-				continue;
+-			}
++			cur = 1 - cur;
++			//snooze(2000);
++		}
+ 
+-#ifndef DEBUG_DISCARD_DATA
+-			if (fDataInput) {
+-				int fBufferIndex = 0;
+-				for (int i = 0; i < numPacketDescriptors; i++) {
+-					int actual_length = ((usb_iso_packet_descriptor)
+-						packetDescriptors[i]).actual_length;
+-					if (actual_length > 0) {
+-						fDataInput->Write(&fBuffer[fBufferIndex],
+-							actual_length);
+-					}
+-					fBufferIndex += actual_length;
+-				}				
++		// However the loop above exited, up to one buffer's transfer can
++		// legitimately still be outstanding with the kernel (that's the
++		// nature of keeping 2 requests in flight at once) -- wait for it
++		// before returning. Otherwise the kernel could still be DMA-ing
++		// completion data into fIsoBuffer[]/fIsoPacketDescriptors[] after
++		// this function returns, racing a StopTransfer()/StartTransfer()
++		// cycle that reallocates or frees them.
++		if (fIsoIn != NULL) {
++			for (int i = 0; i < 2; i++) {
++				if (requestId[i] >= 0)
++					fIsoIn->WaitIsochronous(requestId[i]);
+ 			}
+-#endif
+-			//snooze(2000);
+ 		}
+ 	}
+ #endif
+@@ -631,6 +801,66 @@ CamDevice::_DataPumpThread(void *_this)
+ }
+ 
+ 
++int32
++CamDevice::_IsoConsumerThread(void *_this)
++{
++	CamDevice *dev = (CamDevice *)_this;
++	return dev->IsoConsumerThread();
++}
++
++
++int32
++CamDevice::IsoConsumerThread()
++{
++	int cur = 0;
++	while (true) {
++		// Told to exit by CamDevice::StopTransfer() deleting the
++		// semaphores out from under us once the producer/DataPumpThread
++		// has stopped issuing new requests -- acquire_sem() on a deleted
++		// semaphore returns an error instead of blocking forever.
++		if (acquire_sem(fIsoBufferReady[cur]) != B_OK)
++			break;
++		if (!fTransferEnabled)
++			break;
++
++		// Deliberately not taking fLocker here: fDataInput is set once,
++		// before StartTransfer() is ever called (see UVCCamDevice's
++		// constructor), and never reassigned while streaming, so it
++		// needs no protection -- and the producer thread (DataPumpThread)
++		// holds fLocker for the full duration of its blocking
++		// IsochronousTransfer() call, so contending on the same lock here
++		// would serialize this thread behind that call and defeat the
++		// entire point of pipelining the two.
++		ssize_t len = fIsoTransferLen[cur];
++		if (len > 0 && fDataInput) {
++			int bufferIndex = 0;
++			for (int i = 0; i < fIsoNumPacketDescriptors; i++) {
++				int actualLength
++					= fIsoPacketDescriptors[cur][i].actual_length;
++				if (actualLength > 0) {
++					fDataInput->Write(&fIsoBuffer[cur][bufferIndex],
++						actualLength);
++				}
++				// Each packet occupies a fixed fIsoMaxPacketSize-sized
++				// slot in fIsoBuffer[cur] -- that's the stride the host
++				// controller used when writing the DMA buffer (laid out
++				// before actual per-packet lengths are known), not the
++				// variable actualLength. Advancing by actualLength
++				// instead drifts the read offset out of sync with the
++				// real data as soon as any packet returns less than
++				// requested (routine for isochronous transfers),
++				// scrambling every packet after it.
++				bufferIndex += fIsoMaxPacketSize;
++			}
++		}
++
++		release_sem(fIsoBufferFree[cur]);
++		cur = 1 - cur;
++	}
++	return 0;
++}
++
++
+ void
+ CamDevice::DumpRegs()
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+index f4847ef8ea..4e98227daa 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+@@ -152,6 +152,34 @@ class CamDevice {
+ 		size_t			fBufferLen;
+ 		BRect			fVideoFrame;
+ 		int fDumpFD;
++
++		// Isochronous capture is double-buffered AND kept genuinely
++		// pipelined at the USB scheduling level: DataPumpThread() uses
++		// BUSBEndpoint::QueueIsochronous()/WaitIsochronous() (a non-
++		// blocking submit + a separate blocking wait) to always have the
++		// *other* buffer's transfer still queued with the host
++		// controller while it waits for one buffer's transfer to
++		// complete, and requeues that buffer again immediately -- so
++		// there's never a moment with nothing queued, which is what lets
++		// EHCI schedule each submission to start right where the
++		// previous one's ends (see EHCI::SubmitIsochronous's
++		// fNextStartingFrame chaining) instead of leaving a schedule gap
++		// that costs real captured data on every single call. A separate
++		// thread (IsoConsumerThread) does the memcpy-/deframer-logic work
++		// of splitting each completed transfer's packets out to
++		// fDataInput, so that work never delays the next submission
++		// either.
++		bool			fIsoPipelineReady;
++		thread_id		fIsoConsumerThread;
++		sem_id			fIsoBufferReady[2];
++		sem_id			fIsoBufferFree[2];
++		uint8			*fIsoBuffer[2];
++		usb_iso_packet_descriptor *fIsoPacketDescriptors[2];
++		int				fIsoNumPacketDescriptors;
++		size_t			fIsoMaxPacketSize;
++		ssize_t			fIsoTransferLen[2];
++		int32			IsoConsumerThread();
++		static int32	_IsoConsumerThread(void *_this);
+ };
+ 
+ // the addon itself, that instanciate
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+index 4be0934ed6..6cfc85bbf3 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+@@ -28,7 +28,7 @@ addonSources =
+ 	QuickCamDevice.cpp
+ 	SonixCamDevice.cpp
+ 	NW80xCamDevice.cpp
+-#	UVCCamDevice.cpp UVCDeframer.cpp
++	UVCCamDevice.cpp UVCDeframer.cpp
+ ;
+ 
+ ## colorspace transforms sources
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 13987ee472..7495951e2f 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -72,6 +72,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fUncompressedFormatIndex(1),
+ 	fUncompressedFrameIndex(1)
+ {
++	fIsYUY2 = false;
+ 	fDeframer = new UVCDeframer(this);
+ 	SetDataInput(fDeframer);
+ 
+@@ -141,6 +142,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 			}
+ 		}
+ 	}
++
+ }
+ 
+ 
+@@ -191,6 +193,8 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 			const usbvc_format_descriptor* descriptor
+ 				= (const usbvc_format_descriptor*)_descriptor;
+ 			fUncompressedFormatIndex = descriptor->formatIndex;
++			fIsYUY2 = memcmp(descriptor->uncompressed.format, kYUY2Guid,
++				sizeof(usbvc_guid)) == 0;
+ 			printf("VS_FORMAT_UNCOMPRESSED:\tbFormatIdx=%d,#frmdesc=%d,guid=",
+ 				descriptor->formatIndex, descriptor->numFrameDescriptors);
+ 			print_guid(descriptor->uncompressed.format);
+@@ -558,8 +562,22 @@ UVCCamDevice::StartTransfer()
+ status_t
+ UVCCamDevice::StopTransfer()
+ {
++	// CamDevice::StopTransfer() must run FIRST: it's what stops
++	// DataPumpThread and, in the isochronous case, blocks until every
++	// in-flight IsochronousTransfer()/QueueIsochronous() request is fully
++	// drained (see CamDevice.cpp -- with the pipeline keeping up to 2
++	// requests genuinely outstanding at once, there's essentially always
++	// one in flight while streaming). Calling _SelectIdleAlternate() --
++	// which resets the interface and tears down/recreates the underlying
++	// isochronous pipe -- before that drain has happened tears the pipe
++	// out from under whatever request(s) are still outstanding against
++	// it, which is exactly the scenario that produced a real "USB object
++	// did not become idle!" panic in Pipe::~Pipe()'s WaitForIdle() during
++	// testing: the pipe's reference count could never reach zero because
++	// a transfer nobody was tracking anymore was still holding it.
++	status_t status = CamDevice::StopTransfer();
+ 	_SelectIdleAlternate();
+-	return CamDevice::StopTransfer();
++	return status;
+ }
+ 
+ 
+@@ -606,7 +624,26 @@ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ 		const usb_video_frame_descriptor* descriptor
+ 			= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(i);
+ 		if ((*descriptor).width == width && (*descriptor).height == height) {
+-			fUncompressedFrameIndex = i;
++			// Store the descriptor's own UVC bFrameIndex (what
++			// _ProbeCommitFormat() sends to the camera in the probe/commit
++			// request), NOT the BList position i. These are different
++			// numbering schemes: list positions start at 0 in discovery
++			// order, UVC frame indices start at 1 in descriptor order. On
++			// this camera the list is [pos 0 = frame_index 1 (640x480),
++			// pos 1 = frame_index 2 (320x240)], so storing the position
++			// (1) for the 320x240 pick made the camera commit *its*
++			// frame_index 1 -- 640x480 -- and honestly stream 614400-byte
++			// frames (dwMaxVideoFrameSize in the commit response said
++			// exactly that all along) while everything host-side decoded
++			// 153600-byte 320x240 frames. Chopping a 640-wide stream into
++			// 320-wide rows renders every real row as two half-rows
++			// (the persistent "interlaced"/vertically-stretched look),
++			// and cutting 614400-byte frames at 153600 makes the frame
++			// phase advance by a quarter frame per displayed frame (the
++			// persistent vertical scroll) -- both of which survived every
++			// fix aimed at capture/deframing/display, because the bytes
++			// themselves were never wrong, only this index.
++			fUncompressedFrameIndex = descriptor->frame_index;
+ 			SetVideoFrame(BRect(0, 0, width - 1, height - 1));
+ 			return B_OK;
+ 		}
+@@ -1245,13 +1282,29 @@ UVCCamDevice::_SetParameterValue(uint16 wValue, int8 setValue)
+ status_t
+ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ {
+-	memset(buffer->Data(), 0, buffer->SizeAvailable());
++	// Deliberately NOT clearing the buffer up front anymore: the buffers
++	// rotate through a small group, so on any path that ends up not
++	// decoding fresh pixels into this one (frame dropped by the
++	// deframer, WaitFrame timeout, ...) the display now briefly repeats
++	// slightly-older content instead of flashing a solid black frame,
++	// which is what the old unconditional memset() produced.
+ 	status_t err = fDeframer->WaitFrame(2000000);
+ 	if (err < B_OK) {
+ 		fprintf(stderr, "WaitFrame: %" B_PRIx32 "\n", err);
+ 		return err;
+ 	}
+ 
++	// Latency: the deframer queues completed frames (up to 50!) and
++	// GetFrame() hands them out oldest-first, so whenever the camera
++	// produces faster than the media pipeline consumes, a backlog builds
++	// up and the on-screen image lags further and further behind
++	// reality. Drain the queue down to the newest frame: for every
++	// additional queued frame beyond the one whose semaphore count we
++	// just consumed, drop the current oldest and consume its count too,
++	// so the GetFrame() below always returns the most recent one.
++	while (fDeframer->WaitFrame(0) == B_OK)
++		fDeframer->DropFrame();
++
+ 	CamFrame* f;
+ 	err = fDeframer->GetFrame(&f, stamp);
+ 	if (err < B_OK) {
+@@ -1262,21 +1315,74 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ 	long int w = (long)(VideoFrame().right - VideoFrame().left + 1);
+ 	long int h = (long)(VideoFrame().bottom - VideoFrame().top + 1);
+ 
+-	if (buffer->SizeAvailable() >= (size_t)w * h * 4) {
++	// _DecodeYUY2()/_DecodeColor() read a fixed w*h*2 / w*h bytes from the
++	// captured frame; a frame the deframer hands back short would make
++	// them read past the end of the frame's actual buffer (a real
++	// segfault happened this way during bring-up). The deframer only
++	// emits exact-size frames for uncompressed formats these days, but
++	// keep the size gate anyway: skipping a frame (the buffer then
++	// retains its previous contents) is far better than reading out of
++	// bounds if a short one ever slips through again.
++	size_t srcSize = f->BufferLength();
++	size_t neededSize = fIsYUY2 ? (size_t)w * h * 2 : (size_t)w * h;
++
++	if (buffer->SizeAvailable() >= (size_t)w * h * 4 && srcSize >= neededSize) {
+ 		// TODO: The Video Producer only outputs B_RGB32.  This is OK for most
+ 		// applications.  This could be leveraged if applications can
+ 		// consume B_YUV422.
+-		_DecodeColor((unsigned char*)buffer->Data(),
+-			(unsigned char*)f->Buffer(), w, h);
++		//
++		// dstLen/srcLen are also passed all the way into the decoders
++		// themselves (not just checked here) as a hard backstop: this
++		// check alone was not enough to prevent a real out-of-bounds
++		// access inside _DecodeYUY2 (confirmed via a kernel panic --
++		// VMCache::InsertPage -- reading or writing outside one of these
++		// two buffers despite this check passing), so the decode loops
++		// now clamp themselves to whatever actually fits rather than
++		// trusting w*h to be consistent with the buffers' real sizes.
++		if (fIsYUY2) {
++			_DecodeYUY2((unsigned char*)buffer->Data(),
++				(unsigned char*)f->Buffer(), w, h,
++				buffer->SizeAvailable(), srcSize);
++		} else {
++			_DecodeColor((unsigned char*)buffer->Data(),
++				(unsigned char*)f->Buffer(), w, h,
++				buffer->SizeAvailable(), srcSize);
++		}
+ 	}
+ 	delete f;
+ 	return B_OK;
+ }
+ 
+ 
++size_t
++UVCCamDevice::MaxRawFrameSize()
++{
++	// fMaxVideoFrameSize comes from the negotiated probe/commit response
++	// (_ProbeCommitFormat()) and was meant to be exact for uncompressed
++	// formats -- but diagnostic logging caught it stuck at 614400 (a
++	// 640x480 frame) while VideoFrame() and the actual stream were at
++	// 320x240 (real frame size 153600), a 4x mismatch. Whatever the exact
++	// cause (some path where StartTransfer()/_ProbeCommitFormat() ran
++	// against a different fUncompressedFrameIndex than the one
++	// AcceptVideoFrame() later settled VideoFrame() on), trusting that
++	// stale value made the deframer's frame-boundary backstop essentially
++	// never fire at the right point -- frames came out anywhere from ~1
++	// packet to ~3x the real expected size, never landing on it.
++	// Computing directly from VideoFrame() instead -- the same source
++	// FillFrameBuffer()/_DecodeYUY2() already use -- means the backstop
++	// can never disagree with what decode itself expects, regardless of
++	// what caused fMaxVideoFrameSize to drift.
++	long int width = (long)(VideoFrame().right - VideoFrame().left + 1);
++	long int height = (long)(VideoFrame().bottom - VideoFrame().top + 1);
++	if (width <= 0 || height <= 0)
++		return 0;
++	return fIsYUY2 ? (size_t)width * height * 2 : (size_t)width * height;
++}
++
++
+ void
+ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+-	int32 width, int32 height)
++	int32 width, int32 height, size_t dstLen, size_t srcLen)
+ {
+ 	long int i;
+ 	unsigned char* rawpt, * scanpt;
+@@ -1286,6 +1392,17 @@ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+ 	scanpt = dst;
+ 	size = width*height;
+ 
++	// Clamp to whatever both buffers actually have room for: the caller's
++	// w*h-based size check has been seen to pass while the real captured
++	// (srcLen) or destination (dstLen) buffer was smaller than w*h implies
++	// -- reading/writing past that crashed the kernel (VMCache::InsertPage)
++	// rather than just corrupting this one frame's pixels. A short frame
++	// this way, not a crash.
++	if ((size_t)size > srcLen)
++		size = (long int)srcLen;
++	if ((size_t)size * 3 > dstLen)
++		size = (long int)(dstLen / 3);
++
+ 	for ( i = 0; i < size; i++ ) {
+ 	if ( (i/width) % 2 == 0 ) {
+ 		if ( (i % 2) == 0 ) {
+@@ -1349,6 +1466,67 @@ UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+ }
+ 
+ 
++static inline unsigned char
++clamp_byte(int value)
++{
++	if (value < 0)
++		return 0;
++	if (value > 255)
++		return 255;
++	return (unsigned char)value;
++}
++
++
++void
++UVCCamDevice::_DecodeYUY2(unsigned char* dst, unsigned char* src,
++	int32 width, int32 height, size_t dstLen, size_t srcLen)
++{
++	// YUY2/YUYV packs 2 pixels into 4 bytes: Y0 U Y1 V (4:2:2 subsampling,
++	// chroma shared between the pixel pair). B_RGB32 stores each pixel as
++	// B, G, R, - in memory (little endian).
++	int32 pixelPairs = (width * height) / 2;
++
++	// Clamp to whatever both buffers actually have room for (4 src bytes
++	// and 8 dst bytes per pixel pair). The caller's w*h-based size check
++	// has been seen to pass while the real captured (srcLen) or
++	// destination (dstLen) buffer was smaller than w*h implies -- reading
++	// or writing past that crashed the kernel (VMCache::InsertPage: an
++	// out-of-bounds access here, confirmed via a real panic during
++	// sustained capture) rather than just corrupting this one frame's
++	// pixels. Decoding fewer pixel pairs leaves the rest of dst at
++	// whatever FillFrameBuffer's memset(0) put there -- a partially
++	// black frame, not a crash.
++	int32 maxPairsBySrc = (int32)(srcLen / 4);
++	int32 maxPairsByDst = (int32)(dstLen / 8);
++	if (pixelPairs > maxPairsBySrc)
++		pixelPairs = maxPairsBySrc;
++	if (pixelPairs > maxPairsByDst)
++		pixelPairs = maxPairsByDst;
++
++	for (int32 i = 0; i < pixelPairs; i++) {
++		int y0 = src[0];
++		int u = src[1] - 128;
++		int y1 = src[2];
++		int v = src[3] - 128;
++		src += 4;
++
++		int r = (359 * v) >> 8;
++		int g = (88 * u + 183 * v) >> 8;
++		int b = (454 * u) >> 8;
++
++		dst[0] = clamp_byte(y0 + b);
++		dst[1] = clamp_byte(y0 - g);
++		dst[2] = clamp_byte(y0 + r);
++		dst[3] = 0xff;
++		dst[4] = clamp_byte(y1 + b);
++		dst[5] = clamp_byte(y1 - g);
++		dst[6] = clamp_byte(y1 + r);
++		dst[7] = 0xff;
++		dst += 8;
++	}
++}
++
++
+ 
+ 
+ UVCCamDeviceAddon::UVCCamDeviceAddon(WebCamMediaAddOn* webcam)
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 9b60f38bfb..1113673319 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -35,6 +35,7 @@ public:
+ 									const void *value, size_t size);
+ 	virtual status_t			FillFrameBuffer(BBuffer *buffer,
+ 									bigtime_t *stamp = NULL);
++	virtual size_t				MaxRawFrameSize();
+ 
+ private:
+ 			void				_ParseVideoControl(
+@@ -48,7 +49,12 @@ private:
+ 			status_t			_SelectIdleAlternate();
+ 			void 				_DecodeColor(unsigned char *dst,
+ 									unsigned char *src, int32 width,
+-									int32 height);
++									int32 height, size_t dstLen,
++									size_t srcLen);
++			void				_DecodeYUY2(unsigned char *dst,
++									unsigned char *src, int32 width,
++									int32 height, size_t dstLen,
++									size_t srcLen);
+ 
+ 			void				_AddProcessingParameter(BParameterGroup* group,
+ 									int32 index,
+@@ -93,6 +99,7 @@ private:
+ 			float				fGain;
+ 
+ 			bool				fBinaryBacklightCompensation;
++			bool				fIsYUY2;
+ 
+ 			int					fWBTempAuto;
+ 			int					fWBCompAuto;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+index de84f3840c..50101e4dce 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+@@ -19,7 +19,9 @@
+ UVCDeframer::UVCDeframer(CamDevice* device)
+ 	: CamDeframer(device),
+ 	fFrameCount(0),
+-	fID(0)
++	fID(0),
++	fLastPacketFID(-1),
++	fResyncCount(0)
+ {
+ }
+ 
+@@ -29,39 +31,172 @@ UVCDeframer::~UVCDeframer()
+ }
+ 
+ 
++void
++UVCDeframer::_EmitCurrentFrame()
++{
++	fFrameCount++;
++	const uint8* buf = (uint8*)fInputBuffer.Buffer();
++	fCurrentFrame->Write(buf, fInputBuffer.BufferLength());
++
++	{
++		// The frame list is read and emptied by the media thread under this
++		// same lock (CamDeframer::GetFrame/DropFrame/CountFrames), but this
++		// side -- the USB transfer thread -- was adding to it unlocked. Two
++		// threads mutating a BList at once corrupts its internal array, and
++		// the failure surfaces much later as a "double free" when a stale
++		// pointer is handed to delete. Seen for real once a consumer started
++		// draining stale frames in a tight loop, which turned a rare race
++		// into a frequent one.
++		BAutolock l(fLocker);
++		fFrames.AddItem(fCurrentFrame);
++	}
++
++	release_sem(fFrameSem);
++	fCurrentFrame = NULL;
++
++	// BMallocIO::SetSize(0) frees the backing buffer but does NOT reset
++	// the write position, so without also seeking back to 0 here, every
++	// subsequent frame's payload would keep appending after all prior
++	// frames' data instead of starting fresh -- meaning FillFrameBuffer()
++	// would always end up decoding the very first frame ever captured
++	// (often a dark/black frame from the sensor's power-up/auto-exposure
++	// ramp-up) and never anything newer.
++	fInputBuffer.SetSize(0);
++	fInputBuffer.Seek(0, SEEK_SET);
++}
++
++
+ ssize_t
+ UVCDeframer::Write(const void* buffer, size_t size)
+ {
+ 	const uint8* buf = (const uint8*)buffer;
++
++	if (size < 2 || size < (size_t)buf[0]) {
++		// Malformed packet (shorter than its own declared header length) --
++		// nothing usable in it, and indexing buf[0]/buf[1] below would be
++		// out of bounds.
++		return size;
++	}
++
+ 	int payloadSize = size - buf[0]; // total length - header length
+-	
+-	// This packet is just a header
+-	if (size == buf[0])
+-		return 0;
+-	
+-	// Allocate frame
+-	if (!fCurrentFrame) {
+-		BAutolock l(fLocker);
+-		if (fFrames.CountItems() < MAXFRAMEBUF)
+-			fCurrentFrame = AllocFrame();
+-		else {
+-			printf("Dropped %ld bytes. Too many queued frames.)\n", size);
+-			return size;
++	const uint8* payload = &buf[buf[0]];
++
++	// For fixed-size (uncompressed) formats, frame the stream on the
++	// payload header's FID bit, validated by the known exact frame size.
++	//
++	// History: FID was previously written off as unreliable and framing
++	// was done purely by byte count -- but every observation backing
++	// that verdict was made while the camera was accidentally committed
++	// to 640x480 (a frame-index numbering bug in AcceptVideoFrame())
++	// while the host assembled/decoded 320x240, so *everything* looked
++	// broken. The raw header dumps from that period actually show FID
++	// stable across 60+ consecutive packets -- i.e. behaving correctly
++	// for the large real frames the camera was sending. With the commit
++	// fixed, FID toggles at the camera's true frame boundaries, which is
++	// exactly the anchor byte-count framing lacked: with pure byte
++	// count, every byte the camera drops mid-frame (this camera flags
++	// real data loss via the header ERR bit routinely) pulls the fixed
++	// 153600-byte window into the next frame, showing up on screen as
++	// vertical jumping/drift.
++	//
++	// So: accumulate payload until FID changes; at that boundary, emit
++	// the frame ONLY if it's exactly the expected size, and silently
++	// drop it otherwise (a dropped frame just leaves the previous one on
++	// screen -- far better than displaying a vertically-shifted one).
++	// If FID turns out broken after all (never toggling, or toggling so
++	// often nothing ever gets emitted), permanently fall back to the
++	// old pure byte-count framing rather than stalling the stream.
++	size_t maxFrameSize = fDevice != NULL ? fDevice->MaxRawFrameSize() : 0;
++
++	if (maxFrameSize > 0) {
++		int32 packetFID = buf[1] & 1;
++		bool boundary = fLastPacketFID >= 0 && packetFID != fLastPacketFID;
++		fLastPacketFID = packetFID;
++
++		// Hybrid framing: emit on exact byte count, realign on FID.
++		//
++		// In the steady state each frame's packets sum to exactly
++		// maxFrameSize, the last one triggers the emit below, and the
++		// accumulator is therefore always empty again by the time the
++		// next frame's first packet arrives with its toggled FID -- so
++		// leftover bytes at a FID boundary can mean only one thing: the
++		// previous frame lost data mid-stream and is short. Its bytes
++		// are unusable (wrong row phase); drop them so the new frame
++		// starts aligned at the camera's true frame start.
++		//
++		// Framing by byte count (rather than emitting whatever
++		// accumulated at the FID boundary) is what keeps this robust
++		// against FID *itself* being unreliable: if a whole frame is
++		// lost end-to-end, the FID sequence just doesn't visibly
++		// toggle (0,1,[lost 0],1,... reads as 1->1) -- with byte-count
++		// emission that's harmless, since the next frame still starts
++		// aligned and simply fills/emits as usual. An earlier version
++		// that trusted FID as the only frame terminator concluded from
++		// exactly that situation that FID was broken and permanently
++		// downgraded itself to unanchored byte framing -- which is why
++		// the picture used to hold steady at first and then, after the
++		// first fully-lost frame (~20s in), jump to a wrong vertical
++		// offset for good.
++		if (boundary && fInputBuffer.BufferLength() > 0) {
++			size_t have = fInputBuffer.BufferLength();
++			fResyncCount++;
++			fInputBuffer.SetSize(0);
++			fInputBuffer.Seek(0, SEEK_SET);
++			if ((fResyncCount & 31) == 1) {
++				debug_printf("usb_webcam deframer: dropped %" B_PRIuSIZE
++					"-byte partial frame at FID boundary (drop #%" B_PRIu32
++					", %" B_PRId32 " good frames so far)\n", have,
++					fResyncCount, fFrameCount);
++			}
++		}
++
++		if (payloadSize > 0) {
++			if (!fCurrentFrame) {
++				BAutolock l(fLocker);
++				if (fFrames.CountItems() < MAXFRAMEBUF)
++					fCurrentFrame = AllocFrame();
++				else {
++					printf("Dropped %ld bytes. Too many queued frames.)\n",
++						size);
++					return size;
++				}
++			}
++			fInputBuffer.Write(payload, payloadSize);
++
++			if (fInputBuffer.BufferLength() == maxFrameSize) {
++				_EmitCurrentFrame();
++			} else if (fInputBuffer.BufferLength() > maxFrameSize) {
++				// Only reachable when loss desynchronized us in a way
++				// no FID boundary has caught yet; discard and let the
++				// next boundary re-anchor.
++				fResyncCount++;
++				fInputBuffer.SetSize(0);
++				fInputBuffer.Seek(0, SEEK_SET);
++			}
+ 		}
++		return size;
+ 	}
+-	
+-	// Write payload to buffer
+-	fInputBuffer.Write(&buf[buf[0]], payloadSize);
+-	
+-	// If end of frame add frame to list of frames
+-	if ((buf[1] & 2) || (buf[1] & 1) != fID) {
++
++	// Compressed/unknown-size path: FID/EOF is all there is to go on.
++	// Per the UVC spec, a header-only (zero-payload) packet with the EOF
++	// bit set is a valid way for a camera to terminate a frame -- so this
++	// check must not be skipped just because payloadSize is 0.
++	if (payloadSize > 0) {
++		if (!fCurrentFrame) {
++			BAutolock l(fLocker);
++			if (fFrames.CountItems() < MAXFRAMEBUF)
++				fCurrentFrame = AllocFrame();
++			else {
++				printf("Dropped %ld bytes. Too many queued frames.)\n", size);
++				return size;
++			}
++		}
++		fInputBuffer.Write(payload, payloadSize);
++	}
++
++	if (fCurrentFrame != NULL && ((buf[1] & 2) || (buf[1] & 1) != fID)) {
+ 		fID = buf[1] & 1;
+-		fFrameCount++;
+-		buf = (uint8*)fInputBuffer.Buffer();
+-		fCurrentFrame->Write(buf, fInputBuffer.BufferLength());
+-		fFrames.AddItem(fCurrentFrame);
+-		release_sem(fFrameSem);
+-		fCurrentFrame = NULL;
++		_EmitCurrentFrame();
+ 	}
+ 
+ 	return size;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+index f642bafdc7..0c0c988624 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+@@ -21,10 +21,16 @@ public:
+ 
+ private:
+ 	void						_PrintBuffer(const void* buffer, size_t size);
++	void						_EmitCurrentFrame();
+ 
+ 	int32						fFrameCount;
+ 	int32						fID;
+ 	BMallocIO					fInputBuffer;
++
++	// Frame-phase resynchronization state for fixed-size (uncompressed)
++	// formats -- see Write() for the full story.
++	int32						fLastPacketFID;
++	uint32						fResyncCount;
+ };
+ 
+ #endif /* _UVC_DEFRAMER_H */

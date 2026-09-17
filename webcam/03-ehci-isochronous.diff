@@ -1,0 +1,187 @@
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 45feb64bc9..bdda437c06 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -1204,6 +1204,33 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 	if ((isochronousData->flags & USB_ISO_ASAP) != 0 ||
+ 		isochronousData->starting_frame_number == NULL) {
+ 
++		// Deciding the starting frame AND reserving it (by advancing
++		// fNextStartingFrame past the range this submission will use)
++		// has to happen as one atomic step. Historically only one
++		// isochronous submission was ever in flight at a time (each
++		// caller waited for completion before submitting the next), so
++		// this reads/writes of fFirstIsochronousTransfer/
++		// fNextStartingFrame were never actually contended. That's no
++		// longer true: usb_raw.cpp now lets two callers have a
++		// transfer outstanding simultaneously specifically so EHCI's
++		// chaining below can eliminate the schedule gap between
++		// submissions -- which means two threads can now call
++		// SubmitIsochronous() concurrently. Without this lock, both
++		// could read the same fNextStartingFrame and schedule
++		// overlapping ITDs into the same fItdEntries[] slots.
++		//
++		// The number of virtual frames this submission will occupy is
++		// knowable up front (packet_count is fixed by the caller, one
++		// itd covers up to 8 packets/microframes = 1 frame), so the
++		// reservation doesn't need to wait for the ITD-building loop
++		// below to actually run.
++		uint32 expectedFrameCount = (isochronousData->packet_count + 7) / 8;
++
++		if (!LockIsochronous()) {
++			delete[] isoRequest;
++			return B_ERROR;
++		}
++
+ 		if (fFirstIsochronousTransfer != NULL && fNextStartingFrame != -1)
+ 			currentFrame = fNextStartingFrame;
+ 		else {
+@@ -1224,6 +1251,11 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 		// 2. We stay in the range 0-127
+ 		// 3. There is enough bandwidth in the first entry
+ 		currentFrame &= EHCI_VFRAMELIST_ENTRIES_COUNT - 1;
++
++		fNextStartingFrame = (currentFrame + expectedFrameCount)
++			& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1);
++
++		UnlockIsochronous();
+ 	} else {
+ 		// Find out if the frame number specified has enough bandwidth,
+ 		// otherwise find the first next available frame with enough bandwidth
+@@ -1246,6 +1278,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 
+ 	phys_addr_t currentPhy = bufferPhy;
+ 	uint32 frameCount = 0;
++	uint32 firstFrame = currentFrame;
+ 	while (dataLength > 0) {
+ 		ehci_itd* itd = CreateItdDescriptor();
+ 		isoRequest[itdIndex++] = itd;
+@@ -1299,7 +1332,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 
+ 	// Add transfer to the list
+ 	result = AddPendingIsochronousTransfer(transfer, isoRequest,
+-		itdIndex - 1, directionIn, bufferPhy, bufferLog,
++		itdIndex - 1, firstFrame, directionIn, bufferPhy, bufferLog,
+ 		transfer->DataLength());
+ 	if (result != B_OK) {
+ 		TRACE_ERROR("failed to add pending isochronous transfer\n");
+@@ -1311,7 +1344,12 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 
+ 	TRACE("appended isochronous transfer by starting at frame number %d\n",
+ 		currentFrame);
+-	fNextStartingFrame = currentFrame + 1;
++	// fNextStartingFrame was already reserved (advanced past this whole
++	// submission's frame range) up front, atomically with deciding
++	// currentFrame -- see the comment above where it's set. Writing it
++	// again here, unlocked, would at best be redundant and at worst
++	// clobber a second thread's concurrent reservation with a now-stale
++	// value, corrupting the chaining this exists to make safe.
+ 
+ 	// Wake up the isochronous finisher thread
+ 	release_sem_etc(fFinishIsochronousTransfersSem, 1 /*frameCount*/,
+@@ -1694,8 +1732,8 @@ EHCI::AddPendingTransfer(Transfer *transfer, ehci_qh *queueHead,
+ 
+ status_t
+ EHCI::AddPendingIsochronousTransfer(Transfer *transfer, ehci_itd **isoRequest,
+-	uint32 lastIndex, bool directionIn, addr_t bufferPhy, void* bufferLog,
+-	size_t bufferSize)
++	uint32 lastIndex, uint32 firstFrame, bool directionIn, addr_t bufferPhy,
++	void* bufferLog, size_t bufferSize)
+ {
+ 	if (!transfer || !isoRequest)
+ 		return B_BAD_VALUE;
+@@ -1708,6 +1746,7 @@ EHCI::AddPendingIsochronousTransfer(Transfer *transfer, ehci_itd **isoRequest,
+ 	data->transfer = transfer;
+ 	data->descriptors = isoRequest;
+ 	data->last_to_process = lastIndex;
++	data->first_frame = firstFrame;
+ 	data->incoming = directionIn;
+ 	data->is_active = true;
+ 	data->link = NULL;
+@@ -2208,6 +2247,27 @@ EHCI::FinishIsochronousTransfers()
+ 
+ 					itd = itd->prev;
+ 
++					// The itd examined above (transfer->descriptors[
++					// last_to_process]) was already unlinked from its own
++					// frame slot by the UnlinkITDescriptors() call before
++					// this if/else. A multi-descriptor transfer's *other*
++					// descriptors are linked into their own, different
++					// frame slots (transfer->first_frame + i, one itd per
++					// virtual frame) and were never visited or unlinked --
++					// only ever matched against by index, since
++					// FindIsochronousTransfer() only compares the last
++					// one. Freeing them without unlinking first leaves
++					// whatever frame slot they're still in pointing at
++					// freed memory, corrupting that chain for whenever it
++					// next gets scanned (confirmed via a real use-after-
++					// free page fault doing exactly this).
++					for (uint32 i = 0; i < transfer->last_to_process; i++) {
++						uint32 slot = (transfer->first_frame + i)
++							& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1);
++						UnlinkITDescriptors(transfer->descriptors[i],
++							&fItdEntries[slot]);
++					}
++
+ 					for (uint32 i = 0; i <= transfer->last_to_process; i++)
+ 						FreeDescriptor(transfer->descriptors[i]);
+ 
+@@ -2234,6 +2294,27 @@ EHCI::FinishIsochronousTransfers()
+ 			fFrameBandwidth[currentFrame] = MAX_AVAILABLE_BANDWIDTH;
+ 			currentFrame = (currentFrame + 1) % EHCI_VFRAMELIST_ENTRIES_COUNT;
+ 		}
++
++		if (!transferDone) {
++			// Read-only diagnostic: no behavior change from stock (still
++			// silently gives up, exactly as before), just logging so an
++			// actual failure can be characterized instead of guessed at.
++			// Two prior attempts to *act* on this condition (freeing the
++			// unfound transfer's descriptors, then not freeing them but
++			// still force-completing it) both made a real, reproducible
++			// black-screen-after-sustained-streaming failure worse
++			// (kernel panic, then a full system hang) -- so this is
++			// intentionally observation-only until there's a concrete
++			// dprintf trail to reason from.
++			uint32 liveFrame = (ReadOpReg(EHCI_FRINDEX) / 8)
++				& (EHCI_FRAMELIST_ENTRIES_COUNT - 1);
++			TRACE_ERROR("FinishIsochronousTransfers gave up: scanned all %"
++				B_PRIu32 " virtual frames without finding a completed "
++				"transfer (started at frame %" B_PRIu32 ", live frame now %"
++				B_PRIu32 ", pending list %s)\n", loop, currentFrame,
++				liveFrame, fFirstIsochronousTransfer != NULL ? "non-empty"
++					: "empty");
++		}
+ 	}
+ }
+ 
+diff --git a/src/add-ons/kernel/busses/usb/ehci.h b/src/add-ons/kernel/busses/usb/ehci.h
+index a5eea1f28f..270a2d649c 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.h
++++ b/src/add-ons/kernel/busses/usb/ehci.h
+@@ -39,6 +39,14 @@ typedef struct isochronous_transfer_data {
+ 	// transfer type
+ 	ehci_itd **					descriptors;
+ 	uint16						last_to_process;
++	uint32						first_frame;
++		// Virtual frame list index (fItdEntries[]) that descriptors[0] was
++		// linked into; descriptors[i] is at (first_frame + i) & mask. Only
++		// the last descriptor gets unlinked by the normal completion scan
++		// (it's the one FindIsochronousTransfer() matched on); this lets
++		// completion also unlink every *other* descriptor from its own
++		// frame slot before freeing it, instead of freeing memory that's
++		// still linked into some other frame's itd chain.
+ 	bool						incoming;
+ 	bool						is_active;
+ 	isochronous_transfer_data *	link;
+@@ -103,8 +111,9 @@ static	int32						InterruptPollThread(void *data);
+ 		status_t					AddPendingIsochronousTransfer(
+ 										Transfer *transfer,
+ 										ehci_itd **isoRequest, uint32 lastIndex,
+-										bool directionIn, addr_t bufferPhy,
+-										void *bufferLog, size_t bufferSize);
++										uint32 firstFrame, bool directionIn,
++										addr_t bufferPhy, void *bufferLog,
++										size_t bufferSize);
+ 		status_t					CancelAllPendingTransfers();
+ 
+ 

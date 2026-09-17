@@ -1,0 +1,56 @@
+diff --git a/src/kits/media/MediaEventLooper.cpp b/src/kits/media/MediaEventLooper.cpp
+index 0ea6c2f41e..11c87d39bb 100644
+--- a/src/kits/media/MediaEventLooper.cpp
++++ b/src/kits/media/MediaEventLooper.cpp
+@@ -224,6 +224,17 @@ BMediaEventLooper::ControlLoop()
+ 
+ 	fSchedulingLatency = estimate_max_scheduling_latency(fControlThread);
+ 	while (RunState() != B_QUITTING) {
++		// TimeSource() is not guaranteed to hand back an object. It builds one
++		// lazily by asking the media server, and that request fails while the
++		// server is going away -- which is exactly when this loop is still
++		// turning. The dereferences below used to be unguarded, so the node
++		// faulted on its way out; and because every media add-on shares one
++		// process, a webcam shutting down took the audio mixer with it and
++		// killed sound system-wide.
++		//
++		// Without a time source the only clock left is the real one, which is
++		// what the default system time source would have reported anyway.
++		BTimeSource* timeSource = TimeSource();
+ 		if (err == B_TIMED_OUT
+ 				|| err == B_WOULD_BLOCK) {
+ 			// NOTE: The reference for doing the lateness calculus this way can
+@@ -240,7 +251,8 @@ BMediaEventLooper::ControlLoop()
+ 				// The general idea of lateness is to allow
+ 				// the client code to detect when the buffer
+ 				// is handled late or early.
+-				bigtime_t lateness = TimeSource()->RealTime() - waitUntil;
++				bigtime_t lateness = (timeSource != NULL
++					? timeSource->RealTime() : system_time()) - waitUntil;
+ 
+ 				DispatchEvent(&event, lateness, hasRealtime);
+ 			}
+@@ -255,9 +267,10 @@ BMediaEventLooper::ControlLoop()
+ 		hasEvent = fEventQueue.HasEvents();
+ 
+ 		if (hasEvent) {
+-			waitUntil = TimeSource()->RealTimeFor(
+-				fEventQueue.FirstEventTime(),
+-				fEventLatency + fSchedulingLatency);
++			bigtime_t latency = fEventLatency + fSchedulingLatency;
++			waitUntil = timeSource != NULL
++				? timeSource->RealTimeFor(fEventQueue.FirstEventTime(), latency)
++				: fEventQueue.FirstEventTime() - latency;
+ 		} else if (!hasRealtime)
+ 			waitUntil = B_INFINITE_TIMEOUT;
+ 
+@@ -273,7 +286,8 @@ BMediaEventLooper::ControlLoop()
+ 		}
+ 
+ 		if (waitUntil != B_INFINITE_TIMEOUT
+-				&& TimeSource()->RealTime() >= waitUntil) {
++				&& (timeSource != NULL ? timeSource->RealTime() : system_time())
++					>= waitUntil) {
+ 			err = WaitForMessage(0);
+ 		} else
+ 			err = WaitForMessage(waitUntil);

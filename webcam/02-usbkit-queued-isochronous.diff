@@ -1,0 +1,637 @@
+diff --git a/headers/os/device/USBKit.h b/headers/os/device/USBKit.h
+index 1e82f83f5a..2a7e7e556b 100644
+--- a/headers/os/device/USBKit.h
++++ b/headers/os/device/USBKit.h
+@@ -350,6 +350,19 @@ public:
+ 										usb_iso_packet_descriptor *packetDescriptors,
+ 										uint32 packetCount)	const;
+ 
++		// QueueIsochronous()/WaitIsochronous() split IsochronousTransfer()
++		// into a non-blocking submit step (returns a request ID) and a
++		// separate blocking wait step, so a caller can have more than one
++		// isochronous transfer genuinely outstanding with the host
++		// controller at once -- queue several, then wait on each in
++		// submission order. See their implementations for why that
++		// matters for isochronous IN throughput specifically.
++		int32						QueueIsochronous(void *data,
++										size_t length,
++										usb_iso_packet_descriptor *packetDescriptors,
++										uint32 packetCount) const;
++		ssize_t						WaitIsochronous(int32 requestID) const;
++
+ 		// These are convenience methods for getting and clearing the halt
+ 		// state of an endpoint. They use the control pipe of the device to
+ 		// send the corresponding requests.
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+index 41eb86a6d7..79769d7fe6 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+@@ -32,6 +32,40 @@
+ #define DRIVER_NAME		"usb_raw"
+ #define DEVICE_NAME		"bus/usb/raw"
+ 
++// Isochronous capture needs 2 requests genuinely in flight at once: EHCI
++// only avoids a multi-millisecond schedule gap between one isochronous
++// submission and the next when the new one is queued *before* the
++// previous one has completed and been removed from the pending list (see
++// EHCI::SubmitIsochronous()'s fNextStartingFrame chaining). Waiting for
++// one ISOCHRONOUS_TRANSFER ioctl to fully complete before issuing the
++// next -- which sharing the single device->notify/status/actual_length
++// below would force, since a second concurrent call would corrupt those
++// fields -- guarantees that gap on every single submission. These two
++// slots give isochronous callers their own private completion state so
++// two threads can have a transfer outstanding at the same time; every
++// other transfer type (control/interrupt/bulk) is untouched and keeps
++// using the single notify/status/actual_length fields below as before.
++typedef struct {
++	sem_id				notify;
++	status_t			status;
++	size_t				actual_length;
++	bool				in_use;
++
++	// Only populated/used by the QUEUE_ISOCHRONOUS + WAIT_ISOCHRONOUS
++	// pair: QUEUE submits and returns immediately, so the descriptor
++	// buffer and the userland destination to eventually copy them back
++	// to have to survive until the matching WAIT call runs (arbitrarily
++	// later, from the caller's perspective) instead of being freed/
++	// copied back before the ioctl returns like the plain, blocking
++	// ISOCHRONOUS_TRANSFER does.
++	usb_iso_packet_descriptor *packetDescriptors;
++	usb_iso_packet_descriptor *userPacketDescriptors;
++	size_t				descriptorsSize;
++	usb_pipe			endpointHandle;
++} iso_slot;
++
++#define USB_RAW_ISO_SLOT_COUNT 2
++
+ typedef struct {
+ 	usb_device			device;
+ 	mutex				lock;
+@@ -43,6 +77,9 @@ typedef struct {
+ 	sem_id				notify;
+ 	status_t			status;
+ 	size_t				actual_length;
++
++	mutex				isoSlotLock;
++	iso_slot			isoSlots[USB_RAW_ISO_SLOT_COUNT];
+ } raw_device;
+ 
+ int32 api_version = B_CUR_DRIVER_API_VERSION;
+@@ -67,6 +104,21 @@ usb_raw_device_added(usb_device newDevice, void **cookie)
+ 		return B_NO_MORE_SEMS;
+ 	}
+ 
++	mutex_init(&device->isoSlotLock, "usb_raw iso slot lock");
++	for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++) {
++		device->isoSlots[i].in_use = false;
++		device->isoSlots[i].notify = create_sem(0, "usb_raw iso slot notify");
++		if (device->isoSlots[i].notify < B_OK) {
++			for (int j = 0; j < i; j++)
++				delete_sem(device->isoSlots[j].notify);
++			mutex_destroy(&device->isoSlotLock);
++			delete_sem(device->notify);
++			mutex_destroy(&device->lock);
++			free(device);
++			return B_NO_MORE_SEMS;
++		}
++	}
++
+ 	char deviceName[64];
+ 	memcpy(deviceName, &newDevice, sizeof(usb_device));
+ 	if (gUSBModule->usb_ioctl('DNAM', deviceName, sizeof(deviceName)) >= B_OK) {
+@@ -236,6 +288,9 @@ usb_raw_free(void *cookie)
+ 		mutex_lock(&device->lock);
+ 		mutex_destroy(&device->lock);
+ 		delete_sem(device->notify);
++		mutex_destroy(&device->isoSlotLock);
++		for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++)
++			delete_sem(device->isoSlots[i].notify);
+ 		free(device);
+ 	}
+ 
+@@ -276,6 +331,38 @@ usb_raw_callback(void *cookie, status_t status, void *data, size_t actualLength)
+ }
+ 
+ 
++static status_t
++usb_raw_status_from_transfer_status(status_t status)
++{
++	switch (status) {
++		case B_OK:
++			return B_USB_RAW_STATUS_SUCCESS;
++		case B_TIMED_OUT:
++			return B_USB_RAW_STATUS_TIMEOUT;
++		case B_CANCELED:
++			return B_USB_RAW_STATUS_ABORTED;
++		case B_DEV_CRC_ERROR:
++			return B_USB_RAW_STATUS_CRC_ERROR;
++		case B_DEV_STALLED:
++			return B_USB_RAW_STATUS_STALLED;
++		default:
++			return B_USB_RAW_STATUS_FAILED;
++	}
++}
++
++
++static void
++usb_raw_iso_callback(void *cookie, status_t status, void *data,
++	size_t actualLength)
++{
++	TRACE((DRIVER_NAME": iso_callback()\n"));
++	iso_slot *slot = (iso_slot *)cookie;
++	slot->status = usb_raw_status_from_transfer_status(status);
++	slot->actual_length = actualLength;
++	release_sem(slot->notify);
++}
++
++
+ static status_t
+ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ {
+@@ -764,7 +851,6 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 
+ 		case B_USB_RAW_COMMAND_INTERRUPT_TRANSFER:
+ 		case B_USB_RAW_COMMAND_BULK_TRANSFER:
+-		case B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER:
+ 		{
+ 			if (length < sizeof(command.transfer))
+ 				return B_BUFFER_OVERFLOW;
+@@ -801,49 +887,23 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 				break;
+ 			}
+ 
+-			size_t descriptorsSize = 0;
+-			usb_iso_packet_descriptor *packetDescriptors = NULL;
+ 			void *transferData = NULL;
+-			MemoryDeleter descriptorsDeleter, dataDeleter;
++			MemoryDeleter dataDeleter;
+ 
+ 			bool inTransfer = (endpointInfo->descr->endpoint_address
+ 				& USB_ENDPOINT_ADDR_DIR_IN) != 0;
+-			if (op == B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER) {
+-				if (length < sizeof(command.isochronous))
+-					return B_BUFFER_OVERFLOW;
+-
+-				descriptorsSize = sizeof(usb_iso_packet_descriptor)
+-					* command.isochronous.packet_count;
+-				packetDescriptors
+-					= (usb_iso_packet_descriptor *)malloc(descriptorsSize);
+-				if (packetDescriptors == NULL) {
+-					command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
+-					command.transfer.length = 0;
+-					break;
+-				}
+-				descriptorsDeleter.SetTo(packetDescriptors);
+-
+-				if (!IS_USER_ADDRESS(command.isochronous.data)
+-					|| !IS_USER_ADDRESS(command.isochronous.packet_descriptors)
+-					|| user_memcpy(packetDescriptors,
+-						command.isochronous.packet_descriptors,
+-						descriptorsSize) != B_OK) {
+-					return B_BAD_ADDRESS;
+-				}
+-			} else {
+-				transferData = malloc(command.transfer.length);
+-				if (transferData == NULL) {
+-					command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
+-					command.transfer.length = 0;
+-					break;
+-				}
+-				dataDeleter.SetTo(transferData);
++			transferData = malloc(command.transfer.length);
++			if (transferData == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++				command.transfer.length = 0;
++				break;
++			}
++			dataDeleter.SetTo(transferData);
+ 
+-				if (!IS_USER_ADDRESS(command.transfer.data) || (!inTransfer
+-						&& user_memcpy(transferData, command.transfer.data,
+-							command.transfer.length) != B_OK)) {
+-					return B_BAD_ADDRESS;
+-				}
++			if (!IS_USER_ADDRESS(command.transfer.data) || (!inTransfer
++					&& user_memcpy(transferData, command.transfer.data,
++						command.transfer.length) != B_OK)) {
++				return B_BAD_ADDRESS;
+ 			}
+ 
+ 			status_t status;
+@@ -852,15 +912,10 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 				status = gUSBModule->queue_interrupt(endpointInfo->handle,
+ 					transferData, command.transfer.length,
+ 					usb_raw_callback, device);
+-			} else if (op == B_USB_RAW_COMMAND_BULK_TRANSFER) {
++			} else {
+ 				status = gUSBModule->queue_bulk(endpointInfo->handle,
+ 					transferData, command.transfer.length,
+ 					usb_raw_callback, device);
+-			} else {
+-				status = gUSBModule->queue_isochronous(endpointInfo->handle,
+-					command.isochronous.data, command.isochronous.length,
+-					packetDescriptors, command.isochronous.packet_count, NULL,
+-					0, usb_raw_callback, device);
+ 			}
+ 
+ 			if (status < B_OK) {
+@@ -882,17 +937,282 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 
+ 			if (command.transfer.status == B_OK)
+ 				status = B_OK;
+-			if (op == B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER) {
+-				if (user_memcpy(command.isochronous.packet_descriptors,
+-						packetDescriptors, descriptorsSize) != B_OK) {
+-					status = B_BAD_ADDRESS;
++			if (inTransfer && user_memcpy(command.transfer.data,
++				transferData, command.transfer.length) != B_OK) {
++				status = B_BAD_ADDRESS;
++			}
++
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER:
++		{
++			if (length < sizeof(command.isochronous))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			const usb_configuration_info *configurationInfo =
++				gUSBModule->get_configuration(device->device);
++			if (configurationInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_CONFIGURATION;
++				break;
++			}
++
++			if (command.transfer.interface >= configurationInfo->interface_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_INTERFACE;
++				break;
++			}
++
++			const usb_interface_info *interfaceInfo =
++				configurationInfo->interface[command.transfer.interface].active;
++			if (interfaceInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_ABORTED;
++				break;
++			}
++
++			if (command.transfer.endpoint >= interfaceInfo->endpoint_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			const usb_endpoint_info *endpointInfo =
++				&interfaceInfo->endpoint[command.transfer.endpoint];
++			if (!endpointInfo->handle) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			size_t descriptorsSize = sizeof(usb_iso_packet_descriptor)
++				* command.isochronous.packet_count;
++			usb_iso_packet_descriptor *packetDescriptors
++				= (usb_iso_packet_descriptor *)malloc(descriptorsSize);
++			if (packetDescriptors == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++				command.transfer.length = 0;
++				break;
++			}
++			MemoryDeleter descriptorsDeleter(packetDescriptors);
++
++			if (!IS_USER_ADDRESS(command.isochronous.data)
++				|| !IS_USER_ADDRESS(command.isochronous.packet_descriptors)
++				|| user_memcpy(packetDescriptors,
++					command.isochronous.packet_descriptors,
++					descriptorsSize) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++
++			// Claim a completion slot. Held only long enough to find a
++			// free slot and submit -- NOT across the wait below -- so a
++			// second thread's ISOCHRONOUS_TRANSFER call can submit its
++			// own request while this one is still in flight, instead of
++			// being serialized behind it (see the iso_slot comment near
++			// its definition for why that matters).
++			int slotIndex = -1;
++			mutex_lock(&device->isoSlotLock);
++			for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++) {
++				if (!device->isoSlots[i].in_use) {
++					device->isoSlots[i].in_use = true;
++					slotIndex = i;
++					break;
+ 				}
+-			} else {
+-				if (inTransfer && user_memcpy(command.transfer.data,
+-					transferData, command.transfer.length) != B_OK) {
+-					status = B_BAD_ADDRESS;
++			}
++			mutex_unlock(&device->isoSlotLock);
++
++			if (slotIndex < 0) {
++				// Every slot already has a request in flight -- this
++				// device only expects up to USB_RAW_ISO_SLOT_COUNT
++				// concurrent isochronous callers.
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				break;
++			}
++
++			iso_slot *slot = &device->isoSlots[slotIndex];
++			status_t status = gUSBModule->queue_isochronous(
++				endpointInfo->handle, command.isochronous.data,
++				command.isochronous.length, packetDescriptors,
++				command.isochronous.packet_count, NULL, 0,
++				usb_raw_iso_callback, slot);
++
++			if (status < B_OK) {
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				status = B_OK;
++				mutex_lock(&device->isoSlotLock);
++				slot->in_use = false;
++				mutex_unlock(&device->isoSlotLock);
++				break;
++			}
++
++			status = acquire_sem_etc(slot->notify, 1, B_KILL_CAN_INTERRUPT, 0);
++			if (status != B_OK) {
++				gUSBModule->cancel_queued_transfers(endpointInfo->handle);
++				acquire_sem(slot->notify);
++			}
++
++			command.transfer.status = slot->status;
++			command.transfer.length = slot->actual_length;
++
++			mutex_lock(&device->isoSlotLock);
++			slot->in_use = false;
++			mutex_unlock(&device->isoSlotLock);
++
++			if (command.transfer.status == B_OK)
++				status = B_OK;
++			if (user_memcpy(command.isochronous.packet_descriptors,
++					packetDescriptors, descriptorsSize) != B_OK) {
++				status = B_BAD_ADDRESS;
++			}
++
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_QUEUE_ISOCHRONOUS:
++		{
++			if (length < sizeof(command.isochronous))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			const usb_configuration_info *configurationInfo =
++				gUSBModule->get_configuration(device->device);
++			if (configurationInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_CONFIGURATION;
++				break;
++			}
++
++			if (command.transfer.interface >= configurationInfo->interface_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_INTERFACE;
++				break;
++			}
++
++			const usb_interface_info *interfaceInfo =
++				configurationInfo->interface[command.transfer.interface].active;
++			if (interfaceInfo == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_ABORTED;
++				break;
++			}
++
++			if (command.transfer.endpoint >= interfaceInfo->endpoint_count) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			const usb_endpoint_info *endpointInfo =
++				&interfaceInfo->endpoint[command.transfer.endpoint];
++			if (!endpointInfo->handle) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			size_t descriptorsSize = sizeof(usb_iso_packet_descriptor)
++				* command.isochronous.packet_count;
++			usb_iso_packet_descriptor *packetDescriptors
++				= (usb_iso_packet_descriptor *)malloc(descriptorsSize);
++			if (packetDescriptors == NULL) {
++				command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++				command.transfer.length = 0;
++				break;
++			}
++			MemoryDeleter descriptorsDeleter(packetDescriptors);
++
++			if (!IS_USER_ADDRESS(command.isochronous.data)
++				|| !IS_USER_ADDRESS(command.isochronous.packet_descriptors)
++				|| user_memcpy(packetDescriptors,
++					command.isochronous.packet_descriptors,
++					descriptorsSize) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++
++			int slotIndex = -1;
++			mutex_lock(&device->isoSlotLock);
++			for (int i = 0; i < USB_RAW_ISO_SLOT_COUNT; i++) {
++				if (!device->isoSlots[i].in_use) {
++					device->isoSlots[i].in_use = true;
++					slotIndex = i;
++					break;
+ 				}
+ 			}
++			mutex_unlock(&device->isoSlotLock);
++
++			if (slotIndex < 0) {
++				// Every slot already has a request outstanding -- the
++				// caller must WAIT_ISOCHRONOUS on one of its existing
++				// requests before queuing another.
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				command.isochronous.request_id = -1;
++				break;
++			}
++
++			iso_slot *slot = &device->isoSlots[slotIndex];
++			slot->packetDescriptors = packetDescriptors;
++			slot->userPacketDescriptors = command.isochronous.packet_descriptors;
++			slot->descriptorsSize = descriptorsSize;
++			slot->endpointHandle = endpointInfo->handle;
++
++			status_t submitStatus = gUSBModule->queue_isochronous(
++				endpointInfo->handle, command.isochronous.data,
++				command.isochronous.length, packetDescriptors,
++				command.isochronous.packet_count, NULL, 0,
++				usb_raw_iso_callback, slot);
++
++			if (submitStatus < B_OK) {
++				command.transfer.status = B_USB_RAW_STATUS_FAILED;
++				command.transfer.length = 0;
++				command.isochronous.request_id = -1;
++				mutex_lock(&device->isoSlotLock);
++				slot->in_use = false;
++				mutex_unlock(&device->isoSlotLock);
++				break;
++			}
++
++			// Ownership of packetDescriptors now belongs to the slot
++			// (freed at WAIT_ISOCHRONOUS time, once the transfer using
++			// it has actually completed) -- don't free it when this
++			// scope exits.
++			descriptorsDeleter.Detach();
++
++			command.transfer.status = B_USB_RAW_STATUS_SUCCESS;
++			command.isochronous.request_id = slotIndex;
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_WAIT_ISOCHRONOUS:
++		{
++			if (length < sizeof(command.isochronous))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			int32 slotIndex = command.isochronous.request_id;
++			if (slotIndex < 0 || slotIndex >= USB_RAW_ISO_SLOT_COUNT
++				|| !device->isoSlots[slotIndex].in_use) {
++				command.transfer.status = B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			iso_slot *slot = &device->isoSlots[slotIndex];
++			status = acquire_sem_etc(slot->notify, 1, B_KILL_CAN_INTERRUPT, 0);
++			if (status != B_OK) {
++				gUSBModule->cancel_queued_transfers(slot->endpointHandle);
++				acquire_sem(slot->notify);
++			}
++
++			command.transfer.status = slot->status;
++			command.transfer.length = slot->actual_length;
++
++			if (command.transfer.status == B_OK)
++				status = B_OK;
++			if (user_memcpy(slot->userPacketDescriptors,
++					slot->packetDescriptors, slot->descriptorsSize) != B_OK) {
++				status = B_BAD_ADDRESS;
++			}
++
++			free(slot->packetDescriptors);
++			slot->packetDescriptors = NULL;
++
++			mutex_lock(&device->isoSlotLock);
++			slot->in_use = false;
++			mutex_unlock(&device->isoSlotLock);
+ 
+ 			break;
+ 		}
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.h b/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+index 9968fa825e..0122e5a55e 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+@@ -37,7 +37,26 @@ typedef enum {
+ 	B_USB_RAW_COMMAND_CONTROL_TRANSFER = 0x4000,
+ 	B_USB_RAW_COMMAND_INTERRUPT_TRANSFER,
+ 	B_USB_RAW_COMMAND_BULK_TRANSFER,
+-	B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER
++	B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER,
++
++	// Submit-then-wait split of ISOCHRONOUS_TRANSFER: QUEUE returns
++	// immediately with isochronous.request_id identifying the request
++	// (instead of blocking for completion like ISOCHRONOUS_TRANSFER
++	// does), and a later WAIT call (passing that same request_id back in)
++	// blocks for that specific request's completion and fills in the
++	// result fields exactly like ISOCHRONOUS_TRANSFER would have. This
++	// lets one caller have two isochronous transfers genuinely
++	// outstanding at once -- submit both, then wait on each in turn --
++	// which matters for isochronous IN specifically: the host controller
++	// can schedule a second submission to start immediately where the
++	// first one's schedule range ends only if it's queued before the
++	// first completes (see EHCI::SubmitIsochronous's fNextStartingFrame
++	// chaining); waiting for each transfer to fully finish before
++	// queuing the next guarantees a scheduling gap between every pair of
++	// submissions, during which an isochronous IN device keeps
++	// transmitting into microframes nothing was scheduled to receive.
++	B_USB_RAW_COMMAND_QUEUE_ISOCHRONOUS,
++	B_USB_RAW_COMMAND_WAIT_ISOCHRONOUS
+ } usb_raw_command_id;
+ 
+ 
+@@ -182,6 +201,10 @@ typedef union {
+ 		size_t							length;
+ 		usb_iso_packet_descriptor		*packet_descriptors;
+ 		uint32							packet_count;
++		// Only used by QUEUE_ISOCHRONOUS (out: identifies this request)
++		// and WAIT_ISOCHRONOUS (in: which request to wait for). Unused
++		// by the plain (submit-and-block) ISOCHRONOUS_TRANSFER.
++		int32							request_id;
+ 	} isochronous;
+ } usb_raw_command;
+ 
+diff --git a/src/kits/device/USBEndpoint.cpp b/src/kits/device/USBEndpoint.cpp
+index fd0d629f67..c07874ea8d 100644
+--- a/src/kits/device/USBEndpoint.cpp
++++ b/src/kits/device/USBEndpoint.cpp
+@@ -217,6 +217,61 @@ BUSBEndpoint::IsochronousTransfer(void *data, size_t length,
+ }
+ 
+ 
++int32
++BUSBEndpoint::QueueIsochronous(void *data, size_t length,
++	usb_iso_packet_descriptor *packetDescriptors, uint32 packetCount) const
++{
++	// Submits like IsochronousTransfer(), but returns immediately with a
++	// request ID instead of blocking for completion -- pair with
++	// WaitIsochronous() to actually retrieve the result later. Doing this
++	// lets a caller have two isochronous transfers genuinely outstanding
++	// with the host controller at once (queue both, then wait on each),
++	// which matters specifically for isochronous IN: the schedule gap
++	// between one blocking IsochronousTransfer() call and the next costs
++	// real captured data on every single call (see
++	// EHCI::SubmitIsochronous()'s fNextStartingFrame chaining, which only
++	// kicks in when the next request is queued before the previous one
++	// completes).
++	if (length > 0 && data == NULL)
++		return B_BAD_VALUE;
++
++	usb_raw_command command;
++	command.isochronous.interface = fInterface->Index();
++	command.isochronous.endpoint = fIndex;
++	command.isochronous.data = data;
++	command.isochronous.length = length;
++	command.isochronous.packet_descriptors = packetDescriptors;
++	command.isochronous.packet_count = packetCount;
++	command.isochronous.request_id = -1;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_QUEUE_ISOCHRONOUS, &command,
++		sizeof(command)) || command.isochronous.status != B_USB_RAW_STATUS_SUCCESS)
++		return B_ERROR;
++
++	return command.isochronous.request_id;
++}
++
++
++ssize_t
++BUSBEndpoint::WaitIsochronous(int32 requestID) const
++{
++	// Blocks for the completion of a transfer previously started with
++	// QueueIsochronous(), identified by the request ID it returned. The
++	// packet descriptors passed to that QueueIsochronous() call are
++	// updated in place with the results, exactly as IsochronousTransfer()
++	// would have updated them.
++	usb_raw_command command;
++	memset(&command, 0, sizeof(command));
++	command.isochronous.request_id = requestID;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_WAIT_ISOCHRONOUS, &command,
++		sizeof(command)) || command.isochronous.status != B_USB_RAW_STATUS_SUCCESS)
++		return B_ERROR;
++
++	return command.isochronous.length;
++}
++
++
+ bool
+ BUSBEndpoint::IsStalled() const
+ {
