@@ -6,11 +6,37 @@ Install and build instructions live in [`README.md`](README.md). This file is ev
 
 ## Patch baseline
 
-These patches are derived against, and verified on, nightly commit **`88b7b8b350` (hrev99002+209, 2026-08-24)**. `build-vaio-p-iso.sh` pins that exact commit rather than following `master`: haiku.git moves several times a day, and an unpinned build silently mixes an untested upstream state into an ISO whose entire purpose is booting one specific fragile machine. `HAIKU_GIT_REF=master` overrides it. They were originally written against the 2026-07-21 source; the earlier `r1beta6`-based version of the diff is in this file's git history.
+The patches are applied to **RenkuOS** (<https://github.com/RenkuOS/Source>), a Haiku distribution, at commit **`f04d7eb54a` (hrev60072+55)** -- the commit its published nightly `build00021` (2026-09-16) was built from. `vaio-p-patches.diff` is generated against that commit and verified on a pristine checkout of it: plain apply clean, reverse apply clean.
 
-Some of the underlying bugs (e.g. the ACPICA Global Lock init race, ACPI IRQ trigger/polarity, PCI unaligned config access, the PS/2 multiplexer port-probing timeout, the USBKit `SetAlternate()` bug, the UHCI halt-recovery gap, all of the EHCI isochronous fixes, the UVC frame-index bug, and the SMP AP bring-up retry) are generic correctness issues, not VAIO-P-specific — they may already be fixed upstream by the time you apply this against a newer checkout. If a patch fails to apply, check whether it's already fixed before re-deriving it.
+The previous baseline, haiku.git `88b7b8b350`, is a direct ancestor of `f04d7eb54a` (111 commits ahead, 0 behind), so moving to RenkuOS was a forward rebase rather than a port.
 
-Three of them already were, and their hunks are consequently no longer in the diff:
+### What the build follows, and why not the `nightly` tag
+
+`build-vaio-p-iso.sh` builds whatever the current nightly was built from, reading it from the release notes the nightly workflow writes (`| Commit | <sha> |`). It does **not** check out the `nightly` tag: the workflow republishes the release with `gh release edit`, which never moves the tag, so the tag still points at the first nightly (`47367b99ab`) while the ISO attached to it comes from weeks later. If the release cannot be read, the script falls back to the verified commit above; `RENKU_REF` overrides both. When the nightly has moved past the verified commit, `git apply -3` absorbs hunks whose context merely shifted.
+
+### 32-bit, although the RenkuOS nightly is x86_64 only
+
+The RenkuOS nightly publishes x86_64 images only, and the VAIO P cannot run them: its Atom Z520 has no long mode (CPUID `0x80000001` EDX reads `0x00100000` -- NX, with bit 29 clear). The build therefore produces the `x86_gcc2h` hybrid from the same source. RenkuOS dropped 32-bit only because the pure-`x86` build-packages snapshot 404s; its own workflow names the `x86_gcc2h` snapshot, which upstream still publishes, as the way back. The build also follows the nightly's configuration: `--distro-compatibility default` and `HAIKU_IMAGE_LABEL=RenkuOS` (both overridable), with haiku/buildtools master as RenkuOS pins it.
+
+### What RenkuOS already fixed
+
+The rule when rebasing: if RenkuOS (or the upstream it imports) already fixed the same thing, **its version wins** and our hunk is dropped. Five files conflicted moving onto `f04d7eb54a`:
+
+| File | RenkuOS fix | Result |
+| --- | --- | --- |
+| `src/kits/device/USBInterface.cpp` | `cec26c9713` BUSBInterface: SetAlternate should update fAlternate | Same fix. Hunk dropped. |
+| `src/kits/storage/sniffer/RPattern.cpp` | `821b41727` include `<cstddef>` for `offsetof` | Same fix. Hunk dropped. |
+| `src/servers/launch/LaunchDaemon.cpp` | `855b5d0e3` launch_daemon: actually handle the case with a NULL name | Same bug (directly-named `run` targets silently dropped). Hunk dropped, including the extra guard it carried against if/then/else blocks: `_FindSettingsTemplate()` matches `if`/`then`/`else` by exact name before the wildcard, and `RunConverter` adds nothing for a parameter with sub-parameters, so a conditional block never carries top-level `target` strings for the guard to stop. |
+| `src/add-ons/.../acpica/components/events/evglock.c` | ACPICA 2026-04-08 import added an `AcpiGbl_UseGlobalLock` early return | Not the same fix. Both kept: the early return, then our pending-lock creation ahead of the handler install. |
+| `src/system/kernel/vm/vm_page_writer.cpp` | `60954f91a` kernel/vm: Use only one UnderQuotaCondition | Related, not the same. Upstream fixed *who* is woken (one global condition); the writer still reconciles the global counters only after a write, so a drained queue's stale estimate can still hold every queue over quota. Our reconciliation on idle passes is kept, now notifying `sUnderQuotaCondition`. |
+
+### What the 32-bit build needed beyond the rebase
+
+One build fix, found by building `x86_gcc2h` from `f04d7eb54a` with `jam -j14`: the `btrfs` kernel add-on failed on 11 of its 14 objects with `zlib.h: No such file or directory`, although the include path was right and the header existed a moment later. `btrfs/system_dependencies.h` includes `<zlib.h>` unconditionally and nearly every btrfs source reaches it through `btrfs.h`, but the Jamfile declared the zlib build-package dependency for `Inode.cpp` alone. A serial jam happens to extract the package first; a parallel one compiles the rest before extraction finishes. The Jamfile now declares it for every btrfs source. `packagefs` was checked for the same mistake and is correct: its only zlib user, `ZlibCompressionAlgorithm.cpp`, is the one declared.
+
+The image build also failed on a fresh machine for a reason that had nothing to do with RenkuOS: `don't know how to make vim_x86-9.1.1618-1-x86_gcc2.hpkg`, and the same for five more. The patched nightly profile injected seven hand-fetched `.hpkg` files -- `vim_x86`, `python3.14_x86`, `expat_x86`, `gettext_x86_libintl`, `xz_utils_x86`, `zlib_x86`, `zlib_x86_devel` -- from a `vaio-p-packages` directory beside the source tree, and nothing in the scripts or the README ever said where those files came from; they existed only on the old build volume. The reason for injecting them was a pinned build-packages snapshot too stale to resolve them at boot. RenkuOS's x86_gcc2 repository definition is synced (`88b7b8b350`) and lists the same or newer versions of six of the seven, so by the rule above those now come through the repository: `xz_utils_x86` is back on the upstream line it had been removed from, and `python3.14_x86` and its dependencies are listed beside it. Only `vim_x86` is absent from the repository; it stays injected, `build-vaio-p-iso.sh` downloads it from the live HaikuPorts repository into `vaio-p-packages`, and its requirements stay listed explicitly because an injected file bypasses dependency resolution.
+
+Three earlier hunks had already gone the same way against haiku.git:
 
 | Was patched | Fixed upstream by | Notes |
 | --- | --- | --- |
@@ -18,24 +44,7 @@ Three of them already were, and their hunks are consequently no longer in the di
 | `acpi_lid.cpp` (the `position > 0` early return that spun `power_daemon`) | `15c199f8fd` | Same removal, same reason. |
 | `ehci.cpp` (12-bit `TLENGTH` overflowing into the status bits) | `051bb37f50` | The new `EHCI_ITD_TLENGTH(x)` macro masks to `0x0fff` itself. The other three EHCI isochronous fixes (frame chaining, unlinking every iTD, and the starting-frame race) are still needed and still in the diff. |
 
-### Upstream commits this diff reverts
-
-Going the other way, the diff also **reverts** four upstream commits that landed shortly before the pin, restoring the boot loader's previous timing implementation:
-
-| Reverted | What it changed |
-| --- | --- |
-| `a89c12444a` | Boot loader takes `spin()` from BIOS `INT 15h/86h` and `system_time()` from `INT 1Ah`, instead of its own TSC-based implementation. |
-| `30d3006ec7` | TSC calibration moved out of the boot loader into the kernel, always using PIT channel 2. |
-| `11b378746a` | Added an overflow assert to `spin()`. |
-| `774b6a58ae` | Falls back to `INT 1Ah` when `INT 15h/86h` doesn't work. |
-
-The SMP AP bring-up retry patch (see "Boot speed/robustness" below) drives `spin()` hard on a path that has to work before anything else does -- `spin(10000)` between IPIs, `spin(200)` before the STARTUP IPI, and up to 500 x `spin(1000)` waiting for each AP -- and it was developed and verified against the TSC implementation. Routing all of that through this unit's BIOS instead is not a small change of footing: this is the same BIOS that never acknowledges the EHCI legacy handoff (see "Early EHCI BIOS handoff" above), and `774b6a58ae` -- an `INT 1Ah` fallback added days later for "a problem reported on the forums" -- suggests the new path already misbehaves on real machines. Upstream tested it in QEMU and VMware.
-
-So the reverts are a deliberate hold, not a claim that upstream is wrong. Dropping them is worth trying on a spare boot -- if the machine still comes up, delete these four hunks and regenerate the diff.
-
-Note that `abf211e2eb` (deterministic boot-device block checksums), which landed in the same window, is **not** reverted and does not need to be: the `disk_identifier` record stores `(offset, sum)` pairs and the kernel re-reads whichever offsets the boot loader wrote, so changing which blocks get checksummed keeps both sides in agreement by construction. It touches none of the files this patch does.
-
-Since the target is a moving branch, `build-vaio-p-iso.sh` applies the diff with `git apply -3`, so hunks whose surrounding code merely shifted are merged automatically; it only stops if a hunk genuinely conflicts.
+The diff no longer reverts upstream's boot loader timing work (`a89c12444a`, `30d3006ec7`, `11b378746a`, `774b6a58ae`), as an older version of this section described: that was dropped when the TSC calibration moved into the kernel upstream. Verified in the current diff: no deleted files, and `bios_ia32/timer.cpp` is not touched.
 
 ## What's patched
 

@@ -1,5 +1,5 @@
 diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
-index 9bae1739c6..8c0cb3e324 100644
+index 1624aa58f8..0d8e8e4fce 100644
 --- a/build/jam/DefaultBuildProfiles
 +++ b/build/jam/DefaultBuildProfiles
 @@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
@@ -14,39 +14,34 @@ index 9bae1739c6..8c0cb3e324 100644
  				}
  			}
  
-@@ -159,8 +164,46 @@ rule DefineDefaultBuildProfiles
- 				gcc2 @{
+@@ -160,7 +165,42 @@ rule DefineDefaultBuildProfiles
  					nano_x86@secondary_x86
  					p7zip_x86@secondary_x86
--					xz_utils_x86@secondary_x86
-+					# Personal additions: dependencies for the vim_x86 and
-+					# python3.14_x86 packages injected below as plain files
-+					# into /system/packages (those two are newer than the
-+					# pinned build-packages snapshot, so they can't come in
-+					# through the normal repository path). Checked ALL of
-+					# vim_x86's and python3.14_x86's `requires:` lines
-+					# against what the pinned snapshot actually provides
-+					# (via `package list -i`) up front, rather than
-+					# discovering mismatches one boot at a time: of the
-+					# combined dependency set, four -- xz_utils_x86,
-+					# expat_x86, gettext_x86_libintl, zlib_x86 -- were
-+					# stale enough in the pinned snapshot to fail with
-+					# "nothing provides" at boot (their SONAME/ABI
-+					# compat baseline had moved on since the snapshot was
-+					# last synced), so those four are NOT listed here;
-+					# current versions of each are injected as plain
-+					# files below instead, alongside vim_x86/python3.14_x86
-+					# themselves. Everything else below already satisfies
-+					# both packages' requirements as pinned.
+ 					xz_utils_x86@secondary_x86
++					# Personal additions: python3.14_x86 and vim_x86.
++					# python3.14_x86 comes from the repository like everything
++					# else here. It, xz_utils_x86, expat_x86, gettext_x86_libintl
++					# and zlib_x86 used to be injected as plain files because the
++					# pinned build-packages snapshot carried versions too old to
++					# resolve at boot; the RenkuOS tree's x86_gcc2 repository
++					# definition is synced (88b7b8b350) and now lists the same or
++					# newer versions, so that reason is gone. vim_x86 is still not
++					# in the repository and is injected below -- and an injected
++					# file bypasses dependency resolution, so its requirements
++					# are listed here explicitly.
++					python3.14_x86@secondary_x86
 +					file
 +					bzip2_x86@secondary_x86
++					expat_x86@secondary_x86
 +					gcc_x86_syslibs@secondary_x86
++					gettext_x86_libintl@secondary_x86
 +					libedit_x86@secondary_x86
 +					libffi_x86@secondary_x86
 +					libiconv_x86@secondary_x86
 +					ncurses6_x86@secondary_x86
 +					openssl3_x86@secondary_x86
 +					sqlite_x86@secondary_x86
++					zlib_x86@secondary_x86
 +					zstd_x86@secondary_x86
  				}@
 +				# harfbuzz isn't in the default nightly image, so gcc2's
@@ -62,32 +57,17 @@ index 9bae1739c6..8c0cb3e324 100644
  				;
  			AddHaikuImageSourcePackages
  				nano
-@@ -169,6 +212,55 @@ rule DefineDefaultBuildProfiles
+@@ -169,6 +209,40 @@ rule DefineDefaultBuildProfiles
  
  			AddOptionalHaikuImagePackages Development Git ;
  
-+			# Personal additions: vim and python3.14 are newer than the
-+			# pinned build-packages snapshot (their .hpkg files were
-+			# fetched by hand from the live HaikuPorts repository), so
-+			# drop them into /system/packages as plain files; with no
-+			# packages activation file on a fresh image, packagefs
-+			# activates everything found in that directory at boot. Their
-+			# library/command dependencies are pulled in through the
-+			# regular repository path above.
++			# Personal addition: vim_x86 is not in the x86_gcc2 repository,
++			# so its .hpkg (fetched from the live HaikuPorts repository by
++			# build-vaio-p-iso.sh) is dropped into /system/packages as a plain
++			# file; with no packages activation file on a fresh image,
++			# packagefs activates everything found in that directory at boot.
 +			local vaioPExtraPackages =
-+				vim_x86-9.1.1618-1-x86_gcc2.hpkg
-+				python3.14_x86-3.14.6-2-x86_gcc2.hpkg
-+				expat_x86-2.8.2-1-x86_gcc2.hpkg
-+				gettext_x86_libintl-1.0-1-x86_gcc2.hpkg
-+				xz_utils_x86-5.8.3-1-x86_gcc2.hpkg
-+				zlib_x86-1.3.2-1-x86_gcc2.hpkg
-+				# zlib_x86_devel-1.3.1-4 is pulled in transitively by the
-+				# Development optional package group and requires
-+				# EXACTLY zlib_x86==1.3.1 -- so bumping zlib_x86 above to
-+				# 1.3.2 to satisfy python3.14_x86 broke it the other way.
-+				# Bring in the matching 1.3.2 devel package too so both
-+				# halves agree.
-+				zlib_x86_devel-1.3.2-1-x86_gcc2.hpkg ;
++				vim_x86-9.1.1618-1-x86_gcc2.hpkg ;
 +			# Derived from HAIKU_TOP rather than written out, so this works
 +			# wherever the tree is checked out. It used to be the absolute
 +			# /haiku-build/vaio-p-packages, which is where the build
@@ -160,7 +140,7 @@ index cb649a080c..5974d85d23 100644
 +AddFilesToHaikuImage system non-packaged data firmware intel-ucode
 +	: $(vaioPUcodeFile) ;
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index 8195ada16b..ba9e21fb77 100644
+index 661c49cdf1..42d6dff820 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
 @@ -102,10 +102,22 @@ AddFilesToPackage add-ons kernel interrupt_controllers :
@@ -580,10 +560,10 @@ index a34a24dfe9..403a52384e 100644
  			add_debugger_command("btLocalDevices", &dump_bluetooth_devices,
  				"Lists Bluetooth LocalDevices registered in the Stack");
 diff --git a/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c b/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c
-index ab68836056..f88332b1a0 100644
+index 662e8890d1..d72cde9b74 100644
 --- a/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c
 +++ b/src/add-ons/kernel/bus_managers/acpi/acpica/components/events/evglock.c
-@@ -195,6 +195,23 @@ AcpiEvInitGlobalLockHandler (
+@@ -92,6 +92,23 @@ AcpiEvInitGlobalLockHandler (
          return_ACPI_STATUS (AE_OK);
      }
  
@@ -607,7 +587,7 @@ index ab68836056..f88332b1a0 100644
      /* Attempt installation of the global lock handler */
  
      Status = AcpiInstallFixedEventHandler (ACPI_EVENT_GLOBAL,
-@@ -212,16 +229,17 @@ AcpiEvInitGlobalLockHandler (
+@@ -109,16 +126,17 @@ AcpiEvInitGlobalLockHandler (
          ACPI_ERROR ((AE_INFO,
              "No response from Global Lock hardware, disabling lock"));
  
@@ -630,10 +610,10 @@ index ab68836056..f88332b1a0 100644
      return_ACPI_STATUS (Status);
  }
 diff --git a/src/add-ons/kernel/bus_managers/pci/pci.cpp b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-index 597047bd1f..b892ef39ed 100644
+index 9bfc6f8925..03dec2ed04 100644
 --- a/src/add-ons/kernel/bus_managers/pci/pci.cpp
 +++ b/src/add-ons/kernel/bus_managers/pci/pci.cpp
-@@ -1792,13 +1792,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1796,13 +1796,31 @@ PCI::ReadConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -667,7 +647,7 @@ index 597047bd1f..b892ef39ed 100644
  	status_t status = (*info->controller->read_pci_config)(info->controller_cookie,
  		bus, device, function, offset, size, value);
  	if (status != B_OK) {
-@@ -1848,13 +1866,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
+@@ -1852,13 +1870,28 @@ PCI::WriteConfig(uint8 domain, uint8 bus, uint8 device, uint8 function,
  	if (device > (info->max_bus_devices - 1)
  		|| function > 7
  		|| (size != 1 && size != 2 && size != 4)
@@ -699,7 +679,7 @@ index 597047bd1f..b892ef39ed 100644
  		device, function, offset, size, value);
  }
 diff --git a/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp b/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
-index 177b1997ec..b326705a68 100644
+index 7e312631ab..5f4376068f 100644
 --- a/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
 +++ b/src/add-ons/kernel/bus_managers/pci/pci_fixup.cpp
 @@ -155,6 +155,106 @@ intel_fixup_ahci(PCI *pci, uint8 domain, uint8 bus, uint8 device,
@@ -1678,10 +1658,10 @@ index 330b28f4e7..9cd61cb410 100644
  	uint32		num_channels;
  	uint32		buffer_length;	/* size of buffer in samples */
 diff --git a/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp b/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
-index 7f4c4b44e3..78db182e38 100644
+index b15a677d7b..739f69c5b1 100644
 --- a/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
 +++ b/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
-@@ -1425,9 +1425,39 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
+@@ -1427,9 +1427,39 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
  				hda_send_verbs(audioGroup->codec, &verb, NULL, 1);
  			}
  			if (widget.capabilities.input_amplifier != 0) {
@@ -1723,7 +1703,7 @@ index 7f4c4b44e3..78db182e38 100644
  				for (uint32 i = 0; i < widget.num_inputs; i++) {
  					corb_t verb = MAKE_VERB(audioGroup->codec->addr,
  						widget.node_id,
-@@ -1436,7 +1466,7 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
+@@ -1438,7 +1468,7 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
  							| AMP_SET_RIGHT_CHANNEL
  							| AMP_SET_INPUT_INDEX(i)
  							| ((widget.active_input == (int32)i) ? 0 : AMP_MUTE)
@@ -1732,7 +1712,7 @@ index 7f4c4b44e3..78db182e38 100644
  					hda_send_verbs(audioGroup->codec, &verb, NULL, 1);
  				}
  			}
-@@ -1456,6 +1486,26 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
+@@ -1458,6 +1488,26 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
  			stream->sample_rate &= widget.d.io.rates;
  		}
  
@@ -3502,6 +3482,51 @@ index 0000000000..8e2760c67c
 +	(module_info *)&sSonyEcBacklightModule,
 +	NULL
 +};
+diff --git a/src/add-ons/kernel/file_systems/btrfs/Jamfile b/src/add-ons/kernel/file_systems/btrfs/Jamfile
+index 51659f619e..1b6251c20d 100644
+--- a/src/add-ons/kernel/file_systems/btrfs/Jamfile
++++ b/src/add-ons/kernel/file_systems/btrfs/Jamfile
+@@ -14,15 +14,7 @@ DEFINES += DEBUG_APP="\\\"btrfs\\\"" ;
+ 
+ UseHeaders [ FDirName $(HAIKU_TOP) src libs uuid ] : true ;
+ 
+-Includes [ FGristFiles Inode.cpp ]
+-	: [ BuildFeatureAttribute zlib : headers ] ;
+-
+-if [ FIsBuildFeatureEnabled zstd ] {
+-    Includes [ FGristFiles Inode.cpp ]
+-        : [ BuildFeatureAttribute zstd : headers ] ;
+-}
+-
+-KernelAddon btrfs :
++local btrfsSources =
+ 	btrfs_disk_system.cpp
+ 	kernel_interface.cpp
+ 	Attribute.cpp
+@@ -37,6 +29,23 @@ KernelAddon btrfs :
+ 	Inode.cpp
+ 	Journal.cpp
+ 	Volume.cpp
++	;
++
++# system_dependencies.h includes <zlib.h> unconditionally, and nearly every
++# source here reaches it through btrfs.h -- not just Inode.cpp. With only Inode.cpp
++# declared, a parallel build can compile the rest before the zlib build package
++# has been extracted, failing on "zlib.h: No such file or directory". Seen
++# building x86_gcc2h with jam -j14.
++Includes [ FGristFiles $(btrfsSources) ]
++	: [ BuildFeatureAttribute zlib : headers ] ;
++
++if [ FIsBuildFeatureEnabled zstd ] {
++    Includes [ FGristFiles Inode.cpp ]
++        : [ BuildFeatureAttribute zstd : headers ] ;
++}
++
++KernelAddon btrfs :
++	$(btrfsSources)
+ 	:
+ 	kernel_libz.a
+ 	$(zstdKernelLib)
 diff --git a/src/add-ons/kernel/power/cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/Jamfile
 index 81306a7e6b..01097bf66c 100644
 --- a/src/add-ons/kernel/power/cpufreq/Jamfile
@@ -5617,24 +5642,6 @@ index fd0d629f67..c07874ea8d 100644
  bool
  BUSBEndpoint::IsStalled() const
  {
-diff --git a/src/kits/device/USBInterface.cpp b/src/kits/device/USBInterface.cpp
-index 229894b5bb..909e8e811d 100644
---- a/src/kits/device/USBInterface.cpp
-+++ b/src/kits/device/USBInterface.cpp
-@@ -229,6 +229,13 @@ BUSBInterface::SetAlternate(uint32 alternateIndex)
- 		sizeof(command)) || command.alternate.status != B_USB_RAW_STATUS_SUCCESS)
- 		return B_ERROR;
- 
-+	// _UpdateDescriptorAndEndpoints() re-fetches the descriptor/endpoint list
-+	// using fAlternate, so it must reflect the alternate setting that was
-+	// just actually activated on the device -- otherwise EndpointAt() keeps
-+	// returning endpoints from whatever alternate this object was
-+	// constructed with (typically 0, the zero-bandwidth idle setting for
-+	// isochronous interfaces), even though the hardware itself did switch.
-+	fAlternate = alternateIndex;
- 	_UpdateDescriptorAndEndpoints();
- 	return B_OK;
- }
 diff --git a/src/kits/media/MediaEventLooper.cpp b/src/kits/media/MediaEventLooper.cpp
 index 0ea6c2f41e..11c87d39bb 100644
 --- a/src/kits/media/MediaEventLooper.cpp
@@ -5827,19 +5834,6 @@ index b4227875a1..930cca6ff5 100644
  }
  
  
-diff --git a/src/kits/storage/sniffer/RPattern.cpp b/src/kits/storage/sniffer/RPattern.cpp
-index 814f369e99..fe504b2b72 100644
---- a/src/kits/storage/sniffer/RPattern.cpp
-+++ b/src/kits/storage/sniffer/RPattern.cpp
-@@ -11,6 +11,8 @@
- 	MIME sniffer rpattern implementation
- */
- 
-+#include <cstddef>
-+
- #include "Err.h"
- #include "RPattern.h"
- #include "Range.h"
 diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c b/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c
 index 529552d371..ffa95d38a0 100644
 --- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c
@@ -6181,53 +6175,6 @@ index b696c48674..8261813197 100644
  	}
  
  	// Build argument vector
-diff --git a/src/servers/launch/LaunchDaemon.cpp b/src/servers/launch/LaunchDaemon.cpp
-index 750382b861..8d3bcd5eaf 100644
---- a/src/servers/launch/LaunchDaemon.cpp
-+++ b/src/servers/launch/LaunchDaemon.cpp
-@@ -1563,13 +1563,38 @@ LaunchDaemon::_AddRunTargets(BMessage& message)
- void
- LaunchDaemon::_AddRunTargets(BMessage& message, const char* name)
- {
--	BMessage targets;
--	if (name != NULL && message.FindMessage(name, &targets) != B_OK)
-+	// A "run" block may name its targets directly, with no if/then wrapper:
-+	//
-+	//	run {
-+	//		desktop
-+	//	}
-+	//
-+	// The parser stores those as "target" strings in the block's own message
-+	// (RunConverter in SettingsParser.cpp). This function was reading them
-+	// out of the local "targets" message even in the name == NULL case, where
-+	// nothing ever fills it, so every directly-named target was silently
-+	// dropped -- the block parsed, produced no error, and ran nothing. Only
-+	// the "then"/"else" sub-message forms worked.
-+	BMessage targetsStorage;
-+	const BMessage* targets = &message;
-+	if (name != NULL) {
-+		if (message.FindMessage(name, &targetsStorage) != B_OK)
-+			return;
-+		targets = &targetsStorage;
-+	} else if (message.HasMessage("if") || message.HasMessage("then")
-+			|| message.HasMessage("else")) {
-+		// Only the direct form has its targets in the block itself. A block
-+		// that carries if/then/else keeps them in those sub-messages, and
-+		// reading the block as well would add the targets the condition was
-+		// supposed to choose between -- measured: a stock image then stalled
-+		// before package_daemon, having started something the condition had
-+		// ruled out.
- 		return;
-+	}
- 
- 	const char* target;
--	for (int32 index = 0; targets.FindString("target", index, &target) == B_OK;
--			index++) {
-+	for (int32 index = 0;
-+			targets->FindString("target", index, &target) == B_OK; index++) {
- 		fRunTargets.Add(target);
- 	}
- }
 diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
 index 42bae2a7da..b1d8f38f76 100644
 --- a/src/servers/net/AutoconfigLooper.cpp
@@ -7920,7 +7867,7 @@ index 9435811872..19a659ba84 100644
  
  		delete link;
 diff --git a/src/system/kernel/arch/x86/ioapic.cpp b/src/system/kernel/arch/x86/ioapic.cpp
-index 576d492921..cf242a82ba 100644
+index 69778cdf24..8d099d9229 100644
 --- a/src/system/kernel/arch/x86/ioapic.cpp
 +++ b/src/system/kernel/arch/x86/ioapic.cpp
 @@ -5,6 +5,7 @@
@@ -7931,7 +7878,7 @@ index 576d492921..cf242a82ba 100644
  #include <interrupts.h>
  #include <vm/vm.h>
  
-@@ -13,6 +14,7 @@
+@@ -15,6 +16,7 @@
  #include <ACPI.h>
  #include <AutoDeleter.h>
  #include <safemode.h>
@@ -7939,7 +7886,7 @@ index 576d492921..cf242a82ba 100644
  #include <string.h>
  #include <stdio.h>
  #include <cpu.h>
-@@ -192,6 +194,58 @@ ioapic_write_64(struct ioapic& ioapic, uint8 registerSelect, uint64 value,
+@@ -194,6 +196,58 @@ ioapic_write_64(struct ioapic& ioapic, uint8 registerSelect, uint64 value,
  }
  
  
@@ -7997,8 +7944,8 @@ index 576d492921..cf242a82ba 100644
 +
  static void
  ioapic_configure_pin(struct ioapic& ioapic, uint8 pin, uint8 vector,
- 	uint8 triggerPolarity, uint16 deliveryMode)
-@@ -698,6 +752,12 @@ ioapic_init(kernel_args* args)
+ 	interrupt_trigger_mode triggerMode, interrupt_trigger_polarity triggerPolarity,
+@@ -704,6 +758,12 @@ ioapic_init(kernel_args* args)
  		&ioapic_assign_interrupt_to_cpu,
  	};
  
@@ -8042,7 +7989,7 @@ index 45e7fb785a..277f055149 100644
  		panic("did not find any boot partitions! @! syslog | tail 15");
  	}
 diff --git a/src/system/kernel/vm/ModifiedPageQueue.h b/src/system/kernel/vm/ModifiedPageQueue.h
-index f42bbd69df..23a324954d 100644
+index 7c95db650d..988d8c7ed2 100644
 --- a/src/system/kernel/vm/ModifiedPageQueue.h
 +++ b/src/system/kernel/vm/ModifiedPageQueue.h
 @@ -29,6 +29,7 @@ public:
@@ -8054,10 +8001,10 @@ index f42bbd69df..23a324954d 100644
  private:
  			thread_id			fWriterThread;
 diff --git a/src/system/kernel/vm/vm_page_writer.cpp b/src/system/kernel/vm/vm_page_writer.cpp
-index 194c67fca7..64343646a2 100644
+index 82116500dc..6de3298aee 100644
 --- a/src/system/kernel/vm/vm_page_writer.cpp
 +++ b/src/system/kernel/vm/vm_page_writer.cpp
-@@ -565,13 +565,17 @@ ModifiedPageQueue::_PageWriter()
+@@ -566,13 +566,17 @@ ModifiedPageQueue::_PageWriter()
  	while (fWriterThread >= 0) {
  		if (queue.Count() < kNumPages) {
  			// wait the full amount when no one triggers us
@@ -8077,7 +8024,7 @@ index 194c67fca7..64343646a2 100644
  
  		if (modifiedPages <= pagesSinceLastSuccessfulWrite) {
  			// We ran through the whole queue without being able to write a
-@@ -696,8 +700,10 @@ ModifiedPageQueue::_PageWriter()
+@@ -697,8 +701,10 @@ ModifiedPageQueue::_PageWriter()
  #ifdef TRACE_VM_PAGE_WRITER
  		pageCollectionTime += system_time();
  #endif
@@ -8089,12 +8036,12 @@ index 194c67fca7..64343646a2 100644
  
  		// write pages to disk and do all the cleanup
  		bigtime_t runStart = system_time();
-@@ -729,14 +735,29 @@ ModifiedPageQueue::_PageWriter()
+@@ -730,14 +736,29 @@ ModifiedPageQueue::_PageWriter()
  		if (failedPages == 0 && numPages >= 8)
  			fLastAveragePageWriteDuration = (system_time() - runStart) / numPages;
  
 -		if (!IsOverQuota())
--			fUnderQuotaCondition.NotifyAll();
+-			sUnderQuotaCondition.NotifyAll();
 +		_ReconcileAndNotify();
  	}
  
@@ -8114,14 +8061,14 @@ index 194c67fca7..64343646a2 100644
 +	// WaitIfOverQuota() and no writer ever reaches the notify below, because
 +	// its own IsOverQuota() is false for exactly the same reason.
 +	if (!IsOverQuota())
-+		fUnderQuotaCondition.NotifyAll();
++		sUnderQuotaCondition.NotifyAll();
 +}
 +
 +
  /*static*/ status_t
  ModifiedPageQueue::_WriterThreadEntry(void* _this)
  {
-@@ -919,12 +940,21 @@ vm_page_schedule_write_page_range(struct VMCache *cache, uint32 firstPage,
+@@ -920,12 +941,21 @@ vm_page_schedule_write_page_range(struct VMCache *cache, uint32 firstPage,
  ModifiedPageQueue::~ModifiedPageQueue()
  {
  	thread_id writerThread = fWriterThread;

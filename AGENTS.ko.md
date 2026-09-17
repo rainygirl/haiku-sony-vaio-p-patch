@@ -6,11 +6,37 @@ English version: [`AGENTS.md`](AGENTS.md).
 
 ## 패치 기준 시점
 
-이 패치들은 nightly 커밋 **`88b7b8b350`(hrev99002+209, 2026년 8월 24일)** 기준으로 작성하고 검증했습니다. `build-vaio-p-iso.sh`는 `master`를 따라가지 않고 이 커밋을 고정합니다 — haiku.git은 하루에도 여러 번 움직이는데, 고정하지 않으면 "특정 까다로운 기기 한 대에서 부팅되는 것"이 전부인 ISO에 검증되지 않은 업스트림 상태가 조용히 섞여 들어갑니다. `HAIKU_GIT_REF=master`로 덮어쓸 수 있습니다. 최초 작성은 2026년 7월 21일 소스 기준이었고, `r1beta6` 기준의 이전 diff는 이 파일의 git 히스토리에 남아 있습니다.
+이 패치들은 Haiku 배포판인 **RenkuOS**(<https://github.com/RenkuOS/Source>)의 커밋 **`f04d7eb54a`(hrev60072+55)** 에 적용됩니다 — 공개된 nightly `build00021`(2026년 9월 16일)이 빌드된 바로 그 커밋입니다. `vaio-p-patches.diff`는 이 커밋 기준으로 생성했고, 해당 커밋을 깨끗하게 체크아웃한 트리에서 plain apply와 reverse apply가 모두 문제없음을 확인했습니다.
 
-일부 버그(ACPICA Global Lock 초기화 순서 문제, ACPI IRQ 트리거/극성, PCI 미정렬 config 접근, PS/2 멀티플렉서 포트 프로브 타임아웃, USBKit `SetAlternate()` 버그, UHCI halt 복구 미구현, EHCI isochronous 버그 일체, UVC frame index 버그, SMP AP 기동 재시도 등)는 VAIO P 전용이 아닌 범용 정합성 버그라서, 새 체크아웃을 받을 시점에는 이미 공식 소스에서 고쳐져 있을 수 있습니다. 패치가 적용되지 않으면 먼저 이미 수정됐는지 확인한 뒤 다시 작성해 주세요.
+이전 기준이던 haiku.git `88b7b8b350`은 `f04d7eb54a`의 직계 조상(111커밋 앞, 0커밋 뒤)이므로, RenkuOS로 옮긴 것은 이식이 아니라 앞 방향 rebase였습니다.
 
-실제로 세 건이 그렇게 되어 이제 diff에서 빠졌습니다:
+### 빌드가 따르는 커밋, 그리고 `nightly` 태그를 쓰지 않는 이유
+
+`build-vaio-p-iso.sh`는 현재 nightly가 빌드된 커밋을 빌드하며, 이를 nightly 워크플로가 릴리스 노트에 적는 `| Commit | <sha> |` 행에서 읽어옵니다. `nightly` 태그는 체크아웃하지 **않습니다**: 워크플로는 `gh release edit`로 릴리스를 갱신하는데 이 명령은 태그를 옮기지 않으므로, 태그는 여전히 첫 nightly(`47367b99ab`)를 가리키고 릴리스에 붙은 ISO는 몇 주 뒤의 커밋으로 빌드된 것입니다. 릴리스를 읽지 못하면 위의 검증된 커밋을 쓰고, `RENKU_REF`로 둘 다 덮어쓸 수 있습니다. nightly가 검증된 커밋보다 앞서 나가 있으면, 주변 코드만 밀린 hunk는 `git apply -3`가 흡수합니다.
+
+### RenkuOS nightly는 x86_64 전용인데 32비트로 빌드하는 이유
+
+RenkuOS nightly는 x86_64 이미지만 배포하며, VAIO P는 이를 실행할 수 없습니다: Atom Z520에는 long mode가 없습니다(CPUID `0x80000001` EDX가 `0x00100000` — NX만 있고 29번 비트가 꺼져 있음). 그래서 같은 소스로 `x86_gcc2h` 하이브리드를 빌드합니다. RenkuOS가 32비트를 뺀 이유는 순수 `x86` build-packages 스냅샷이 404이기 때문일 뿐이고, 워크플로 스스로 업스트림이 여전히 공개하는 `x86_gcc2h` 스냅샷을 복귀 경로로 명시하고 있습니다. 빌드 설정도 nightly를 따릅니다: `--distro-compatibility default`, `HAIKU_IMAGE_LABEL=RenkuOS`(둘 다 덮어쓰기 가능), buildtools는 RenkuOS가 고정한 대로 haiku/buildtools master.
+
+### RenkuOS가 이미 고친 것
+
+rebase 원칙: RenkuOS(또는 RenkuOS가 가져오는 업스트림)가 같은 문제를 이미 고쳤다면 **RenkuOS 쪽이 이기고** 우리 hunk는 뺍니다. `f04d7eb54a`로 옮기면서 다섯 파일이 충돌했습니다:
+
+| 파일 | RenkuOS의 수정 | 결과 |
+| --- | --- | --- |
+| `src/kits/device/USBInterface.cpp` | `cec26c9713` BUSBInterface: SetAlternate should update fAlternate | 같은 수정. hunk 제거. |
+| `src/kits/storage/sniffer/RPattern.cpp` | `821b41727` `offsetof`용 `<cstddef>` 포함 | 같은 수정. hunk 제거. |
+| `src/servers/launch/LaunchDaemon.cpp` | `855b5d0e3` launch_daemon: actually handle the case with a NULL name | 같은 버그(직접 나열한 `run` 타겟이 조용히 버려짐). hunk 제거 — if/then/else 블록용 추가 가드도 함께 뺐습니다: `_FindSettingsTemplate()`는 와일드카드보다 먼저 `if`/`then`/`else`를 정확한 이름으로 매칭하고, `RunConverter`는 하위 파라미터가 있는 파라미터에 아무것도 추가하지 않으므로, 조건부 블록에는 가드가 막을 최상위 `target` 문자열이 애초에 생기지 않습니다. |
+| `src/add-ons/.../acpica/components/events/evglock.c` | ACPICA 2026-04-08 반입에서 `AcpiGbl_UseGlobalLock` 조기 반환 추가 | 같은 수정이 아님. 둘 다 유지: 조기 반환 다음에 핸들러 설치보다 앞선 pending lock 생성. |
+| `src/system/kernel/vm/vm_page_writer.cpp` | `60954f91a` kernel/vm: Use only one UnderQuotaCondition | 관련은 있으나 같은 수정이 아님. 업스트림은 *누구를 깨우는지*(전역 조건 하나)를 고쳤고, writer는 여전히 쓰기 뒤에만 전역 카운터를 재조정하므로 비워진 큐의 낡은 추정치가 모든 큐를 계속 quota 초과 상태로 묶어둘 수 있습니다. 유휴 패스에서의 재조정은 유지하고, 알림 대상만 `sUnderQuotaCondition`으로 바꿨습니다. |
+
+### rebase 외에 32비트 빌드에 필요했던 것
+
+`f04d7eb54a`에서 `jam -j14`로 `x86_gcc2h`를 빌드하다 발견한 빌드 수정 하나: `btrfs` 커널 add-on의 오브젝트 14개 중 11개가 `zlib.h: No such file or directory`로 실패했습니다. include 경로는 맞았고 헤더도 곧 생겼습니다. `btrfs/system_dependencies.h`는 `<zlib.h>`를 무조건 포함하고 거의 모든 btrfs 소스가 `btrfs.h`를 통해 그 헤더를 거치는데, Jamfile은 zlib 빌드 패키지 의존성을 `Inode.cpp` 하나에만 선언해 두었습니다. 직렬 jam은 우연히 패키지를 먼저 풀지만, 병렬 jam은 압축해제가 끝나기 전에 나머지를 컴파일합니다. 이제 Jamfile이 모든 btrfs 소스에 의존성을 선언합니다. `packagefs`도 같은 실수가 있는지 확인했는데 올바릅니다 — zlib를 쓰는 유일한 파일 `ZlibCompressionAlgorithm.cpp`에 선언돼 있습니다.
+
+이미지 빌드는 새 머신에서 RenkuOS와 무관한 이유로도 실패했습니다: `don't know how to make vim_x86-9.1.1618-1-x86_gcc2.hpkg`, 그리고 같은 메시지가 다섯 개 더. 패치된 nightly 프로필은 손으로 받아둔 `.hpkg` 파일 일곱 개 — `vim_x86`, `python3.14_x86`, `expat_x86`, `gettext_x86_libintl`, `xz_utils_x86`, `zlib_x86`, `zlib_x86_devel` — 를 소스 트리 옆 `vaio-p-packages` 디렉터리에서 주입했는데, 스크립트도 README도 그 파일을 어디서 받는지 한 번도 설명하지 않았고 파일은 예전 빌드 볼륨에만 있었습니다. 주입한 이유는 고정된 build-packages 스냅샷이 너무 낡아 부팅 시 해석되지 않았기 때문이었습니다. RenkuOS의 x86_gcc2 저장소 정의는 동기화돼 있고(`88b7b8b350`) 일곱 개 중 여섯 개를 같거나 더 새로운 버전으로 제공하므로, 위 원칙대로 이제 저장소를 통해 들어옵니다: `xz_utils_x86`은 제거됐던 upstream 줄로 돌아갔고, `python3.14_x86`과 그 의존성은 그 옆에 나열됩니다. 저장소에 없는 것은 `vim_x86` 하나뿐이라 계속 주입하며, `build-vaio-p-iso.sh`가 라이브 HaikuPorts 저장소에서 `vaio-p-packages`로 내려받습니다. 주입된 파일은 의존성 해석을 거치지 않으므로 그 요구 패키지들은 계속 명시적으로 나열합니다.
+
+haiku.git 기준일 때도 세 건이 같은 식으로 빠졌습니다:
 
 | 패치했던 곳 | 업스트림 수정 커밋 | 비고 |
 | --- | --- | --- |
@@ -18,24 +44,7 @@ English version: [`AGENTS.md`](AGENTS.md).
 | `acpi_lid.cpp` (`power_daemon`을 100% CPU로 돌게 만든 `position > 0` 조기 반환) | `15c199f8fd` | 같은 제거, 같은 이유입니다. |
 | `ehci.cpp` (12비트 `TLENGTH`가 status 비트를 침범하던 문제) | `051bb37f50` | 새 `EHCI_ITD_TLENGTH(x)` 매크로가 `0x0fff`로 직접 마스킹합니다. 나머지 EHCI isochronous 수정 세 건(프레임 체이닝, 모든 iTD 언링크, 시작 프레임 경쟁)은 여전히 필요하며 diff에 남아 있습니다. |
 
-### 이 diff가 되돌리는 업스트림 커밋
-
-반대 방향으로, 이 diff는 고정 커밋 직전에 들어온 업스트림 커밋 4개를 **revert**해서 부트로더의 이전 타이밍 구현을 유지합니다:
-
-| revert 대상 | 변경 내용 |
-| --- | --- |
-| `a89c12444a` | 부트로더의 `spin()`이 자체 TSC 구현 대신 BIOS `INT 15h/86h`를, `system_time()`은 `INT 1Ah`를 쓰도록 변경 |
-| `30d3006ec7` | TSC 캘리브레이션을 부트로더에서 커널로 이동, 항상 PIT 채널 2 사용 |
-| `11b378746a` | `spin()`에 오버플로 assert 추가 |
-| `774b6a58ae` | `INT 15h/86h`가 동작하지 않을 때 `INT 1Ah`로 폴백 |
-
-SMP AP 기동 재시도 패치(아래 "부팅 속도/견고성" 항목)는 다른 무엇보다 먼저 동작해야 하는 경로에서 `spin()`을 강하게 사용합니다 — IPI 사이의 `spin(10000)`, STARTUP IPI 직전의 `spin(200)`, 각 AP를 기다리는 최대 500회의 `spin(1000)` — 그리고 이 패치는 TSC 구현을 기준으로 개발하고 검증했습니다. 이것을 전부 이 기기의 BIOS를 거치도록 바꾸는 건 발판을 통째로 바꾸는 일입니다. 이 BIOS는 EHCI legacy handoff 요청에 끝내 응하지 않는 바로 그 BIOS이고(위 "Poulsbo EHCI BIOS 조기 핸드오프" 참고), 며칠 뒤 "포럼에 보고된 문제" 때문에 추가된 `INT 1Ah` 폴백(`774b6a58ae`)은 새 경로가 실기에서 이미 오작동한다는 방증입니다. 업스트림의 검증 환경은 QEMU와 VMware입니다.
-
-즉 이 revert는 업스트림이 틀렸다는 주장이 아니라 의도적인 보류입니다. 여유 있을 때 한 번 빼고 부팅해 볼 만합니다 — 정상적으로 올라오면 이 네 hunk를 지우고 diff를 다시 생성하면 됩니다.
-
-같은 구간에 들어온 `abf211e2eb`(부팅 디스크 블록 체크섬 결정론화)는 **revert 대상이 아니며 그럴 필요도 없습니다**: `disk_identifier` 레코드가 `(offset, sum)` 쌍을 저장하고 커널은 부트로더가 기록한 offset을 그대로 다시 읽으므로, 어느 블록을 체크섬하든 양쪽이 구조적으로 항상 일치합니다. 이 패치가 건드리는 파일과도 전혀 겹치지 않습니다.
-
-대상이 계속 움직이는 브랜치이므로 `build-vaio-p-iso.sh`는 `git apply -3`로 적용합니다. 주변 코드만 밀린 hunk는 자동으로 병합되고, 진짜 충돌이 날 때만 중단됩니다.
+이 diff는 더 이상 업스트림의 부트로더 타이밍 작업(`a89c12444a`, `30d3006ec7`, `11b378746a`, `774b6a58ae`)을 revert하지 않습니다 — 이 절의 이전 버전은 그렇게 설명했지만, TSC 캘리브레이션이 업스트림에서 커널로 옮겨졌을 때 빠졌습니다. 현재 diff에서 확인: 삭제되는 파일이 없고 `bios_ia32/timer.cpp`를 건드리지 않습니다.
 
 ## 무엇을 고치는가
 
