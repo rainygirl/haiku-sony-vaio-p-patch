@@ -56,6 +56,7 @@ The diff no longer reverts upstream's boot loader timing work (`a89c12444a`, `30
 - **UHCI controller halt recovery** — `uhci.cpp`/`.h`: on some hardware, this controller halts (`process error` -> `host controller halted`) when talking to a misbehaving device, and the driver previously just disabled interrupts and left the controller (and everything sharing it) permanently dead for the rest of the boot -- a literal `// ToDo: cancel all transfers and reset the host controller` in the source. Now it actually cancels in-flight transfers (properly unlinking them from the schedule, not just the software bookkeeping -- an earlier attempt at this that skipped that step caused an immediate re-halt loop that pegged the CPU), resets the controller, and restarts the schedule. If halts keep recurring in a tight loop anyway (observed on hardware where restarting the schedule alone re-triggers the fault, with no device activity involved), it gives up after a few tries within 2 seconds instead of looping forever.
 - **PS/2 multiplexer** — `ps2_common.cpp`: only probes mux sub-ports 1-3 that actually have something respond, instead of running the full magic-knock sequence (and eating the timeout) on ports nothing is plugged into.
 - **WiFi (Atheros AR928X)** — `if_ath.c`/`if_athvar.h`: escalates repeated beacon-miss/bb-hang recovery to a full PCI power-cycle (D3->D0) of the adapter. `ieee80211_scan_sta.c`: stops `net80211` from auto-joining any open AP before a real join was ever requested (the STA-mode default candidate scan used to grab the nearest open neighbor AP at boot). `AutoconfigLooper.cpp`/`.h`: retries auto-join on a grace period instead of only once, and doesn't treat an unsolicited open-network association as "done."
+- **`ifconfig <device> scan` could hang forever** — `src/kits/network/libnetapi/NetworkDevice.cpp`: `BNetworkDevice::Scan(wait = true)` waited on its scan-completion listener with an unbounded `wait_for_thread()`. net80211 can accept a scan request, returning success rather than `EINPROGRESS`, without ever running one through to completion -- the request is folded into a scan already in flight, whose own completion was reported before this listener existed -- and then `B_NETWORK_WLAN_SCANNED` never arrives. Observed on this machine: three `ifconfig` processes parked there for over ten minutes until killed by hand, while the same scan run alone finished in under twenty seconds. The wait is now bounded at 20 seconds (roughly twice a full-band active scan here), after which the listener is quit through a messenger captured while it was known alive, and `B_TIMED_OUT` is returned so `ifconfig` says so instead of printing a stale cache as a fresh result.
 - **Sony EC driver (new) — including working Fn+F5/F6 brightness keys** — `drivers/power/sony_ec/`: a new MIT-licensed driver for the Sony `SNY5001` ACPI device (SNC), covering brightness get/set, hotkey arming, and the wireless kill-switch/Fn-key notify events. On every kill-switch toggle it requests both WLAN radio power (SNC `F124` sub-function 4) and Bluetooth module power (sub-function 6) — both derived from this model's disassembled DSDT, and neither is something the EC does on its own — so WiFi actually comes back after an off/on cycle instead of staying dead, and the Bluetooth module gets its logic power enabled (readback via sub-function 5 confirms `BTPW` sticks, and the module's USB presence visibly follows it). It also requests Bluetooth power once, unconditionally, ~10 seconds after boot (not just on kill-switch toggle), since some units never toggle the switch at all. (The indicator LED next to the switch is not EC/software-controllable on this unit: the `WLSL` bit writes and reads back fine but has no visible effect.) Written from scratch against the ACPI protocol (documented in the driver's own comments), not derived from Linux's `sony-laptop.c`.
   - **Fn+F5/F6 now actually dim/brighten the panel.** All twelve Fn+Fn-row keys funnel through the DSDT's `_Q0A`/`_Q0B` EC queries into one shared notify (handle `0x0100`); the driver reads the real per-key code back via `F100` sub-function 2 (`BUF0 = SNC.ECR`, itself populated from `H8EC.HKCD` right before the notify fires) and identified F5/F6 by testing on real hardware (Fn+F5 → code `0x05`/`0x85`, Fn+F6 → `0x06`/`0x86`; press vs. release wasn't distinguished, so the driver acts once on the non-`0x80` code). The harder part: this model's `SBRT` ACPI method only ever reaches the SNC's own scratch register and fires `ASLE`, a "backlight changed" notification meant for the Intel graphics driver to act on -- and Haiku has no such driver for this PowerVR SGX-based Poulsbo/GMA500 chip (see "graphics acceleration" below), so nothing was ever listening. A first attempt guessed the classic Intel mobile `BLC_PWM_CTL` MMIO register (period/duty in bits 31:16/15:0) — it visibly changed the backlight, proving *some* register at that offset affects it, but the level-to-brightness order came out scrambled (readback of the computed duty cycle was confirmed monotonic, so the bug wasn't in the math — it was the wrong register for this chip's actual layout). Intel's [SCH US15W datasheet](https://www.versalogic.com/wp-content/themes/vsl-new/assets/resources/support/ocelot/Intel_SCH_Specification_Mar_2009.pdf) (doc 319537, Graphics/Video/Display D2:F0 section) documents the real mechanism instead: the **LBB** (Legacy Backlight Brightness) register at **PCI config space offset 0xF4**, a plain linear 0 (dimmest) - 255 (brightest) byte -- no period/duty math needed at all, and confirmed correct (monotonic, evenly spaced) on real hardware once switched to it.
 - **Bluetooth (fully working: local device, remote scanning, kill-switch recovery, boot auto-start)** — this unit's Bluetooth module was long presumed dead hardware, based on what looked like a complete elimination chain: EC power request demonstrably working (`BTPW` readback, USB presence-detect following power), healthy-looking controller, yet never an answer to a single `GET_DESCRIPTOR`. That chain had one unverifiable hidden assumption — that the UHCI controller could successfully perform a transfer at all — and it was false: the SCH USBLEGSUP corruption (see the headline fix above) meant no device on any UHCI companion could ever enumerate, indistinguishable from software from a dead module. With the UHCI fix the module enumerates and Haiku's `h2generic` driver binds it, but three further bugs in the userland Bluetooth stack still stood between that and an actually usable system:
@@ -234,6 +235,17 @@ The blocklist is a way to test an add-on fix without rebuilding the image. Once 
 As of nightly `cb9d2488bc` the Devices preflet can write that same `BlockedEntries` stanza for you ("Disable driver" in the bottom-right panel), which is easier to get right than editing the settings file by hand. It only offers it for drivers that actually come from a package, and refuses on ones it considers critical.
 
 One thing that looks like a failure and is not: with no default video node assigned, `BMediaRoster::GetVideoInput()` returns `B_NAME_NOT_FOUND` even though the camera is enumerated and already producing frames. Nothing assigns that default automatically. Check the syslog for `usb_webcam deframer` lines before concluding the add-on did not load.
+
+**Shared libraries do neither.** `~/config/non-packaged/lib` is not on the library search path of a binary under `/boot/system`, so a rebuilt `libbnetapi.so` dropped there changes nothing: `listimage` on a running `ifconfig` still shows `/boot/system/lib/libbnetapi.so`. Only a process given an explicit `LIBRARY_PATH` picks the override up, which is enough to test one command and useless for `net_server`. Replace the entry inside the base package instead -- `package add` rewrites one path without extracting the rest:
+
+```
+mkdir -p stage/lib && cp built-libbnetapi.so stage/lib/libbnetapi.so
+cp /boot/system/packages/haiku-<version>.hpkg haiku-patched.hpkg
+package add -f -C stage haiku-patched.hpkg lib/libbnetapi.so   # ~8 min for 40 MB on this Atom
+package list -i haiku-patched.hpkg                             # PackageInfo must survive
+```
+
+then back up the original, copy the patched file over the same name in `/boot/system/packages`, and reboot. The revision string does not change, and the `libnetapi.so` compatibility symlink inside the package keeps pointing at the replaced file. Check two things before trusting it: every symbol its consumers import (`objdump -T /boot/system/servers/net_server | grep UND`, intersected with the old library's exports) must still be exported by the new one, and its `objdump -p` NEEDED list may have grown -- a library built on a newer tree picked up `libssl.so.3`/`libcrypto.so.3` here, which resolved only because OpenSSL 3 happens to be installed. Recovery from a bad swap is the boot loader's previous package state, which needs physical access.
 
 ## AP bring-up: measured values that contradict this document (2026-08-19)
 
@@ -1612,3 +1624,51 @@ with `Failed to change the package activation in packagefs: Name in use`. Move
 the old `.hpkg` out of `/boot/system/packages` and copy the new one in under a
 different filename instead, then confirm by checksum rather than by size --
 the sizes are identical.
+
+## WiFi: what the transmit error counter and `bb hang` actually mean (2026-09-19)
+
+Two things this adapter reports look like faults and are not. Both are written down here because both had already cost an investigation before being measured.
+
+### The transmit error counter only moves during scans
+
+`ifconfig /dev/net/atheroswifi/0` showed 62 transmit errors 40 minutes into a boot, and the same 62 forty minutes later. Sampling it around known events settles what it counts:
+
+| what was done | transmit errors | packet loss |
+| --- | --- | --- |
+| 200 pings at 0.05 s | +0 | 0% |
+| 31 MB / 22k packets bulk transfer | +0 | 0% |
+| one `ifconfig <device> scan` | +13 | -- |
+| a second scan, later | +13 | -- |
+| 80 pings spanning a scan | +4 | 0%, RTT peak 125 ms |
+
+So it counts frames handed to the driver while the radio is off-channel for a scan, which net80211 drops with `oerrors` rather than queueing. It is cumulative since boot and never resets. The 62 seen after boot is the 4-8 association scans a normal boot runs (13 x 5 = 65), which matches the scan counts recorded under "Wireless failed on about one boot in seven" above. A non-zero value here is not evidence of anything; compare two samples under load instead.
+
+### `bb hang detected (0x4)` costs nothing measurable
+
+`(ath) bb hang detected (0x4), resetting` fires every 2-25 minutes, in clusters, on an idle machine as readily as a loaded one. 0x4 is rx_clear stuck -- the baseband reporting the channel permanently busy -- and `ath_bmiss_proc()` answers it with a reset, which is the only place that message is printed, so every one of them means the beacon-miss path ran.
+
+Measured with 2400 pings at 1 s, spanning two of them:
+
+```
+2400 packets transmitted, 2400 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 3.244/22.071/181.607/26.021 ms
+```
+
+Neither event dropped a packet. RTT at the two timestamps was 92 ms and 100 ms, inside the range this link produces with nothing happening (max 181 ms across the same run). The D3/D0 escalation added for repeated beacon loss never fired, because the vap never left RUN. Treat these lines as the recovery working, not as a fault to chase.
+
+### Disabling 11n does not reduce them
+
+Worth recording as a negative result, since HT20+AMPDU is the obvious suspect and `ieee80211_output_seqno_assign: TID mismatch; tid=12` appears in the log during scans:
+
+| | bb hang | 31 MB transfer |
+| --- | --- | --- |
+| 11n (HT20 +AMPDU) | 3 in 50 min | 18.2 s (~14 Mbps) |
+| 11g (`ifconfig <device> -ht`) | 2 in 48 min | 26.7 s (~9.4 Mbps) |
+
+A third of the throughput for no measurable change, so it was reverted. Note that `-ht` alone does nothing until the interface reassociates: the flag is accepted (`wlan_control: 9234, 105`) but the media type stays `802.11n(g)` until a `down`/`up`, which on this machine took 9 seconds and cost one packet.
+
+### Two build-script defects found on the way
+
+`build-vaio-p-iso.sh` asked for `setfattr`/`getfattr` in `REQUIRED_CMDS` but never installed the `attr` package that provides them. On a stock container the extended-attribute probe therefore failed for want of the tool rather than for want of the feature, and the build died insisting a named Docker volume could not hold xattrs -- which it can, as the same probe shows once `attr` is installed.
+
+The second is emulation, not the script: Rosetta drops `cc1` with a SIGSEGV under parallel load. Two cross-tools builds died in `binutils/libiberty` this way (`lbasename.c` at -j4, `safe-ctype.c` at -j3) on files that then compiled five times out of five by hand, and a third run logged 19 such deaths in an hour before losing `collect2` the same way. `CC_RETRY=1` (default from the macOS wrapper) installs a `gcc`/`g++`/`cc` wrapper that retries signal deaths and ICEs three times and passes real compile errors straight through. The same build on a 14-core, 36 GB Docker VM logged zero retries, so the trigger is at least partly the 4-core, 6 GB one -- do not read the wrapper as a diagnosis.

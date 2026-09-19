@@ -100,7 +100,66 @@ if [ "${#MISSING[@]}" -gt 0 ] || ! dpkg -l gcc-multilib >/dev/null 2>&1; then
 		build-essential gcc-multilib g++-multilib \
 		bison flex gawk texinfo nasm git wget \
 		autoconf automake libtool python3 zip unzip xorriso \
-		zlib1g-dev zlib1g-dev:i386 libzstd-dev liblzma-dev libncurses-dev
+		zlib1g-dev zlib1g-dev:i386 libzstd-dev liblzma-dev libncurses-dev \
+		attr
+		# attr, for setfattr/getfattr: REQUIRED_CMDS asks for them, but the
+		# package providing them was missing from this list, so a stock
+		# container never got them. The extended-attribute probe below then
+		# failed for want of the tool rather than for want of the feature,
+		# and the build died claiming a named Docker volume -- which does
+		# hold xattrs -- could not.
+fi
+
+# ---------------------------------------------------------------------------
+# Retry wrapper around the host compiler, for emulated hosts.
+#
+# Rosetta (amd64 emulation on Apple silicon, which is how the Docker wrapper
+# runs this) intermittently drops cc1 with a SIGSEGV under parallel load. Two
+# cross-tools builds died in binutils/libiberty this way -- lbasename.c at
+# -j4, safe-ctype.c at -j3 -- on files that then compiled five times out of
+# five by hand, and a third run logged 19 such deaths in its first hour. The
+# fault is transient and the cost of hitting it is a whole cross-tools build,
+# so retry it.
+#
+# Only signal deaths and gcc ICEs are retried; a real compile error (exit 1)
+# is passed straight through, since retrying that would only hide it. Off
+# unless CC_RETRY=1, which the macOS wrapper sets -- a native Linux host has
+# no emulator to work around, and there a repeated segfault is a real fault
+# worth seeing.
+if [ "${CC_RETRY:-0}" = "1" ]; then
+	log "Installing compiler retry wrappers (emulated host)"
+	cat > /usr/local/bin/.cc-retry <<'RETRY_EOF'
+#!/bin/sh
+real="$1"; shift
+attempt=0
+while :; do
+	err="$(mktemp)"
+	"$real" "$@" 2>"$err"
+	rc=$?
+	cat "$err" >&2
+	if [ $rc -eq 0 ]; then rm -f "$err"; exit 0; fi
+	if [ $attempt -lt 3 ] && { [ $rc -ge 128 ] || [ $rc -eq 4 ] \
+			|| grep -q "internal compiler error" "$err"; }; then
+		attempt=$((attempt + 1))
+		echo "cc-retry: $real died (rc=$rc), attempt $attempt" >&2
+		rm -f "$err"
+		continue
+	fi
+	rm -f "$err"
+	exit $rc
+done
+RETRY_EOF
+	chmod +x /usr/local/bin/.cc-retry
+	for tool in gcc cc gcc-11; do
+		printf '#!/bin/sh\nexec /usr/local/bin/.cc-retry /usr/bin/gcc-11 "$@"\n' \
+			> "/usr/local/bin/$tool"
+		chmod +x "/usr/local/bin/$tool"
+	done
+	for tool in g++ c++ g++-11; do
+		printf '#!/bin/sh\nexec /usr/local/bin/.cc-retry /usr/bin/g++-11 "$@"\n' \
+			> "/usr/local/bin/$tool"
+		chmod +x "/usr/local/bin/$tool"
+	done
 fi
 
 # ---------------------------------------------------------------------------

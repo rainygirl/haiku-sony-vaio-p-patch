@@ -103,8 +103,13 @@ docker exec "$CONTAINER_NAME" chmod +x "$WORK_MOUNT/tools/build-vaio-p-iso.sh"
 # ---------------------------------------------------------------------------
 log "Running the build inside the container (this is the slow part)"
 # ---------------------------------------------------------------------------
+# CC_RETRY: an amd64 container on this host is emulated, and Rosetta drops cc1
+# under parallel load often enough to lose a whole cross-tools build to it.
+# See the wrapper it switches on in build-vaio-p-iso.sh. Set CC_RETRY=0 to
+# watch those failures instead of papering over them.
 docker exec \
 	-e SKIP_CROSS_TOOLS="${SKIP_CROSS_TOOLS:-0}" \
+	-e CC_RETRY="${CC_RETRY:-1}" \
 	${RENKU_REF:+-e RENKU_REF="$RENKU_REF"} \
 	${DISTRO_COMPATIBILITY:+-e DISTRO_COMPATIBILITY="$DISTRO_COMPATIBILITY"} \
 	${IMAGE_LABEL:+-e IMAGE_LABEL="$IMAGE_LABEL"} \

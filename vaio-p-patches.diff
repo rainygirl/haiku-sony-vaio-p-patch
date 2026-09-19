@@ -5834,6 +5834,54 @@ index b4227875a1..930cca6ff5 100644
  }
  
  
+diff --git a/src/kits/network/libnetapi/NetworkDevice.cpp b/src/kits/network/libnetapi/NetworkDevice.cpp
+index b3beebd..0f8ac5d 100644
+--- a/src/kits/network/libnetapi/NetworkDevice.cpp
++++ b/src/kits/network/libnetapi/NetworkDevice.cpp
+@@ -823,8 +823,41 @@ BNetworkDevice::Scan(bool wait, bool forceRescan)
+ 		return status;
+ 	}
+ 
+-	while (wait_for_thread(listener->Run(), NULL) == B_INTERRUPTED)
+-		;
++	// Wait for the scan to report completion -- but not forever. net80211
++	// can accept a scan request, returning success rather than EINPROGRESS,
++	// without ever running one through to completion: the request is folded
++	// into the scan already in flight, whose own completion was reported
++	// before this listener existed. B_NETWORK_WLAN_SCANNED then never
++	// arrives and this wait never ends. Measured on an AR928X (168c:002a):
++	// issuing a second `ifconfig <device> scan` while one was still running
++	// left three of them parked here for over ten minutes, holding the
++	// device's scan state, until they were killed by hand -- while the same
++	// scan, run alone afterwards, completed in under twenty seconds.
++	//
++	// Twenty seconds is roughly twice a full-band active scan on that
++	// hardware, so a scan that has not reported in by then is not late, it
++	// is not coming. Report the timeout rather than pretending success:
++	// ifconfig(1) prints it and exits instead of listing a stale cache as
++	// if it were a fresh result.
++	thread_id listenerThread = listener->Run();
++		// Capture a messenger while the looper is known to be alive: past
++		// this point it may quit and delete itself at any moment.
++	BMessenger listenerMessenger(NULL, listener);
++	const bigtime_t deadline = system_time() + 20 * 1000000LL;
++
++	status_t waitStatus;
++	do {
++		waitStatus = wait_for_thread_etc(listenerThread, B_ABSOLUTE_TIMEOUT,
++			deadline, NULL);
++	} while (waitStatus == B_INTERRUPTED);
++
++	if (waitStatus == B_TIMED_OUT) {
++		listenerMessenger.SendMessage(B_QUIT_REQUESTED);
++		while (wait_for_thread(listenerThread, NULL) == B_INTERRUPTED)
++			;
++		return B_TIMED_OUT;
++	}
++
+ 	return B_OK;
+ }
+ 
 diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c b/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c
 index 529552d371..ffa95d38a0 100644
 --- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_scan_sta.c

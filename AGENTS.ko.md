@@ -56,6 +56,7 @@ haiku.git 기준일 때도 세 건이 같은 식으로 빠졌습니다:
 - **UHCI 컨트롤러 halt 복구** — `uhci.cpp`/`.h`: 일부 하드웨어에서는 오작동하는 장치와 통신하다 컨트롤러 자체가 halt(`process error` → `host controller halted`)되는데, 기존 드라이버는 이때 인터럽트만 끄고 그 컨트롤러(와 거기 물린 모든 장치)를 부팅 내내 영구히 죽은 상태로 방치했습니다 — 소스에 `// ToDo: cancel all transfers and reset the host controller`라고 그대로 적혀 있었습니다. 이제는 진행 중이던 전송을 실제로 취소(소프트웨어 기록뿐 아니라 스케줄에서도 unlink — 이 unlink를 빠뜨린 첫 시도는 즉시 재halt가 반복되며 CPU를 잡아먹는 버그를 냈습니다)하고, 컨트롤러를 리셋한 뒤 스케줄을 재시작합니다. 그래도 halt가 계속 반복되면(스케줄 재시작 자체가 다시 halt를 유발하는, 장치 활동과 무관한 하드웨어 결함으로 보이는 경우) 2초 내 몇 차례 시도 후 포기하도록 상한을 뒀습니다(무한 루프 방지).
 - **PS/2 멀티플렉서** — `ps2_common.cpp`: 아무것도 연결되지 않은 멀티플렉스 서브포트(1~3)에 대해 매직시퀀스 전체를 시도하고 타임아웃까지 기다리는 대신, 실제로 응답이 있는 포트만 프로브합니다.
 - **WiFi (Atheros AR928X)** — `if_ath.c`/`if_athvar.h`: beacon-miss/bb-hang 복구가 반복되면 어댑터를 PCI 파워사이클(D3->D0)까지 강제합니다. `ieee80211_scan_sta.c`: 실제 접속 요청이 있기 전까지 `net80211`이 열린 AP에 마음대로 자동 접속하지 못하게 막습니다(원래는 STA 모드의 기본 후보 스캔이 부팅 시 가장 가까운 열린 이웃 AP를 붙잡았습니다). `AutoconfigLooper.cpp`/`.h`: 자동 접속을 한 번만 시도하지 않고 유예 시간을 두고 재시도하며, 의도치 않은 오픈 네트워크 연결을 "완료"로 취급하지 않습니다.
+- **`ifconfig <장치> scan`이 영영 끝나지 않을 수 있음** — `src/kits/network/libnetapi/NetworkDevice.cpp`: `BNetworkDevice::Scan(wait = true)`가 스캔 완료 리스너를 `wait_for_thread()`로 무한정 기다렸습니다. net80211은 이미 진행 중인 스캔에 요청을 흡수시키면서 `EINPROGRESS`가 아니라 성공을 돌려주는 경우가 있는데, 그 스캔의 완료 통보는 이 리스너가 생기기 전에 이미 나간 뒤라 `B_NETWORK_WLAN_SCANNED`가 영영 오지 않습니다. 이 기기에서 관측: `ifconfig` 프로세스 3개가 10분 넘게 그 자리에 묶여 있다가 손으로 죽여야 사라졌고, 같은 스캔을 단독으로 돌리면 20초 안에 끝났습니다. 이제 20초(여기서 전 대역 능동 스캔의 약 두 배)로 제한하고, 살아 있을 때 확보해 둔 메신저로 리스너를 종료시킨 뒤 `B_TIMED_OUT`을 반환합니다. `ifconfig`가 낡은 캐시를 새 결과인 양 출력하지 않고 타임아웃을 알립니다.
 - **Sony EC 드라이버 (신규) — Fn+F5/F6 밝기 단축키 실동작 포함** — `drivers/power/sony_ec/`: Sony `SNY5001` ACPI 장치(SNC)용 신규 MIT 라이선스 드라이버로, 밝기 조회/설정, 핫키 arm, 무선 스위치/Fn키 notify 이벤트를 처리합니다. 무선 킬스위치를 토글할 때마다 WLAN 라디오 전원(SNC `F124` sub-function 4)과 Bluetooth 모듈 전원(sub-function 6)을 함께 요청합니다 — 둘 다 이 모델의 DSDT를 직접 디스어셈블해 알아낸 프로토콜이며, EC가 알아서 해주지 않는 일입니다. 덕분에 스위치를 껐다 켜도 WiFi가 죽지 않고 살아나며, Bluetooth 모듈의 로직 전원도 켜집니다(sub-function 5 readback으로 `BTPW` 반영을 확인했고, 모듈의 USB 존재 신호가 전원을 정확히 따라 움직이는 것도 실측 확인). 킬스위치 토글과 별개로, 부팅 후 ~10초 뒤 한 번 무조건 Bluetooth 전원을 요청합니다(스위치를 아예 안 건드리는 개체도 있으므로). (스위치 옆 표시 LED는 이 개체에서는 소프트웨어로 제어되지 않습니다: `WLSL` 비트 쓰기/재독은 정상 동작하지만 실제 LED에는 반영되지 않음.) Linux `sony-laptop.c`를 그대로 가져온 게 아니라 처음부터 새로 작성했습니다(자세한 내용은 드라이버 코드 내 주석 참고).
   - **이제 Fn+F5/F6이 실제로 화면 밝기를 조절합니다.** Fn-로우 12개 키 전부가 DSDT의 `_Q0A`/`_Q0B` EC 쿼리를 거쳐 같은 notify(handle `0x0100`) 하나로 들어오는데, 실제 어떤 키인지는 `F100`의 sub-function 2(`BUF0 = SNC.ECR`, notify 직전에 `H8EC.HKCD`로 채워짐)로 읽어와 실기에서 직접 눌러 확인했습니다(Fn+F5 → 코드 `0x05`/`0x85`, Fn+F6 → `0x06`/`0x86`; press/release 구분은 안 했고 0x80 비트 없는 쪽 코드에서만 동작). 더 어려웠던 부분: 이 모델의 `SBRT` ACPI 메서드는 SNC 자체 스크래치 레지스터를 갱신하고 `ASLE`("백라이트 변경됨" 신호, 인텔 그래픽 드라이버가 받아서 처리하는 용도)를 세팅하는 것까지만 하는데, Haiku엔 이 PowerVR SGX 기반 Poulsbo/GMA500 칩용 그래픽 드라이버가 없어서(아래 "그래픽 가속" 참고) 아무도 이 신호를 안 받습니다. 처음엔 전통적인 인텔 모바일 `BLC_PWM_CTL` MMIO 레지스터(상위16비트 period/하위16비트 duty)를 추측해서 시도했는데 — 실제로 화면 밝기가 바뀌긴 했지만(이 오프셋의 어떤 레지스터가 밝기에 영향을 준다는 증거) 레벨별 밝기 순서가 뒤죽박죽이었습니다(계산한 duty cycle 값 자체는 readback으로 단조 증가가 확인됐으니 수학 문제가 아니라 이 칩의 실제 레지스터 배치와 다른 엉뚱한 레지스터를 건드린 것). Intel의 [SCH US15W 데이터시트](https://www.versalogic.com/wp-content/themes/vsl-new/assets/resources/support/ocelot/Intel_SCH_Specification_Mar_2009.pdf)(문서번호 319537, Graphics/Video/Display D2:F0 섹션)에 진짜 방식이 나와있었습니다: **PCI Config Space 오프셋 0xF4의 LBB(Legacy Backlight Brightness) 레지스터** — period/duty 계산이 아예 필요 없는 단순 선형 0(가장 어두움)~255(가장 밝음) 값이고, 이걸로 바꾸니 실기에서 단조롭고 고른 밝기 조절이 확인됐습니다.
 - **Bluetooth (완전히 동작: 로컬 디바이스, 원격 스캔, 킬스위치 복구, 부팅 자동시작)** — 이 개체의 Bluetooth 모듈은 오랫동안 하드웨어 결함으로 판정되어 있었습니다. 완전해 보이는 소거 사슬(EC 전원 요청 정상 동작 확인 — `BTPW` readback, USB 존재 신호가 전원을 따라 움직임 — 건강해 보이는 컨트롤러, 그런데도 `GET_DESCRIPTOR` 무응답)에 근거했지만, 그 사슬에는 검증 불가능한 숨은 전제가 하나 있었습니다 — "UHCI 컨트롤러가 전송 자체는 수행할 수 있다"는 것 — 그리고 그 전제가 거짓이었습니다. SCH USBLEGSUP 손상(위의 핵심 수정 참고) 때문에 UHCI 컴패니언의 어떤 장치도 열거될 수 없었고, 이는 소프트웨어에서 보면 죽은 장치와 구별이 불가능합니다. UHCI 수정 후 모듈은 열거되고 Haiku의 `h2generic` 드라이버가 바인딩되지만, 유저랜드 Bluetooth 스택에 남아있던 버그 3개를 더 고쳐야 실제로 쓸 수 있는 상태가 됐습니다:
@@ -231,3 +232,62 @@ rm /boot/system/non-packaged/add-ons/media/usb_webcam.media_addon
 nightly `cb9d2488bc`부터는 Devices 환경설정이 이 `BlockedEntries` 항목을 대신 작성해 줍니다(우측 하단 패널의 "Disable driver"). 설정 파일을 직접 편집하는 것보다 실수할 여지가 적습니다. 실제로 패키지에서 온 드라이버에만 이 버튼이 나오고, 핵심 드라이버로 판단되는 것은 비활성화를 거부합니다.
 
 실패처럼 보이지만 아닌 경우가 하나 있습니다. 기본 비디오 노드가 지정되지 않으면 카메라가 이미 열거되어 프레임을 내보내고 있어도 `BMediaRoster::GetVideoInput()`은 `B_NAME_NOT_FOUND`를 반환합니다. 이 기본값을 자동으로 지정해 주는 것은 없습니다. 애드온이 로드되지 않았다고 단정하기 전에 syslog에서 `usb_webcam deframer` 줄을 확인하세요.
+
+**공유 라이브러리는 둘 다 아닙니다.** `/boot/system` 아래 바이너리의 라이브러리 검색 경로에는 `~/config/non-packaged/lib`가 없습니다. 그래서 새로 빌드한 `libbnetapi.so`를 거기 넣어도 아무 일도 일어나지 않습니다. 실행 중인 `ifconfig`를 `listimage`로 보면 여전히 `/boot/system/lib/libbnetapi.so`를 로드합니다. `LIBRARY_PATH`를 명시한 프로세스에서만 대체본이 쓰이며, 명령 하나를 시험하기에는 충분하지만 `net_server`에는 소용이 없습니다. 대신 기본 패키지 안의 항목을 교체하세요. `package add`는 나머지를 추출하지 않고 경로 하나만 다시 씁니다.
+
+```
+mkdir -p stage/lib && cp built-libbnetapi.so stage/lib/libbnetapi.so
+cp /boot/system/packages/haiku-<version>.hpkg haiku-patched.hpkg
+package add -f -C stage haiku-patched.hpkg lib/libbnetapi.so   # 이 Atom에서 40MB에 약 8분
+package list -i haiku-patched.hpkg                             # PackageInfo가 남아 있어야 정상
+```
+
+그 다음 원본을 백업하고, `/boot/system/packages`에 같은 이름으로 덮어쓴 뒤 재부팅합니다. 리비전 문자열은 바뀌지 않고, 패키지 안의 `libnetapi.so` 호환 심볼릭 링크도 교체된 파일을 그대로 가리킵니다. 믿기 전에 두 가지를 확인하세요. 소비자가 가져다 쓰는 심볼(`objdump -T /boot/system/servers/net_server | grep UND`를 기존 라이브러리의 export와 교집합)이 새 라이브러리에도 전부 있어야 하고, `objdump -p`의 NEEDED 목록이 늘었을 수 있습니다. 여기서는 최신 트리에서 빌드한 라이브러리가 `libssl.so.3`/`libcrypto.so.3`를 끌어왔고, OpenSSL 3가 마침 설치돼 있어서 해결됐습니다. 잘못 교체했을 때의 복구 수단은 부팅 로더의 이전 패키지 상태이고, 물리적 접근이 필요합니다.
+
+## WiFi: 송신 오류 카운터와 `bb hang`의 실제 의미 (2026-09-19)
+
+이 어댑터가 보고하는 두 가지는 고장처럼 보이지만 고장이 아닙니다. 둘 다 측정하기 전에 이미 한 번씩 조사 비용을 치렀기에 기록해 둡니다.
+
+### 송신 오류 카운터는 스캔 중에만 올라갑니다
+
+부팅 40분 뒤 62건이었고, 다시 40분 뒤에도 같은 62건이었습니다. 사건별로 표본을 떠 보면 무엇을 세는지 분명해집니다.
+
+| 한 일 | 송신 오류 | 패킷 손실 |
+| --- | --- | --- |
+| 0.05초 간격 ping 200회 | +0 | 0% |
+| 31MB / 22k 패킷 대량 전송 | +0 | 0% |
+| `ifconfig <장치> scan` 1회 | +13 | -- |
+| 잠시 뒤 스캔 1회 더 | +13 | -- |
+| 스캔을 걸친 ping 80회 | +4 | 0%, RTT 최대 125ms |
+
+스캔 때문에 라디오가 다른 채널에 가 있는 동안 드라이버로 넘어온 프레임을 세는 값입니다. net80211이 큐에 넣지 않고 `oerrors`로 버립니다. 부팅 이후 누적이며 초기화되지 않습니다. 부팅 직후의 62건은 정상 부팅이 도는 스캔 4~8회 몫입니다(13 x 5 = 65). 위의 "무선이 일곱 번에 한 번꼴로 실패했다" 항목에 기록된 스캔 횟수와 맞습니다. 이 값이 0이 아니라는 것 자체는 아무 근거도 되지 않습니다. 부하를 걸고 두 표본을 비교하세요.
+
+### `bb hang detected (0x4)`는 측정 가능한 손해가 없습니다
+
+2~25분 간격으로, 군집으로, 유휴 상태에서도 부하 상태만큼 자주 발생합니다. 0x4는 rx_clear stuck, 즉 베이스밴드가 채널을 계속 사용 중으로 보고하는 상태이고, `ath_bmiss_proc()`이 리셋으로 대응합니다. 그 메시지를 찍는 곳이 거기뿐이므로 한 줄마다 비콘 누락 경로가 돌았다는 뜻입니다.
+
+1초 간격 ping 2400회로 두 번의 발생을 포함해 측정했습니다.
+
+```
+2400 packets transmitted, 2400 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 3.244/22.071/181.607/26.021 ms
+```
+
+두 번 다 한 패킷도 잃지 않았습니다. 해당 시각의 RTT는 92ms와 100ms로, 아무 일 없을 때도 이 링크가 내는 범위 안입니다(같은 측정의 최대 181ms). vap이 RUN에서 벗어나지 않았으므로 반복 비콘 손실용 D3/D0 에스컬레이션도 발동하지 않았습니다. 이 줄들은 복구가 작동하고 있다는 표시이지 쫓아야 할 고장이 아닙니다.
+
+### 11n을 꺼도 줄지 않습니다
+
+HT20+AMPDU가 유력한 용의자로 보이고 스캔 중 로그에 `ieee80211_output_seqno_assign: TID mismatch; tid=12`가 찍히기 때문에, 부정 결과로 남겨 둡니다.
+
+| | bb hang | 31MB 전송 |
+| --- | --- | --- |
+| 11n (HT20 +AMPDU) | 50분에 3회 | 18.2초 (~14 Mbps) |
+| 11g (`ifconfig <장치> -ht`) | 48분에 2회 | 26.7초 (~9.4 Mbps) |
+
+측정 가능한 변화 없이 처리량만 3분의 1을 잃으므로 되돌렸습니다. 그리고 `-ht`만으로는 아무것도 바뀌지 않습니다. 플래그는 받아들여지지만(`wlan_control: 9234, 105`) `down`/`up`으로 재접속하기 전까지 media type은 `802.11n(g)` 그대로입니다. 이 기기에서 재접속은 9초, 손실 1패킷이었습니다.
+
+### 그 과정에서 발견한 빌드 스크립트 결함 두 가지
+
+`build-vaio-p-iso.sh`의 `REQUIRED_CMDS`는 `setfattr`/`getfattr`를 요구하면서 정작 그것을 제공하는 `attr` 패키지를 설치 목록에 넣지 않았습니다. 그래서 깨끗한 컨테이너에서는 확장 속성 탐지가 "기능이 없어서"가 아니라 "도구가 없어서" 실패했고, 빌드는 네임드 Docker 볼륨이 xattr을 보관하지 못한다고 주장하며 죽었습니다. `attr`을 설치하면 같은 탐지가 바로 통과합니다.
+
+두 번째는 스크립트가 아니라 에뮬레이션입니다. Rosetta가 병렬 부하에서 `cc1`을 SIGSEGV로 떨어뜨립니다. cross-tools 빌드가 `binutils/libiberty`에서 두 번 죽었고(-j4의 `lbasename.c`, -j3의 `safe-ctype.c`), 두 파일 모두 손으로 컴파일하면 5회 중 5회 성공했습니다. 세 번째 실행은 한 시간에 19회를 기록한 뒤 `collect2`를 같은 식으로 잃었습니다. `CC_RETRY=1`(macOS 래퍼의 기본값)이 `gcc`/`g++`/`cc` 래퍼를 설치해 시그널 사망과 ICE만 3회까지 재시도하고 실제 컴파일 오류는 그대로 통과시킵니다. 다만 14코어 36GB Docker VM에서 같은 빌드는 재시도 0회였으므로, 방아쇠에는 4코어 6GB라는 조건도 섞여 있습니다. 래퍼를 원인 진단으로 읽지 마세요.
