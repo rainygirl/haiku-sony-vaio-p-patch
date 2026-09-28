@@ -79,6 +79,16 @@ cd tools/vaio-p
 
 That is what the RenkuOS nightly builds with. It ships no trademarked artwork, so an installed system comes up without the desktop logo; [`restore-haiku-logo.sh`](restore-haiku-logo.sh) puts it back. The boot splash is unaffected either way, since the patch set no longer draws the logo at boot.
 
+## Graphics
+
+The ISO carries a small driver for this machine's Intel SCH US15W (Poulsbo,
+"GMA500"), so the mouse pointer is drawn by the display engine rather than by
+app_server in software. Nothing has to be installed or turned on; `ls
+/dev/graphics/` shows `poulsbo` next to `vesa` on a patched system. There is no
+2D or 3D acceleration - the drawing engine on this chip is an undocumented
+PowerVR SGX535 - and the same driver is available separately, for unpatched
+systems, at [haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver).
+
 ## After building
 
 A successful build only verifies the source compiles — real verification requires the actual hardware: boot from USB with ACPI on and no Safe Mode, install to the internal disk (create an Intel partition map + BFS partition in DriveSetup first, then install), then confirm it survives a reboot.

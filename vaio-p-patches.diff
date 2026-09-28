@@ -99,10 +99,35 @@ index 1624aa58f8..0d8e8e4fce 100644
  			if $(HAIKU_PACKAGING_ARCHS) in x86_gcc2 x86 x86_64 {
  				AddOptionalHaikuImagePackages WebPositive ;
 diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
-index cb649a080c..5974d85d23 100644
+index cb649a0..0709e9a 100644
 --- a/build/jam/images/definitions/regular
 +++ b/build/jam/images/definitions/regular
-@@ -336,6 +336,21 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
+@@ -189,6 +189,14 @@ SYSTEM_ADD_ONS_ACCELERANTS += [ FFilterByBuildFeatures
+ 	x86 @{
+ 		3dfx.accelerant
+ 		neomagic.accelerant
++		# VAIO P: Intel SCH US15W (Poulsbo, "GMA500"). Its drawing engine is
++		# a PowerVR SGX535 with no public documentation, so only the display
++		# half -- which is Intel's and i915-shaped -- is driven: the mode the
++		# BIOS set is kept and the hardware cursor plane is used. Without it
++		# the machine falls back to vesa, which has no cursor hooks, so
++		# app_server saves, draws and restores the area under the pointer on
++		# every mouse move. On a 1.33 GHz Atom that is visible.
++		poulsbo.accelerant
+ 	}@ # x86
+ ] ;
+ 
+@@ -304,6 +312,9 @@ SYSTEM_ADD_ONS_DRIVERS_GRAPHICS += [ FFilterByBuildFeatures
+ 	x86 @{
+ 		3dfx
+ 		neomagic
++		# See the note next to poulsbo.accelerant above. Poulsbo only ever
++		# shipped paired with 32-bit Atom Z5xx parts, so x86 only.
++		poulsbo
+ 	}@ # x86
+ ] ;
+ 
+@@ -336,6 +347,21 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
  
  SYSTEM_ADD_ONS_DRIVERS_POWER += [ FFilterByBuildFeatures
  	acpi_battery@x86,x86_64
@@ -124,7 +149,7 @@ index cb649a080c..5974d85d23 100644
  ] ;
  
  SYSTEM_ADD_ONS_FILE_SYSTEMS +=
-@@ -385,3 +400,14 @@ AddDirectoryToHaikuImage home config settings touchpad ;
+@@ -385,3 +411,14 @@ AddDirectoryToHaikuImage home config settings touchpad ;
  local shortcutsSettingsFile = <settings>shortcuts_settings ;
  SEARCH on $(shortcutsSettingsFile) = [ FDirName $(HAIKU_TOP) data settings ] ;
  AddFilesToHaikuImage home config settings : $(shortcutsSettingsFile) ;
@@ -547,6 +572,507 @@ index 0000000000..5b5572699c
 +
 +
 +#endif	/* _BACKLIGHT_MODULE_H */
+diff --git a/headers/private/graphics/poulsbo/poulsbo.h b/headers/private/graphics/poulsbo/poulsbo.h
+new file mode 100644
+index 0000000..f14af8d
+--- /dev/null
++++ b/headers/private/graphics/poulsbo/poulsbo.h
+@@ -0,0 +1,79 @@
++/*
++ * Poulsbo (Intel SCH US15W, GMA500) graphics driver for Haiku - 공유 정의.
++ *
++ * 이 칩의 그리기 엔진은 PowerVR SGX 라 문서가 없지만, 디스플레이 파이프라인은
++ * i915 계열이라 레지스터가 그대로 통한다. 이 드라이버는 그 절반만 쓴다:
++ * BIOS 가 세운 모드를 그대로 두고, 하드웨어 커서를 붙인다.
++ *
++ * 하드웨어 커서만으로도 이 기기에서는 의미가 있다. app_server 가 소프트웨어
++ * 커서를 쓰면 포인터가 움직일 때마다 그 아래를 저장·복원·합성해야 하는데,
++ * 1.33 GHz Atom 과 가속 없는 프레임버퍼에서는 그 비용이 그대로 보인다.
++ */
++#ifndef POULSBO_H
++#define POULSBO_H
++
++#include <Accelerant.h>
++#include <Drivers.h>
++#include <GraphicsDefs.h>
++#include <OS.h>
++
++#define POULSBO_ACCELERANT_NAME	"poulsbo.accelerant"
++#define POULSBO_PRIVATE_MAGIC	'PSBO'
++
++#define POULSBO_CURSOR_WIDTH	64
++#define POULSBO_CURSOR_HEIGHT	64
++/* 커널이 만든 영역을 accelerant(유저랜드)가 clone 하려면 B_CLONEABLE_AREA 가
++   있어야 한다. 없으면 clone_area 가 B_NOT_ALLOWED 로 막힌다. */
++#define POULSBO_AREA_PROTECTION	(B_READ_AREA | B_WRITE_AREA \
++	| B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA)
++
++#define POULSBO_CURSOR_BYTES	(POULSBO_CURSOR_WIDTH * POULSBO_CURSOR_HEIGHT * 4)
++
++typedef struct {
++	uint32			magic;
++	area_id			shared_area;
++	area_id			registers_area;		/* BAR0, 매핑된 MMIO */
++	area_id			framebuffer_area;	/* 스톨른 프레임버퍼 */
++	area_id			cursor_area;		/* 물리 연속 16 KB */
++	uint32			cursor_physical;	/* CURBBASE 에 그대로 쓴다 */
++	uint32			framebuffer_size;
++	uint32			bytes_per_row;
++	uint32			framebuffer_physical;
++	display_mode	current_mode;
++} poulsbo_shared_info;
++
++typedef struct {
++	uint32	magic;
++	area_id	shared_info_area;
++} poulsbo_private_data;
++
++enum {
++	POULSBO_GET_PRIVATE_DATA = B_DEVICE_OP_CODES_END + 1
++};
++
++/* 디스플레이 레지스터 (파이프 B = 내장 LVDS 패널) */
++#define PSB_HTOTAL_B		0x61000
++#define PSB_HSYNC_B			0x61008
++#define PSB_VTOTAL_B		0x6100c
++#define PSB_VSYNC_B			0x61014
++#define PSB_PIPEBSRC		0x6101c
++#define PSB_PIPEBCONF		0x71008
++#define PSB_DSPBSTRIDE		0x71188
++#define PSB_DSPBSURF		0x7119c
++#define PSB_CURBCNTR		0x700c0
++#define PSB_CURBBASE		0x700c4
++#define PSB_CURBPOS			0x700c8
++
++/* 커서 제어 비트 - 리눅스 gma500 의 gma_display.c 와 같은 조합 */
++#define PSB_CURSOR_MODE_DISABLE		0x00
++#define PSB_CURSOR_MODE_64_ARGB		((1 << 5) | 0x07)
++/* 감마는 쓰지 않는다. 리눅스 gma500 은 이 비트를 켜지만 LUT 도 함께
++   프로그래밍한다. BIOS 가 세운 모드를 그대로 쓰는 이 드라이버에서는 LUT 가
++   초기화돼 있지 않아, 켜면 커서 색이 깨진다. */
++#define PSB_MCURSOR_GAMMA_ENABLE	(1 << 26)
++#define PSB_MCURSOR_PIPE_B			(1 << 28)
++#define PSB_CURSOR_POS_SIGN			0x8000
++#define PSB_CURSOR_X_SHIFT			0
++#define PSB_CURSOR_Y_SHIFT			16
++
++#endif	/* POULSBO_H */
+diff --git a/src/add-ons/accelerants/Jamfile b/src/add-ons/accelerants/Jamfile
+index 9b6a99e..2cc6e6c 100644
+--- a/src/add-ons/accelerants/Jamfile
++++ b/src/add-ons/accelerants/Jamfile
+@@ -10,6 +10,7 @@ SubInclude HAIKU_TOP src add-ons accelerants intel_extreme ;
+ SubInclude HAIKU_TOP src add-ons accelerants matrox ;
+ SubInclude HAIKU_TOP src add-ons accelerants neomagic ;
+ SubInclude HAIKU_TOP src add-ons accelerants nvidia ;
++SubInclude HAIKU_TOP src add-ons accelerants poulsbo ;
+ SubInclude HAIKU_TOP src add-ons accelerants radeon ;
+ SubInclude HAIKU_TOP src add-ons accelerants radeon_hd ;
+ SubInclude HAIKU_TOP src add-ons accelerants s3 ;
+diff --git a/src/add-ons/accelerants/poulsbo/Jamfile b/src/add-ons/accelerants/poulsbo/Jamfile
+new file mode 100644
+index 0000000..fb37d0f
+--- /dev/null
++++ b/src/add-ons/accelerants/poulsbo/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src add-ons accelerants poulsbo ;
++
++UsePrivateHeaders graphics ;
++UsePrivateHeaders [ FDirName graphics poulsbo ] ;
++
++Addon poulsbo.accelerant :
++	accelerant.c
++	;
+diff --git a/src/add-ons/accelerants/poulsbo/accelerant.c b/src/add-ons/accelerants/poulsbo/accelerant.c
+new file mode 100644
+index 0000000..27828ba
+--- /dev/null
++++ b/src/add-ons/accelerants/poulsbo/accelerant.c
+@@ -0,0 +1,384 @@
++/*
++ * Poulsbo accelerant.
++ *
++ * app_server 가 이 모듈을 통해 화면을 다룬다. 모드 설정은 하지 않는다 -
++ * BIOS 가 세운 파이프 B 의 상태를 그대로 보고하고, 대신 하드웨어 커서를
++ * 제공한다. 그것만으로도 소프트웨어 커서의 저장·복원·합성이 사라진다.
++ *
++ * 커서 레지스터 규칙은 실기기에서 확인한 것이다:
++ *   CURBCNTR = (1<<28) 파이프B | (1<<26) 감마 | 0x27 (64x64 ARGB)
++ *   CURBBASE = 물리 주소 (GTT 오프셋이 아니다 - Poulsbo 는 cursor_needs_phys)
++ *   CURBPOS  = (y<<16) | x, 음수는 각 필드의 비트 15 로 부호를 준다
++ */
++#include <Accelerant.h>
++#include <Drivers.h>
++#include <GraphicsDefs.h>
++#include <OS.h>
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <poulsbo.h>
++
++static int sDeviceFD = -1;
++static area_id sSharedClone = -1;
++static area_id sRegistersClone = -1;
++static area_id sFramebufferClone = -1;
++static area_id sCursorClone = -1;
++static poulsbo_shared_info* sShared = NULL;
++static uint8* sRegisters = NULL;
++static uint8* sFramebuffer = NULL;
++static uint8* sCursor = NULL;
++static uint16 sHotX = 0;
++static uint16 sHotY = 0;
++static bool sCursorVisible = false;
++
++
++static void
++write32(uint32 offset, uint32 value)
++{
++	*(volatile uint32*)(sRegisters + offset) = value;
++}
++
++
++static void
++arm_cursor(void)
++{
++	/* base 를 다시 쓰는 것이 더블 버퍼 갱신 신호다.
++	   감마는 켜지 않는다 - 이 파이프의 팔레트 LUT 는 초기화돼 있지 않고
++	   (DSPBCNTR 의 감마 비트도 꺼져 있다) 커서만 그 LUT 를 통과시키면
++	   검정 테두리가 흰색과 섞여 깨져 보인다. 실기기에서 확인했다. */
++	write32(PSB_CURBCNTR, sCursorVisible
++		? (PSB_MCURSOR_PIPE_B | PSB_CURSOR_MODE_64_ARGB)
++		: PSB_CURSOR_MODE_DISABLE);
++	write32(PSB_CURBBASE, sCursorVisible ? sShared->cursor_physical : 0);
++}
++
++
++static status_t
++init_common(int fd, bool isClone)
++{
++	poulsbo_private_data data;
++
++	sDeviceFD = fd;
++	data.magic = POULSBO_PRIVATE_MAGIC;
++	if (ioctl(sDeviceFD, POULSBO_GET_PRIVATE_DATA, &data, sizeof(data)) != 0)
++		return errno != 0 ? (status_t)errno : B_ERROR;
++
++	sSharedClone = clone_area("poulsbo shared clone", (void**)&sShared,
++		B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, data.shared_info_area);
++	if (sSharedClone < B_OK)
++		return sSharedClone;
++
++	sRegistersClone = clone_area("poulsbo regs clone", (void**)&sRegisters,
++		B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, sShared->registers_area);
++	if (sRegistersClone < B_OK)
++		return sRegistersClone;
++
++	sFramebufferClone = clone_area("poulsbo fb clone", (void**)&sFramebuffer,
++		B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, sShared->framebuffer_area);
++	if (sFramebufferClone < B_OK)
++		return sFramebufferClone;
++
++	sCursorClone = clone_area("poulsbo cursor clone", (void**)&sCursor,
++		B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, sShared->cursor_area);
++	if (sCursorClone < B_OK)
++		return sCursorClone;
++
++	return B_OK;
++}
++
++
++static void
++uninit_common(void)
++{
++	if (sCursorClone >= B_OK) delete_area(sCursorClone);
++	if (sFramebufferClone >= B_OK) delete_area(sFramebufferClone);
++	if (sRegistersClone >= B_OK) delete_area(sRegistersClone);
++	if (sSharedClone >= B_OK) delete_area(sSharedClone);
++	sCursorClone = sFramebufferClone = sRegistersClone = sSharedClone = -1;
++}
++
++
++static status_t
++poulsbo_init_accelerant(int fd)
++{
++	status_t status = init_common(fd, false);
++	if (status != B_OK)
++		return status;
++	sCursorVisible = false;
++	arm_cursor();
++	return B_OK;
++}
++
++
++static void
++poulsbo_uninit_accelerant(void)
++{
++	sCursorVisible = false;
++	if (sRegisters != NULL)
++		arm_cursor();
++	uninit_common();
++}
++
++
++static ssize_t
++poulsbo_accelerant_clone_info_size(void)
++{
++	return B_PATH_NAME_LENGTH;
++}
++
++
++static void
++poulsbo_get_accelerant_clone_info(void* data)
++{
++	strcpy((char*)data, "/dev/graphics/poulsbo");
++}
++
++
++static status_t
++poulsbo_clone_accelerant(void* data)
++{
++	int fd = open((const char*)data, B_READ_WRITE);
++	if (fd < 0)
++		return errno;
++	return init_common(fd, true);
++}
++
++
++static status_t
++poulsbo_get_accelerant_device_info(accelerant_device_info* info)
++{
++	info->version = B_ACCELERANT_VERSION;
++	strcpy(info->name, "Intel SCH US15W (Poulsbo) / GMA500");
++	strcpy(info->chipset, "GMA500");
++	strcpy(info->serial_no, "");
++	info->memory = sShared->framebuffer_size;
++	info->dac_speed = sShared->current_mode.timing.pixel_clock / 1000;
++	return B_OK;
++}
++
++
++static uint32
++poulsbo_accelerant_mode_count(void)
++{
++	return 1;
++}
++
++
++static status_t
++poulsbo_get_mode_list(display_mode* modes)
++{
++	modes[0] = sShared->current_mode;
++	return B_OK;
++}
++
++
++static status_t
++poulsbo_propose_display_mode(display_mode* target, const display_mode* low,
++	const display_mode* high)
++{
++	/* 패널은 고정이다. 들어온 요청이 무엇이든 지금 모드로 되돌려 준다. */
++	*target = sShared->current_mode;
++	return B_OK;
++}
++
++
++static status_t
++poulsbo_set_display_mode(display_mode* mode)
++{
++	/* 모드를 바꾸지 않는다. 같은 모드 요청만 성공으로 친다. */
++	if (mode->virtual_width != sShared->current_mode.virtual_width
++		|| mode->virtual_height != sShared->current_mode.virtual_height)
++		return B_BAD_VALUE;
++	return B_OK;
++}
++
++
++static status_t
++poulsbo_get_display_mode(display_mode* mode)
++{
++	*mode = sShared->current_mode;
++	return B_OK;
++}
++
++
++static status_t
++poulsbo_get_frame_buffer_config(frame_buffer_config* config)
++{
++	config->frame_buffer = sFramebuffer;
++	config->frame_buffer_dma = (void*)sShared->framebuffer_physical;
++	config->bytes_per_row = sShared->bytes_per_row;
++	return B_OK;
++}
++
++
++static status_t
++poulsbo_get_pixel_clock_limits(display_mode* mode, uint32* low, uint32* high)
++{
++	*low = mode->timing.pixel_clock;
++	*high = mode->timing.pixel_clock;
++	return B_OK;
++}
++
++
++static uint32
++poulsbo_dpms_capabilities(void)
++{
++	return B_DPMS_ON;
++}
++
++
++static uint32
++poulsbo_dpms_mode(void)
++{
++	return B_DPMS_ON;
++}
++
++
++static status_t
++poulsbo_set_dpms_mode(uint32 mode)
++{
++	return mode == B_DPMS_ON ? B_OK : B_UNSUPPORTED;
++}
++
++
++static void
++poulsbo_move_cursor(uint16 x, uint16 y)
++{
++	int32 px = (int32)x - (int32)sHotX;
++	int32 py = (int32)y - (int32)sHotY;
++	uint32 position = 0;
++
++	if (px < 0) {
++		position |= PSB_CURSOR_POS_SIGN << PSB_CURSOR_X_SHIFT;
++		px = -px;
++	}
++	if (py < 0) {
++		position |= PSB_CURSOR_POS_SIGN << PSB_CURSOR_Y_SHIFT;
++		py = -py;
++	}
++	position |= ((uint32)px & 0x7fff) << PSB_CURSOR_X_SHIFT;
++	position |= ((uint32)py & 0x7fff) << PSB_CURSOR_Y_SHIFT;
++
++	write32(PSB_CURBPOS, position);
++	write32(PSB_CURBBASE, sCursorVisible ? sShared->cursor_physical : 0);
++}
++
++
++static void
++poulsbo_show_cursor(bool visible)
++{
++	sCursorVisible = visible;
++	arm_cursor();
++}
++
++
++static status_t
++poulsbo_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
++	uint16 hotY, color_space space, uint16 bytesPerRow, const uint8* data)
++{
++	uint16 row;
++
++	if (width > POULSBO_CURSOR_WIDTH || height > POULSBO_CURSOR_HEIGHT)
++		return B_UNSUPPORTED;
++	if (space != B_RGBA32 && space != B_RGB32)
++		return B_UNSUPPORTED;
++
++	memset(sCursor, 0, POULSBO_CURSOR_BYTES);
++	for (row = 0; row < height; row++) {
++		memcpy(sCursor + row * POULSBO_CURSOR_WIDTH * 4,
++			data + row * bytesPerRow, width * 4);
++	}
++	sHotX = hotX;
++	sHotY = hotY;
++	arm_cursor();
++	return B_OK;
++}
++
++
++static status_t
++poulsbo_set_cursor_shape(uint16 width, uint16 height, uint16 hotX,
++	uint16 hotY, const uint8* andMask, const uint8* xorMask)
++{
++	/* 옛 2색 커서. 하드웨어는 ARGB 만 아니까 흑백으로 펼쳐 준다. */
++	uint16 x, y;
++	uint16 stride = (width + 7) / 8;
++
++	if (width > POULSBO_CURSOR_WIDTH || height > POULSBO_CURSOR_HEIGHT)
++		return B_UNSUPPORTED;
++
++	memset(sCursor, 0, POULSBO_CURSOR_BYTES);
++	for (y = 0; y < height; y++) {
++		for (x = 0; x < width; x++) {
++			uint8 bit = 0x80 >> (x & 7);
++			bool opaque = (andMask[y * stride + x / 8] & bit) == 0;
++			bool black = (xorMask[y * stride + x / 8] & bit) == 0;
++			uint32* pixel = (uint32*)(sCursor
++				+ (y * POULSBO_CURSOR_WIDTH + x) * 4);
++			if (!opaque)
++				*pixel = 0;
++			else
++				*pixel = black ? 0xff000000 : 0xffffffff;
++		}
++	}
++	sHotX = hotX;
++	sHotY = hotY;
++	arm_cursor();
++	return B_OK;
++}
++
++
++void*
++get_accelerant_hook(uint32 feature, void* data)
++{
++	switch (feature) {
++		case B_INIT_ACCELERANT:
++			return (void*)poulsbo_init_accelerant;
++		case B_UNINIT_ACCELERANT:
++			return (void*)poulsbo_uninit_accelerant;
++		case B_CLONE_ACCELERANT:
++			return (void*)poulsbo_clone_accelerant;
++		case B_ACCELERANT_CLONE_INFO_SIZE:
++			return (void*)poulsbo_accelerant_clone_info_size;
++		case B_GET_ACCELERANT_CLONE_INFO:
++			return (void*)poulsbo_get_accelerant_clone_info;
++		case B_GET_ACCELERANT_DEVICE_INFO:
++			return (void*)poulsbo_get_accelerant_device_info;
++
++		case B_ACCELERANT_MODE_COUNT:
++			return (void*)poulsbo_accelerant_mode_count;
++		case B_GET_MODE_LIST:
++			return (void*)poulsbo_get_mode_list;
++		case B_PROPOSE_DISPLAY_MODE:
++			return (void*)poulsbo_propose_display_mode;
++		case B_SET_DISPLAY_MODE:
++			return (void*)poulsbo_set_display_mode;
++		case B_GET_DISPLAY_MODE:
++			return (void*)poulsbo_get_display_mode;
++		case B_GET_FRAME_BUFFER_CONFIG:
++			return (void*)poulsbo_get_frame_buffer_config;
++		case B_GET_PIXEL_CLOCK_LIMITS:
++			return (void*)poulsbo_get_pixel_clock_limits;
++
++		case B_DPMS_CAPABILITIES:
++			return (void*)poulsbo_dpms_capabilities;
++		case B_DPMS_MODE:
++			return (void*)poulsbo_dpms_mode;
++		case B_SET_DPMS_MODE:
++			return (void*)poulsbo_set_dpms_mode;
++
++		case B_MOVE_CURSOR:
++			return (void*)poulsbo_move_cursor;
++		case B_SHOW_CURSOR:
++			return (void*)poulsbo_show_cursor;
++		case B_SET_CURSOR_BITMAP:
++			return (void*)poulsbo_set_cursor_bitmap;
++		case B_SET_CURSOR_SHAPE:
++			return (void*)poulsbo_set_cursor_shape;
++	}
++	return NULL;
++}
 diff --git a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp b/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
 index a34a24dfe9..403a52384e 100644
 --- a/src/add-ons/kernel/bluetooth/hci/bluetooth.cpp
@@ -2429,6 +2955,359 @@ index 9968fa825e..0122e5a55e 100644
  	} isochronous;
  } usb_raw_command;
  
+diff --git a/src/add-ons/kernel/drivers/graphics/Jamfile b/src/add-ons/kernel/drivers/graphics/Jamfile
+index cfaa4e4..5e5b9db 100644
+--- a/src/add-ons/kernel/drivers/graphics/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/Jamfile
+@@ -10,6 +10,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers graphics intel_extreme ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics matrox ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics neomagic ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics nvidia ;
++SubInclude HAIKU_TOP src add-ons kernel drivers graphics poulsbo ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon_hd ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics s3 ;
+diff --git a/src/add-ons/kernel/drivers/graphics/poulsbo/Jamfile b/src/add-ons/kernel/drivers/graphics/poulsbo/Jamfile
+new file mode 100644
+index 0000000..aaebc21
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/poulsbo/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src add-ons kernel drivers graphics poulsbo ;
++
++UsePrivateHeaders [ FDirName graphics poulsbo ] ;
++UsePrivateKernelHeaders ;
++
++KernelAddon poulsbo :
++	poulsbo.c
++	;
+diff --git a/src/add-ons/kernel/drivers/graphics/poulsbo/poulsbo.c b/src/add-ons/kernel/drivers/graphics/poulsbo/poulsbo.c
+new file mode 100644
+index 0000000..29dca37
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/poulsbo/poulsbo.c
+@@ -0,0 +1,321 @@
++/*
++ * Poulsbo 커널 드라이버.
++ *
++ * 하는 일이 적다. BIOS(또는 VESA)가 이미 세워 놓은 파이프 B 의 모드를 읽어
++ * 그대로 보고하고, 프레임버퍼와 MMIO 를 영역으로 매핑하고, 하드웨어 커서용
++ * 물리 연속 16 KB 를 잡아 둔다. 모드 설정은 하지 않는다 - 이 기기의 패널은
++ * 1600x768 고정이고, 잘못 건드리면 화면이 죽는다.
++ */
++#include <KernelExport.h>
++#include <Drivers.h>
++#include <PCI.h>
++#include <graphic_driver.h>
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <poulsbo.h>
++
++#define TRACE(x...)	dprintf("poulsbo: " x)
++
++/* 커널이 내보내는 비공개 함수다. private/kernel/vm/vm.h 를 그대로 넣으면
++   C++ 정의가 딸려 오므로 선언만 옮겨 적는다. vesa 드라이버도 이 함수로
++   프레임버퍼에 write-combining 을 건다. */
++extern status_t vm_set_area_memory_type(area_id id, phys_addr_t physicalBase,
++	uint32 type);
++
++#define VENDOR_INTEL	0x8086
++#define DEVICE_POULSBO	0x8108
++
++int32 api_version = B_CUR_DRIVER_API_VERSION;
++
++static pci_module_info* sPCI = NULL;
++static pci_info sPCIInfo;
++static bool sHasDevice = false;
++
++static area_id sSharedArea = -1;
++static area_id sRegistersArea = -1;
++static area_id sFramebufferArea = -1;
++static area_id sCursorArea = -1;
++static poulsbo_shared_info* sShared = NULL;
++static uint8* sRegisters = NULL;
++
++static const char* sDeviceNames[] = { "graphics/poulsbo", NULL };
++
++
++static uint32
++read32(uint32 offset)
++{
++	return *(volatile uint32*)(sRegisters + offset);
++}
++
++
++static bool
++find_poulsbo(void)
++{
++	long index;
++	for (index = 0; sPCI->get_nth_pci_info(index, &sPCIInfo) == B_OK; index++) {
++		if (sPCIInfo.vendor_id == VENDOR_INTEL
++			&& sPCIInfo.device_id == DEVICE_POULSBO)
++			return true;
++	}
++	return false;
++}
++
++
++status_t
++init_hardware(void)
++{
++	bool found;
++	if (get_module(B_PCI_MODULE_NAME, (module_info**)&sPCI) != B_OK)
++		return B_ERROR;
++	found = find_poulsbo();
++	put_module(B_PCI_MODULE_NAME);
++	sPCI = NULL;
++	return found ? B_OK : B_ERROR;
++}
++
++
++static void
++read_current_mode(display_mode* mode)
++{
++	uint32 htotal = read32(PSB_HTOTAL_B);
++	uint32 hsync = read32(PSB_HSYNC_B);
++	uint32 vtotal = read32(PSB_VTOTAL_B);
++	uint32 vsync = read32(PSB_VSYNC_B);
++	uint32 source = read32(PSB_PIPEBSRC);
++
++	memset(mode, 0, sizeof(*mode));
++	mode->timing.h_display = (htotal & 0xffff) + 1;
++	mode->timing.h_total = (htotal >> 16) + 1;
++	mode->timing.h_sync_start = (hsync & 0xffff) + 1;
++	mode->timing.h_sync_end = (hsync >> 16) + 1;
++	mode->timing.v_display = (vtotal & 0xffff) + 1;
++	mode->timing.v_total = (vtotal >> 16) + 1;
++	mode->timing.v_sync_start = (vsync & 0xffff) + 1;
++	mode->timing.v_sync_end = (vsync >> 16) + 1;
++	/* 패널은 60 Hz 고정이다. 픽셀 클럭은 타이밍에서 되짚어 kHz 로 적는다.
++	   커널 모듈에는 libgcc 가 없어 64비트 나눗셈을 쓸 수 없다 - 이 값들은
++	   32비트 안에서 곱해도 넘치지 않는다 (1794 * 778 * 60 = 8.4e7). */
++	mode->timing.pixel_clock = ((uint32)mode->timing.h_total
++		* (uint32)mode->timing.v_total * 60) / 1000;
++	mode->space = B_RGB32_LITTLE;
++	mode->virtual_width = ((source >> 16) & 0xffff) + 1;
++	mode->virtual_height = (source & 0xffff) + 1;
++	mode->h_display_start = 0;
++	mode->v_display_start = 0;
++	mode->flags = B_SCROLL;
++}
++
++
++status_t
++init_driver(void)
++{
++	physical_entry entry;
++	void* address;
++	uint32 stolenBase;
++	uint32 stride;
++	uint32 height;
++	area_id gttArea;
++	uint32* gtt;
++
++	if (get_module(B_PCI_MODULE_NAME, (module_info**)&sPCI) != B_OK)
++		return B_ERROR;
++	if (!find_poulsbo()) {
++		put_module(B_PCI_MODULE_NAME);
++		return B_ERROR;
++	}
++	sHasDevice = true;
++
++	/* MMIO (BAR0). 레지스터라 캐시를 끈다. */
++	sRegistersArea = map_physical_memory("poulsbo registers",
++		sPCIInfo.u.h0.base_registers[0], sPCIInfo.u.h0.base_register_sizes[0],
++		B_ANY_KERNEL_ADDRESS, POULSBO_AREA_PROTECTION, (void**)&sRegisters);
++	if (sRegistersArea < B_OK) {
++		TRACE("MMIO 매핑 실패\n");
++		goto error;
++	}
++
++	/* 프레임버퍼의 물리 주소는 GTT 0번 칸에 적혀 있다 (BIOS 가 채운다). */
++	gttArea = map_physical_memory("poulsbo gtt",
++		sPCIInfo.u.h0.base_registers[3], sPCIInfo.u.h0.base_register_sizes[3],
++		B_ANY_KERNEL_ADDRESS, B_READ_AREA, (void**)&gtt);
++	if (gttArea < B_OK) {
++		TRACE("GTT 매핑 실패\n");
++		goto error;
++	}
++	stolenBase = gtt[0] & ~0xfff;
++	delete_area(gttArea);
++
++	stride = read32(PSB_DSPBSTRIDE) & 0xffff;
++	height = (read32(PSB_PIPEBSRC) & 0xffff) + 1;
++	if (stride == 0 || height == 0 || (read32(PSB_PIPEBCONF) & 0x80000000) == 0) {
++		TRACE("파이프 B 가 꺼져 있다 - 이 드라이버는 모드를 세우지 않는다\n");
++		goto error;
++	}
++
++	sFramebufferArea = map_physical_memory("poulsbo framebuffer", stolenBase,
++		stride * height, B_ANY_KERNEL_ADDRESS, POULSBO_AREA_PROTECTION,
++		&address);
++	if (sFramebufferArea < B_OK) {
++		TRACE("프레임버퍼 매핑 실패\n");
++		goto error;
++	}
++	/* 스캔아웃은 CPU 캐시를 들여다보지 않는다. write-back 으로 두면 그린
++	   픽셀이 캐시에 머물다가 늦게 반영돼 창을 끌 때 잔상이 남는다.
++	   vesa 드라이버와 같이 write-combining 으로 바꾼다. */
++	vm_set_area_memory_type(sFramebufferArea, stolenBase,
++		B_WRITE_COMBINING_MEMORY);
++
++	/* 커서는 물리적으로 연속인 16 KB 를 요구한다 (cursor_needs_phys). */
++	sCursorArea = create_area("poulsbo cursor", &address, B_ANY_KERNEL_ADDRESS,
++		B_PAGE_SIZE * 4, B_CONTIGUOUS, POULSBO_AREA_PROTECTION);
++	if (sCursorArea < B_OK) {
++		TRACE("커서 영역 생성 실패\n");
++		goto error;
++	}
++	memset(address, 0, B_PAGE_SIZE * 4);
++	if (get_memory_map(address, B_PAGE_SIZE * 4, &entry, 1) != B_OK) {
++		TRACE("커서 물리 주소 조회 실패\n");
++		goto error;
++	}
++
++	sSharedArea = create_area("poulsbo shared", (void**)&sShared,
++		B_ANY_KERNEL_ADDRESS,
++		(sizeof(poulsbo_shared_info) + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1),
++		B_FULL_LOCK, POULSBO_AREA_PROTECTION);
++	if (sSharedArea < B_OK) {
++		TRACE("공유 영역 생성 실패\n");
++		goto error;
++	}
++
++	memset(sShared, 0, sizeof(poulsbo_shared_info));
++	sShared->magic = POULSBO_PRIVATE_MAGIC;
++	sShared->shared_area = sSharedArea;
++	sShared->registers_area = sRegistersArea;
++	sShared->framebuffer_area = sFramebufferArea;
++	sShared->cursor_area = sCursorArea;
++	sShared->cursor_physical = (uint32)entry.address;
++	sShared->framebuffer_physical = stolenBase;
++	sShared->framebuffer_size = stride * height;
++	sShared->bytes_per_row = stride;
++	read_current_mode(&sShared->current_mode);
++
++	TRACE("%ux%u, stride %u, 스톨른 %08x, 커서 %08x\n",
++		(unsigned)sShared->current_mode.virtual_width,
++		(unsigned)sShared->current_mode.virtual_height,
++		(unsigned)stride, (unsigned)stolenBase,
++		(unsigned)sShared->cursor_physical);
++	return B_OK;
++
++error:
++	if (sSharedArea >= B_OK) delete_area(sSharedArea);
++	if (sCursorArea >= B_OK) delete_area(sCursorArea);
++	if (sFramebufferArea >= B_OK) delete_area(sFramebufferArea);
++	if (sRegistersArea >= B_OK) delete_area(sRegistersArea);
++	sSharedArea = sCursorArea = sFramebufferArea = sRegistersArea = -1;
++	put_module(B_PCI_MODULE_NAME);
++	sPCI = NULL;
++	sHasDevice = false;
++	return B_ERROR;
++}
++
++
++void
++uninit_driver(void)
++{
++	if (sSharedArea >= B_OK) delete_area(sSharedArea);
++	if (sCursorArea >= B_OK) delete_area(sCursorArea);
++	if (sFramebufferArea >= B_OK) delete_area(sFramebufferArea);
++	if (sRegistersArea >= B_OK) delete_area(sRegistersArea);
++	if (sPCI != NULL)
++		put_module(B_PCI_MODULE_NAME);
++}
++
++
++const char**
++publish_devices(void)
++{
++	return sHasDevice ? sDeviceNames : NULL;
++}
++
++
++static status_t
++device_open(const char* name, uint32 flags, void** cookie)
++{
++	*cookie = NULL;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* length)
++{
++	*length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer, size_t* length)
++{
++	*length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case B_GET_ACCELERANT_SIGNATURE:
++			strcpy((char*)buffer, POULSBO_ACCELERANT_NAME);
++			return B_OK;
++
++		case B_GET_PATH_FOR_DEVICE:
++			strcpy((char*)buffer, "/dev/graphics/poulsbo");
++			return B_OK;
++
++		case POULSBO_GET_PRIVATE_DATA:
++		{
++			poulsbo_private_data* data = (poulsbo_private_data*)buffer;
++			if (data->magic != POULSBO_PRIVATE_MAGIC)
++				return B_BAD_VALUE;
++			data->shared_info_area = sSharedArea;
++			return B_OK;
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static device_hooks sDeviceHooks = {
++	device_open,
++	device_close,
++	device_free,
++	device_control,
++	device_read,
++	device_write,
++	NULL, NULL, NULL, NULL
++};
++
++
++device_hooks*
++find_device(const char* name)
++{
++	return &sDeviceHooks;
++}
 diff --git a/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp b/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp
 index edeba186d9..bfd203eea2 100644
 --- a/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp

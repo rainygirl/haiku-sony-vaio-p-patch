@@ -79,6 +79,17 @@ cd tools/vaio-p
 
 RenkuOS nightly가 이 설정으로 빌드하기 때문입니다. 상표가 있는 아트워크를 포함하지 않으므로 설치된 시스템의 바탕화면 로고가 비어 있는데, [`restore-haiku-logo.sh`](restore-haiku-logo.sh)로 되돌릴 수 있습니다. 부팅 스플래시는 어느 쪽이든 영향이 없습니다 — 패치셋이 더 이상 부팅 시 로고를 그리지 않기 때문입니다.
 
+## 그래픽
+
+이 ISO 에는 이 기기의 Intel SCH US15W(Poulsbo, 이른바 "GMA500")용 작은
+드라이버가 들어 있습니다. 덕분에 마우스 포인터를 app_server 가 소프트웨어로
+그리지 않고 디스플레이 엔진이 직접 합성합니다. 따로 설치하거나 켤 것은
+없습니다 - 패치된 시스템에서 `ls /dev/graphics/` 를 하면 `vesa` 옆에
+`poulsbo` 가 보입니다. 2D·3D 가속은 없습니다. 이 칩의 그리기 엔진은 문서가
+공개되지 않은 PowerVR SGX535 입니다. 패치하지 않은 시스템용으로는 같은
+드라이버를 [haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver)
+에서 따로 받을 수 있습니다.
+
 ## 빌드 후 확인
 
 빌드 자체는 소스 검증일 뿐이며, 실제 검증은 실기기에서만 가능합니다: USB로 ACPI를 켜고 Safe Mode 없이 부팅 -> 내장 디스크에 설치 (DriveSetup으로 Intel 파티션 맵 + BFS 파티션을 먼저 만든 뒤 설치) -> 재부팅까지 확인해야 합니다.
