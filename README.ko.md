@@ -85,10 +85,17 @@ RenkuOS nightly가 이 설정으로 빌드하기 때문입니다. 상표가 있�
 드라이버가 들어 있습니다. 덕분에 마우스 포인터를 app_server 가 소프트웨어로
 그리지 않고 디스플레이 엔진이 직접 합성합니다. 따로 설치하거나 켤 것은
 없습니다 - 패치된 시스템에서 `ls /dev/graphics/` 를 하면 `vesa` 옆에
-`poulsbo` 가 보입니다. 2D·3D 가속은 없습니다. 이 칩의 그리기 엔진은 문서가
-공개되지 않은 PowerVR SGX535 입니다. 패치하지 않은 시스템용으로는 같은
-드라이버를 [haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver)
-에서 따로 받을 수 있습니다.
+`poulsbo` 가 보입니다.
+
+이 드라이버는 칩에 들어 있는 PowerVR SGX 2D 엔진도 구동하며 복사·채우기·반전
+훅을 제공하지만, app_server 는 이 훅들을 호출하지 않습니다. app_server 는 모든
+그리기를 주 메모리의 백버퍼에서 마친 뒤 완성된 사각형만 화면으로 밀어 넣으므로,
+프레임버퍼 안에서 복사하는 일 자체가 없습니다. 실기기에서 재 보면 그 백버퍼
+작업의 비용이 2D 엔진과 비슷합니다. 3D 가속은 없습니다.
+
+패치하지 않은 시스템용으로는 같은 드라이버를
+[haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver) 에서 따로
+받을 수 있습니다.
 
 ## 빌드 후 확인
 

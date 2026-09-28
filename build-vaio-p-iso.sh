@@ -51,6 +51,13 @@
 #                        desktop logo back on an installed system.
 #   IMAGE_LABEL          HAIKU_IMAGE_LABEL. Default: "RenkuOS", as the nightly.
 #   JOBS                 Parallelism for configure/jam. Default: nproc.
+#   JAM_TARGET           What to hand jam. Default: "@nightly-anyboot", the
+#                        whole image. Set it to a single target, such as
+#                        "app_server", to build just that -- useful for
+#                        trying a patch that only touches one binary without
+#                        building and installing a new image. Nothing is
+#                        copied out then; the build directory is printed
+#                        instead.
 
 set -euo pipefail
 
@@ -60,6 +67,7 @@ OUTPUT_ISO="${2:-$PWD/renku-vaio-p.iso}"
 JOBS="${JOBS:-$(nproc)}"
 DISTRO_COMPATIBILITY="${DISTRO_COMPATIBILITY:-default}"
 IMAGE_LABEL="${IMAGE_LABEL:-RenkuOS}"
+JAM_TARGET="${JAM_TARGET:-@nightly-anyboot}"
 
 RENKU_REPO="https://github.com/RenkuOS/Source.git"
 RENKU_API="https://api.github.com/repos/RenkuOS/Source"
@@ -376,14 +384,20 @@ fi
 [ -x "$JAM_BIN" ] || die "jam build did not produce an executable, check the output above"
 
 # ---------------------------------------------------------------------------
-log "Building RenkuOS (jam -q @nightly-anyboot) -- this is the slow part"
+log "Building RenkuOS (jam -q $JAM_TARGET) -- this is the slow part"
 # ---------------------------------------------------------------------------
 export PATH="$(dirname "$JAM_BIN"):$PATH"
 # Same label the RenkuOS nightly brands its images with. Exported rather than
 # written to UserBuildConfig: the nightly workflow found that only the export
 # reliably reaches jam.
 export HAIKU_IMAGE_LABEL="$IMAGE_LABEL"
-(cd "$GENDIR" && jam -q -j"$JOBS" @nightly-anyboot)
+(cd "$GENDIR" && jam -q -j"$JOBS" "$JAM_TARGET")
+
+if [ "$JAM_TARGET" != "@nightly-anyboot" ]; then
+	log "Built target $JAM_TARGET -- no image was assembled"
+	echo "Look for it under $GENDIR/objects"
+	exit 0
+fi
 
 # ---------------------------------------------------------------------------
 log "Done -- copying ISO to $OUTPUT_ISO"

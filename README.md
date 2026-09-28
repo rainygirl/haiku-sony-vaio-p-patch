@@ -84,10 +84,16 @@ That is what the RenkuOS nightly builds with. It ships no trademarked artwork, s
 The ISO carries a small driver for this machine's Intel SCH US15W (Poulsbo,
 "GMA500"), so the mouse pointer is drawn by the display engine rather than by
 app_server in software. Nothing has to be installed or turned on; `ls
-/dev/graphics/` shows `poulsbo` next to `vesa` on a patched system. There is no
-2D or 3D acceleration - the drawing engine on this chip is an undocumented
-PowerVR SGX535 - and the same driver is available separately, for unpatched
-systems, at [haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver).
+/dev/graphics/` shows `poulsbo` next to `vesa` on a patched system.
+
+The driver also drives the chip's PowerVR SGX 2D engine and offers the blit,
+fill and invert hooks, but app_server never calls them: it composes everything
+in a back buffer in main memory and pushes finished rectangles to the screen, so
+it never copies inside the frame buffer. Measured here, that back buffer work
+costs about as much as the engine would. There is no 3D acceleration.
+
+The same driver is available separately, for unpatched systems, at
+[haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver).
 
 ## After building
 

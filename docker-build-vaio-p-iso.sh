@@ -20,7 +20,8 @@
 #
 # Environment variables (forwarded to build-vaio-p-iso.sh inside the
 # container, see that script's header for details):
-#   SKIP_CROSS_TOOLS, RENKU_REF, DISTRO_COMPATIBILITY, IMAGE_LABEL, JOBS
+#   SKIP_CROSS_TOOLS, RENKU_REF, DISTRO_COMPATIBILITY, IMAGE_LABEL, JOBS,
+#   JAM_TARGET
 # and, for this wrapper only:
 #   CONTAINER_NAME       Build container name. Default: vaio-p-builder.
 #   WORK_VOLUME_NAME     Docker volume holding the whole build. Default:
@@ -114,10 +115,17 @@ docker exec \
 	${DISTRO_COMPATIBILITY:+-e DISTRO_COMPATIBILITY="$DISTRO_COMPATIBILITY"} \
 	${IMAGE_LABEL:+-e IMAGE_LABEL="$IMAGE_LABEL"} \
 	${JOBS:+-e JOBS="$JOBS"} \
+	${JAM_TARGET:+-e JAM_TARGET="$JAM_TARGET"} \
 	"$CONTAINER_NAME" \
 	"$WORK_MOUNT/tools/build-vaio-p-iso.sh" \
 	"$WORK_MOUNT/work" \
 	"$WORK_MOUNT/renku-vaio-p.iso"
+
+if [ -n "${JAM_TARGET:-}" ] && [ "$JAM_TARGET" != "@nightly-anyboot" ]; then
+	log "Built target $JAM_TARGET inside $CONTAINER_NAME -- nothing to copy out"
+	echo "Fetch it with: docker cp $CONTAINER_NAME:<path printed above> ."
+	exit 0
+fi
 
 # ---------------------------------------------------------------------------
 log "Copying finished ISO out to the Mac"
