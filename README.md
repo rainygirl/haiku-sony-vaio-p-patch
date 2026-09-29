@@ -92,6 +92,12 @@ in a back buffer in main memory and pushes finished rectangles to the screen, so
 it never copies inside the frame buffer. Measured here, that back buffer work
 costs about as much as the engine would. There is no 3D acceleration.
 
+The chip's sprite plane is offered through the overlay hooks - a second RGB
+surface the display engine composites, positioned anywhere on screen, at 1:1.
+There is no overlay plane on this hardware and therefore no YUV conversion or
+scaling, and Haiku's own overlay path does not yet hand the buffer to the
+application correctly, so nothing uses it today.
+
 The same driver is available separately, for unpatched systems, at
 [haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver).
 
