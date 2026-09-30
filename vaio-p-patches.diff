@@ -7029,7 +7029,7 @@ index f52f068155..484279715d 100644
  get_drive_parameters(uint8 drive, drive_parameters *parameters)
  {
 diff --git a/src/system/boot/platform/bios_ia32/smp.cpp b/src/system/boot/platform/bios_ia32/smp.cpp
-index 831f57a7e6..6f3f55a03d 100644
+index 831f57a7e6..b13d7dd8f6 100644
 --- a/src/system/boot/platform/bios_ia32/smp.cpp
 +++ b/src/system/boot/platform/bios_ia32/smp.cpp
 @@ -10,6 +10,7 @@
@@ -7055,7 +7055,7 @@ index 831f57a7e6..6f3f55a03d 100644
  #include "mmu.h"
  #include "acpi.h"
  
-@@ -474,6 +477,858 @@ smp_park_cpu(uint32 cpu)
+@@ -474,6 +477,945 @@ smp_park_cpu(uint32 cpu)
  }
  
  
@@ -7076,6 +7076,80 @@ index 831f57a7e6..6f3f55a03d 100644
 +// "the AP never executed anything at all" (the documented out-of-window
 +// behaviour) from "it ran but did not reach protected mode".
 +static const uint32 kApRealModeMarker = 0x9e808;
++
++
++// The loader's system_time() reads the BIOS tick count (INT 1Ah: 55 ms steps,
++// counted from midnight) and its spin() calls INT 15h AH=86h. Neither can time
++// an INIT/SIPI sequence or tell an SMI from a normal millisecond, and a BIOS
++// call in the middle of the wake is one more thing that can land in it. So the
++// early wake keeps its own clock: the TSC, calibrated against PIT channel 2
++// the way Linux's pit_calibrate_tsc() does, three times, keeping the fastest
++// run -- an SMI during a run can only make it longer.
++static uint64 sTscPerMs = 0;
++
++
++static inline uint64
++smp_rdtsc(void)
++{
++	uint64 tsc;
++	asm volatile ("rdtsc" : "=A" (tsc));
++	return tsc;
++}
++
++
++static void
++smp_calibrate_tsc(void)
++{
++	// 11932 PIT ticks at 1.193182 MHz is 10 ms.
++	const uint16 kPitTicks = 11932;
++	uint64 best = 0;
++
++	for (int32 run = 0; run < 3; run++) {
++		uint8 gate = in8(0x61);
++		out8((gate & ~0x02) | 0x01, 0x61);
++			// channel 2 gate on, speaker off
++		out8(0xb0, 0x43);
++			// channel 2, lobyte/hibyte, mode 0 (interrupt on terminal count)
++		out8(kPitTicks & 0xff, 0x42);
++		out8(kPitTicks >> 8, 0x42);
++
++		uint64 start = smp_rdtsc();
++		while ((in8(0x61) & 0x20) == 0)
++			;
++		uint64 elapsed = smp_rdtsc() - start;
++		out8(gate, 0x61);
++
++		if (best == 0 || elapsed < best)
++			best = elapsed;
++	}
++
++	sTscPerMs = best / 10;
++}
++
++
++/*!	Microseconds on the calibrated TSC. Before calibration (and on machines
++	the early wake does not run on) it falls back to the loader's clock.
++*/
++bigtime_t
++smp_early_now_us(void)
++{
++	if (sTscPerMs == 0)
++		return system_time();
++	return (bigtime_t)(smp_rdtsc() * 1000 / sTscPerMs);
++}
++
++
++static void
++smp_delay_us(uint32 microseconds)
++{
++	if (sTscPerMs == 0) {
++		spin(microseconds);
++		return;
++	}
++	uint64 end = smp_rdtsc() + (uint64)microseconds * sTscPerMs / 1000;
++	while (smp_rdtsc() < end)
++		asm volatile ("pause;");
++}
 +
 +
 +/*!	Copies the trampoline into place and builds the gdt it loads. Contents are
@@ -7128,7 +7202,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +
 +// Microseconds spent in each segment of one INIT/SIPI sequence, by the
 +// loader's own TSC clock. Indices: 0 esr-clear, 1 init-assert write, 2
-+// init-assert wait, 3 init-deassert write, 4 init-deassert wait, 5 spin(10000),
++// init-assert wait, 3 init-deassert write, 4 init-deassert wait, 5 init-to-sipi (no wait since the fix),
 +// 6 sipi-1 write, 7 sipi-1 spin(200), 8 sipi-1 wait, 9 sipi-2 write,
 +// 10 sipi-2 spin(200), 11 sipi-2 wait.
 +static uint32 sSegmentUs[12];
@@ -7147,14 +7221,14 @@ index 831f57a7e6..6f3f55a03d 100644
 +static uint32 sEarlyWakeMaxAttempts;
 +static const char* const kSegmentName[12] = {
 +	"esr-clear", "init-assert-write", "init-assert-wait",
-+	"init-deassert-write", "init-deassert-wait", "spin10ms",
++	"init-deassert-write", "init-deassert-wait", "init-to-sipi",
 +	"sipi1-write", "sipi1-spin200", "sipi1-wait",
 +	"sipi2-write", "sipi2-spin200", "sipi2-wait"
 +};
 +
-+#define SEGMENT_BEGIN()		bigtime_t segStart = system_time()
-+#define SEGMENT_END(index)	sSegmentUs[index] += (uint32)(system_time() \
-+								- segStart); segStart = system_time()
++#define SEGMENT_BEGIN()		bigtime_t segStart = smp_early_now_us()
++#define SEGMENT_END(index)	sSegmentUs[index] += (uint32)(smp_early_now_us() \
++								- segStart); segStart = smp_early_now_us()
 +
 +
 +/*!	Bounded wait for the local APIC to finish sending, recording how long it
@@ -7163,7 +7237,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +static bool
 +smp_wait_for_delivery(const char* name, uint32 writtenIcr)
 +{
-+	bigtime_t start = system_time();
++	bigtime_t start = smp_early_now_us();
 +
 +	uint32 timeout = kIPIDeliveryTimeout;
 +	while ((apic_read(APIC_INTR_COMMAND_1) & APIC_DELIVERY_STATUS) != 0
@@ -7171,7 +7245,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +		asm volatile ("pause;");
 +	}
 +
-+	uint32 elapsedUs = (uint32)(system_time() - start);
++	uint32 elapsedUs = (uint32)(smp_early_now_us() - start);
 +	uint32 readback = apic_read(APIC_INTR_COMMAND_1);
 +
 +	// The error status register latches on write, so write-then-read is the
@@ -7232,24 +7306,18 @@ index 831f57a7e6..6f3f55a03d 100644
 +		SEGMENT_END(phase == 0 ? 2 : 4);
 +	}
 +
-+	// The 10 ms the MP init protocol asks for between INIT and SIPI, sliced so
-+	// the 200 ms stall that lands in here can be located. Measured: baseline
-+	// 10 ms spins are exact to the microsecond, an INIT to a bogus APIC id
-+	// costs nothing, and a *second* INIT to id 1 costs nothing -- only the
-+	// first INIT of the boot is followed by this stall. That is what a core
-+	// resetting its sibling thread looks like from the thread that is still
-+	// running, and it means something is there to reset.
-+	for (uint32 slice = 0; slice < 20; slice++) {
-+		bigtime_t sliceStart = system_time();
-+		spin(500);
-+		uint32 sliceUs = (uint32)(system_time() - sliceStart);
-+		if (sliceUs > 2000 && sStallSliceCount < 4) {
-+			sStallSlice[sStallSliceCount] = slice;
-+			sStallSliceUs[sStallSliceCount] = sliceUs;
-+			sStallSliceCount++;
-+		}
-+	}
-+
++	// No wait between INIT and SIPI. The 10 ms the MP spec asks for is for
++	// discrete 82489DX APICs; Linux has used no delay on every Intel CPU from
++	// the Pentium Pro on (smp_set_init_udelay(), init_udelay = 0) and 10 us
++	// between the two SIPIs.
++	//
++	// Here the 10 ms was not just unnecessary, it was the race. After INIT
++	// the AP sits in wait-for-SIPI, and an SMI arriving in that window cannot
++	// rendezvous with it: the firmware's handler waits out its own timeout (a
++	// fixed ~311 ms, measured to within 63 us on two boots) and the AP does
++	// not start. Whether a boot got two CPUs came down to whether an SMI
++	// happened to land in those 10 ms. Sending the SIPI right away shrinks
++	// the window to microseconds.
 +	SEGMENT_END(5);
 +
 +	uint32 numStartups
@@ -7267,7 +7335,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +
 +		SEGMENT_END(j == 0 ? 6 : 9);
 +
-+		spin(200);
++		smp_delay_us(10);
 +
 +		SEGMENT_END(j == 0 ? 7 : 10);
 +
@@ -7419,7 +7487,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +						= pci_cfg_read(0, device, function, eecp, 4);
 +					if ((legacySupport & (1 << 16)) == 0)
 +						break;
-+					spin(5000);
++					smp_delay_us(5000);
 +				}
 +			}
 +
@@ -7435,7 +7503,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +					? ((legacySupport & (1 << 16)) != 0
 +						? "BIOS-owned (forced off)" : "BIOS-owned (released)")
 +					: "already unowned",
-+				(uint32)(system_time() / 1000));
++				(uint32)(smp_early_now_us() / 1000));
 +			return;
 +		}
 +	}
@@ -7609,6 +7677,8 @@ index 831f57a7e6..6f3f55a03d 100644
 +	if (gKernelArgs.arch_args.apic_phys == 0 || gKernelArgs.num_cpus < 2)
 +		return;
 +
++	smp_calibrate_tsc();
++
 +	// Silence the BIOS's USB SMIs before the first INIT goes out -- see the
 +	// function's comment for why this decides whether the AP starts at all.
 +	smp_early_usb_handoff();
@@ -7646,7 +7716,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +	// itself costs enough time to move the result.
 +	uint64 tscAtWake;
 +	asm volatile ("rdtsc" : "=A" (tscAtWake));
-+	bigtime_t usDirectStart = system_time();
++	bigtime_t usDirectStart = smp_early_now_us();
 +
 +	// A single delivery timeout used to abort the entire early wake with no
 +	// SIPI sent and nothing in the log to say so, because the return value
@@ -7704,7 +7774,24 @@ index 831f57a7e6..6f3f55a03d 100644
 +				sent = false;
 +		}
 +
-+		spin(2000);
++		// Wait for the AP's real-mode marker before trying again, and wait
++		// long enough. Checking after 2 ms and sending the next INIT reset an
++		// AP that was merely slow -- the marker has been seen at handover on
++		// boots where this loop had already given up on it. 100 ms, polled
++		// every millisecond; a millisecond that takes far longer than one is
++		// an SMI, recorded as before.
++		for (uint32 waited = 0; waited < 100; waited++) {
++			if (*(volatile uint32 *)kApRealModeMarker != 0)
++				break;
++			bigtime_t sliceStart = smp_early_now_us();
++			smp_delay_us(1000);
++			uint32 sliceUs = (uint32)(smp_early_now_us() - sliceStart);
++			if (sliceUs > 2000 && sStallSliceCount < 4) {
++				sStallSlice[sStallSliceCount] = waited;
++				sStallSliceUs[sStallSliceCount] = sliceUs;
++				sStallSliceCount++;
++			}
++		}
 +
 +		if (*(volatile uint32 *)kApRealModeMarker != 0)
 +			break;
@@ -7718,10 +7805,10 @@ index 831f57a7e6..6f3f55a03d 100644
 +
 +	// Give the firmware-mediated path a moment beyond the IPI one: if the AP
 +	// comes back through the BIOS and the 40:67 pointer, it does so on the
-+	// firmware's schedule, not within the 2 ms the loop above waits.
++	// firmware's schedule, not within the 100 ms the loop above waits.
 +	if (*(volatile uint32 *)kApRealModeMarker == 0) {
 +		for (uint32 waited = 0; waited < 500; waited += 10) {
-+			spin(10000);
++			smp_delay_us(10000);
 +			if (*(volatile uint32 *)kApRealModeMarker != 0)
 +				break;
 +		}
@@ -7731,7 +7818,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +	out8(0x0f, 0x70);
 +	out8(0x00, 0x71);
 +
-+	bigtime_t usDirectEnd = system_time();
++	bigtime_t usDirectEnd = smp_early_now_us();
 +	uint64 tscAfter;
 +	asm volatile ("rdtsc" : "=A" (tscAfter));
 +
@@ -7739,7 +7826,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +	// earlier version divided by a hand-picked 1.33 GHz and reported a SIPI
 +	// sequence of 208 ms where the code's own spins account for about 10,
 +	// which is what exposed the error.
-+	uint64 usNow = (uint64)system_time();
++	uint64 usNow = (uint64)smp_early_now_us();
 +	uint32 msAtWake = (uint32)(((tscAtWake * usNow / tscAfter)) / 1000ULL);
 +	uint32 msAfter = (uint32)(usNow / 1000ULL);
 +
@@ -7809,7 +7896,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +			reroll_screen_print("\r\nSMP: second CPU did not answer. Rebooting on "
 +				"purpose to re-roll the firmware state.\r\nThis is expected and "
 +				"may repeat several times before the machine finishes booting.\r\n");
-+			spin(50000);	// let serial output drain
++			smp_delay_us(50000);	// let serial output drain
 +
 +			// The coldest reset available first: a KBC-pulse warm reset
 +			// demonstrably carries the bad state along -- measured, one
@@ -7819,9 +7906,9 @@ index 831f57a7e6..6f3f55a03d 100644
 +			// software gets here; the KBC pulse stays as the fallback for
 +			// the case where this chipset ignores 0xcf9.
 +			out8(0x02, 0xcf9);
-+			spin(500);
++			smp_delay_us(500);
 +			out8(0x0e, 0xcf9);
-+			spin(100000);
++			smp_delay_us(100000);
 +			out8(0xfe, 0x64);	// keyboard-controller pulse, as platform_exit()
 +			for (;;)
 +				asm volatile ("hlt");
@@ -7870,7 +7957,7 @@ index 831f57a7e6..6f3f55a03d 100644
 +	// If the AP does run, this is where it shows -- and a marker that is set
 +	// here but zero there means the 0x9e000 page was overwritten in between,
 +	// not that the AP never started.
-+	spin(5000);
++	smp_delay_us(5000);
 +	dprintf("smp:   markers 5 ms after the wake: real-mode %#" B_PRIx32
 +		", pmode %#" B_PRIx32 "\n", *(volatile uint32 *)kApRealModeMarker,
 +		*(volatile uint32 *)kApParkedMarker);
@@ -7902,8 +7989,8 @@ index 831f57a7e6..6f3f55a03d 100644
 +
 +	if (sStallSliceCount != 0) {
 +		for (uint32 i = 0; i < sStallSliceCount; i++) {
-+			dprintf("smp:   stall: slice %" B_PRIu32 " of 20 took %" B_PRIu32
-+				" us\n", sStallSlice[i], sStallSliceUs[i]);
++			dprintf("smp:   stall: ms %" B_PRIu32 " of 100 after the SIPI took %"
++				B_PRIu32 " us\n", sStallSlice[i], sStallSliceUs[i]);
 +		}
 +	}
 +
@@ -7914,7 +8001,7 @@ index 831f57a7e6..6f3f55a03d 100644
  void
  smp_boot_other_cpus(void (*entryFunc)(void))
  {
-@@ -496,9 +1351,26 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -496,9 +1438,26 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  	uint32 trampolineStack = 0x9e000;
  #endif
  
@@ -7942,7 +8029,7 @@ index 831f57a7e6..6f3f55a03d 100644
  
  	const bool bounded = smp_cpu_wants_bounded_startup();
  	const uint32 attempts = bounded ? kApStartupAttempts : 1;
-@@ -525,6 +1397,45 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -525,6 +1484,45 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  		// visible action on the first attempt and comes up on a later one.
  		// Everywhere else this is one pass with the original unbounded
  		// waits, exactly as before.
@@ -7988,7 +8075,7 @@ index 831f57a7e6..6f3f55a03d 100644
  		bool started = false;
  
  		for (uint32 attempt = 0; attempt < attempts && !started; attempt++) {
-@@ -669,6 +1580,16 @@ smp_boot_other_cpus(void (*entryFunc)(void))
+@@ -669,6 +1667,16 @@ smp_boot_other_cpus(void (*entryFunc)(void))
  			// would have started. On the machine this was written for that
  			// is exactly one CPU, the Hyper-Threading sibling, and it is
  			// the last in the list.
@@ -8005,7 +8092,7 @@ index 831f57a7e6..6f3f55a03d 100644
  			smp_park_cpu(i);
  
  			dprintf("smp: cpu %" B_PRIu32 " (apic id %u) did not start after "
-@@ -696,6 +1617,40 @@ smp_add_safemode_menus(Menu *menu)
+@@ -696,6 +1704,40 @@ smp_add_safemode_menus(Menu *menu)
  {
  	MenuItem *item;
  
@@ -8047,15 +8134,16 @@ index 831f57a7e6..6f3f55a03d 100644
  		menu->AddItem(item = new(nothrow) MenuItem("Disable IO-APIC"));
  		item->SetType(MENU_ITEM_MARKABLE);
 diff --git a/src/system/boot/platform/bios_ia32/smp.h b/src/system/boot/platform/bios_ia32/smp.h
-index 4acda1622d..4aa8bc5356 100644
+index 4acda1622d..0dce742aef 100644
 --- a/src/system/boot/platform/bios_ia32/smp.h
 +++ b/src/system/boot/platform/bios_ia32/smp.h
-@@ -18,6 +18,8 @@ extern "C" {
+@@ -18,6 +18,9 @@ extern "C" {
  #endif
  
  extern void smp_init(void);
 +extern bool smp_early_wake_supported(void);
 +void smp_wake_other_cpus_early(void);
++extern bigtime_t smp_early_now_us(void);
  extern void smp_init_other_cpus(void);
  extern void smp_boot_other_cpus(void (*entryFunc)(void));
  
@@ -8144,10 +8232,10 @@ index 33a5ced675..ce4cc1b66a 100644
  	movl   %eax,%cr3        # set the page dir
  	
 diff --git a/src/system/boot/platform/bios_ia32/start.cpp b/src/system/boot/platform/bios_ia32/start.cpp
-index ab4d055082..7bd4b5b27c 100644
+index ab4d055082..3499f0c3f1 100644
 --- a/src/system/boot/platform/bios_ia32/start.cpp
 +++ b/src/system/boot/platform/bios_ia32/start.cpp
-@@ -182,12 +182,51 @@ _start(void)
+@@ -182,12 +182,52 @@ _start(void)
  	args.arguments = NULL;
  
  	serial_init();
@@ -8184,11 +8272,12 @@ index ab4d055082..7bd4b5b27c 100644
 +		smp_wake_other_cpus_early();
 +
 +		// Printed only now: dprintf() is expensive enough to move the numbers
-+		// it would be reporting. Converted with the loader's own PIT-calibrated
-+		// clock rather than an assumed rate.
++		// it would be reporting. Converted with the PIT-calibrated TSC clock
++		// rather than an assumed rate.
 +		uint64 tscNow;
 +		asm volatile ("rdtsc" : "=A" (tscNow));
-+		uint64 usNow = (uint64)system_time();
++		uint64 usNow = (uint64)smp_early_now_us();
++			// the TSC clock the wake calibrated; system_time() is BIOS ticks
 +		dprintf("smp: stage ms -- acpi %" B_PRIu32 " smp_init %" B_PRIu32
 +			" (uptime now %" B_PRIu32 " ms)\n",
 +			(uint32)((((uint64)(tscSmp - tscAcpi)) * usNow / tscNow) / 1000ULL),
@@ -8201,7 +8290,7 @@ index ab4d055082..7bd4b5b27c 100644
  	parse_multiboot_commandline(&args);
  
  	// reading the keyboard doesn't seem to work in graphics mode
-@@ -197,8 +236,12 @@ _start(void)
+@@ -197,8 +237,12 @@ _start(void)
  //		serial_enable();
  
  	apm_init();

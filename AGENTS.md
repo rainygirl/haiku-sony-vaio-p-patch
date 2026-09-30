@@ -144,6 +144,57 @@ The diff no longer reverts upstream's boot loader timing work (`a89c12444a`, `30
 - **Installer** — `WorkerThread.cpp`/`.h`: actually marks the target partition active and writes MBR boot code after install, so a fresh install is bootable without a manual `writembr` step. The disk device manager won't commit a partition-table change (including the active flag) against a live, mounted partition, so this unmounts the target first -- nothing after this point in the install still needs it mounted. The MBR is only overwritten if marking the partition active actually succeeded; a fresh install with no active partition and generic MBR code is completely unbootable (no boot loader ever runs, not even to show the boot options menu), so on failure this leaves whatever boot setup was already on the disk alone instead of risking that. Both steps `sync()` afterwards, since the MBR write goes through an external `writembr` process that bypasses the disk device manager entirely.
 - **launch_daemon** — `Job.cpp`: retries launching a signature-based app for a while instead of failing immediately if `launch_daemon` hasn't seen it registered yet (matters on slow storage).
 
+## Second logical CPU: the race, and why it is gone (2026-09-30)
+
+Everything below this section records the long hunt; this is where it ended.
+The coin flip was a race between our own INIT/SIPI timing and the firmware's
+SMIs, and two changes remove it.
+
+**The 10 ms INIT-to-SIPI wait was the window.** After INIT the AP sits in
+wait-for-SIPI. An SMI arriving then cannot rendezvous with it, so the handler
+waits out its own timeout -- the fixed ~311 ms measured below, identical to
+63 us on two boots -- and the AP does not start. Whether a boot got two CPUs
+came down to whether an SMI landed in those 10 ms. The 10 ms is for discrete
+82489DX APICs: Linux has used no delay on every Intel CPU from the Pentium Pro
+on (`smp_set_init_udelay()`, `init_udelay = 0`) and 10 us between the two
+SIPIs. The early wake now does the same, and the whole sequence takes 36 us.
+
+**The retry loop reset slow APs.** It checked the real-mode marker 2 ms after
+the SIPI and then sent the next INIT, resetting an AP that had merely not got
+there yet (the marker had been seen at handover on boots where this loop gave
+up). It now waits up to 100 ms.
+
+**The loader's clock changed under the code.** Upstream moved the BIOS
+loader's `system_time()` to the BIOS tick count (INT 1Ah: 55 ms steps, counted
+from midnight -- the `44733245 ms after power-on` in the first boot) and
+`spin()` to INT 15h AH=86h (`a89c12444a`, `774b6a58ae`). The early wake's
+waits, its stall detection and every figure it prints relied on a precise
+clock, and a BIOS call in the middle of the wake is one more thing to land in
+it. The early wake now calibrates the TSC against PIT channel 2 (as Linux's
+`pit_calibrate_tsc()` does, three runs, fastest kept) and times everything on
+it; `start.cpp`'s stage timings use the same clock. Upstream's `spin()` also
+has `regs.ecx = microseconds << 16` where `>> 16` is meant, so waits of 64 ms
+and longer are cut short -- worth reporting, not patched here.
+
+Measured with the installed loader, four boots in a row:
+
+```text
+smp: early wake sent to 1 ap(s) at 11485 ms after power-on (took 0 ms,
+     sequence completed, attempt 1 of 10, 0 spoiled by a stall)
+smp:   segments (us): total 26, direct 36
+smp: cpu 1 was parked by the early wake, handed over
+```
+
+Every boot: attempt 1, no stall, no reroll, two CPUs. The same morning the
+previous loader had spent all eight rerolls and come up with one.
+
+Tested without an image rebuild: the loader was built on the machine
+(`jam -q haiku_loader.hpkg` in a checkout of the baseline with this patch) and
+the `haiku_loader` package in `/boot/system/packages` swapped for it, with the
+active one kept in `~/loaderbak/`. The package takes about 20 s to activate;
+check `/boot/system/haiku_loader.bios_ia32` has the new timestamp before
+rebooting.
+
 ## Second logical CPU (working)
 
 The Atom Z520 is a single core with Hyper-Threading, and both logical CPUs run:

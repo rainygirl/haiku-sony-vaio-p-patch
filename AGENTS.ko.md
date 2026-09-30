@@ -141,6 +141,53 @@ haiku.git 기준일 때도 세 건이 같은 식으로 빠졌습니다:
 - **설치기** — `WorkerThread.cpp`/`.h`: 설치 후 대상 파티션을 실제로 active로 표시하고 MBR 부트코드를 기록해서, 수동으로 `writembr`를 하지 않아도 설치 직후 바로 부팅 가능하게 함. 디스크 디바이스 매니저는 마운트된 상태의 파티션에는 파티션 테이블 변경(active 플래그 포함)을 커밋해주지 않으므로, 이 시점부터는 더 이상 마운트가 필요 없다는 걸 확인하고 대상을 먼저 마운트 해제합니다. active 표시가 실제로 성공했을 때만 MBR을 덮어씁니다 — active 파티션이 하나도 없는 상태에서 범용 MBR 코드만 새로 쓰면 디스크가 완전히 부팅 불가능해지므로(부트로더가 전혀 실행되지 않아 부팅 옵션 메뉴조차 뜨지 않음), 실패 시에는 디스크에 원래 있던 부팅 설정을 그대로 두고 건드리지 않습니다. 두 단계 모두 이후 `sync()`를 호출합니다(MBR 쓰기는 디스크 디바이스 매니저를 완전히 우회하는 외부 `writembr` 프로세스로 이루어지기 때문).
 - **launch_daemon** — `Job.cpp`: `launch_daemon`이 아직 앱을 등록하지 못한 시점이면 즉시 실패하지 않고 한동안 재시도(느린 저장장치에서 중요).
 
+## 두 번째 논리 CPU: 경합과 해결 (2026-09-30)
+
+이 절 아래는 긴 추적 기록이고, 여기가 그 끝입니다. 부팅마다 되다 안 되다
+한 것은 우리 INIT/SIPI 타이밍과 펌웨어 SMI 사이의 경합이었고, 두 가지 변경으로
+없어졌습니다.
+
+**INIT 에서 SIPI 까지의 10 ms 가 그 창이었습니다.** INIT 을 받은 AP 는
+wait-for-SIPI 상태에 있고, 그때 SMI 가 오면 핸들러가 AP 와 합류하지 못해 자기
+타임아웃(아래에서 잰 고정 ~311 ms, 두 부팅에서 63 us 차이)까지 기다리며 AP 는
+뜨지 않습니다. CPU 2개가 뜨느냐는 SMI 가 그 10 ms 에 걸리느냐였습니다. 10 ms 는
+외장 82489DX APIC 시절 값입니다. 리눅스는 Pentium Pro 이후 모든 Intel CPU 에서
+대기 0(`smp_set_init_udelay()`, `init_udelay = 0`), 두 SIPI 사이 10 us 를
+씁니다. early wake 도 그렇게 바꿨고, 전체 시퀀스가 36 us 입니다.
+
+**재시도 루프가 느린 AP 를 리셋했습니다.** SIPI 2 ms 뒤 real-mode 표시를 보고
+다음 INIT 을 보내, 아직 도착하지 않았을 뿐인 AP 를 리셋했습니다(이 루프가 포기한
+부팅에서도 인계 시점에는 표시가 서 있었습니다). 이제 100 ms 까지 기다립니다.
+
+**로더의 시계가 코드 밑에서 바뀌었습니다.** 업스트림이 BIOS 로더의
+`system_time()` 을 BIOS 틱(INT 1Ah: 55 ms 단위, 자정부터 - 첫 부팅의
+`44733245 ms after power-on`)으로, `spin()` 을 INT 15h AH=86h 로 바꿨습니다
+(`a89c12444a`, `774b6a58ae`). early wake 의 대기, 멈춤 감지, 출력하는 모든
+수치가 정확한 시계에 기대고 있었고, wake 도중의 BIOS 호출은 또 하나의 끼어들
+거리입니다. 이제 early wake 는 PIT 채널 2 로 TSC 를 보정해(리눅스
+`pit_calibrate_tsc()` 처럼 세 번 재서 가장 빠른 값) 모든 시간을 잽니다.
+`start.cpp` 의 단계 시간도 같은 시계를 씁니다. 업스트림 `spin()` 에는
+`>> 16` 이어야 할 `regs.ecx = microseconds << 16` 이 있어 64 ms 이상의 대기가
+잘립니다. 보고할 거리이고 여기서는 고치지 않았습니다.
+
+설치한 로더로 네 번 연속 부팅한 결과:
+
+```text
+smp: early wake sent to 1 ap(s) at 11485 ms after power-on (took 0 ms,
+     sequence completed, attempt 1 of 10, 0 spoiled by a stall)
+smp:   segments (us): total 26, direct 36
+smp: cpu 1 was parked by the early wake, handed over
+```
+
+매번 첫 시도, 멈춤 없음, reroll 없음, CPU 2개였습니다. 같은 날 아침 이전
+로더는 reroll 8번을 다 쓰고 CPU 1개로 떴습니다.
+
+이미지 재빌드 없이 시험했습니다. 기준 커밋에 이 패치를 얹은 체크아웃에서 기기에서
+`jam -q haiku_loader.hpkg` 로 로더를 만들고, `/boot/system/packages` 의
+`haiku_loader` 패키지를 그것으로 바꿨습니다(쓰던 것은 `~/loaderbak/`). 패키지
+활성화에 20초쯤 걸리므로 재부팅 전에 `/boot/system/haiku_loader.bios_ia32` 의
+시각이 바뀌었는지 확인합니다.
+
 ## 두 번째 논리 CPU (동작함)
 
 Atom Z520은 싱글 코어 + 하이퍼스레딩이고, 두 논리 CPU가 모두 동작합니다.
