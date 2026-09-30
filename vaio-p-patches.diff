@@ -6816,13 +6816,32 @@ index b696c48674..8261813197 100644
  
  	// Build argument vector
 diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
-index 42bae2a7da..b1d8f38f76 100644
+index 42bae2a7da..01cb584fd6 100644
 --- a/src/servers/net/AutoconfigLooper.cpp
 +++ b/src/servers/net/AutoconfigLooper.cpp
-@@ -26,6 +26,22 @@
+@@ -11,13 +11,17 @@
+ #include "AutoconfigLooper.h"
+ 
+ #include <errno.h>
++#include <new>
+ #include <net/if_dl.h>
+ #include <net/if_media.h>
+ #include <net/if_types.h>
+ #include <stdio.h>
++#include <string.h>
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
++#include <syslog.h>
+ 
++#include <NetworkDevice.h>
+ #include <NetworkInterface.h>
+ #include <NetworkNotifications.h>
+ 
+@@ -26,6 +30,23 @@
  
  
  static const uint32 kMsgReadyToRun = 'rdyr';
++static const uint32 kMsgJoinCheck = 'jnck';
 +static const bigtime_t kJoinNetworkRetryTimeout = 30000000;
 +	// 30 seconds. This has to exceed how long a join can legitimately take,
 +	// because a retry is not free: the new join request deauthenticates
@@ -6842,18 +6861,52 @@ index 42bae2a7da..b1d8f38f76 100644
  
  
  AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
-@@ -34,7 +50,9 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+@@ -34,7 +55,11 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
  	fDevice(device),
  	fCurrentClient(NULL),
  	fLastMediaStatus(0),
 -	fJoiningNetwork(false)
 +	fJoiningNetwork(false),
 +	fJoiningNetworkSince(0),
-+	fJoinNetworkRetryTimeout(kJoinNetworkRetryTimeout)
++	fJoinNetworkRetryTimeout(kJoinNetworkRetryTimeout),
++	fJoinCheckRunner(NULL),
++	fJoinGeneration(0)
  {
  	BMessage ready(kMsgReadyToRun);
  	PostMessage(&ready);
-@@ -194,18 +212,58 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+@@ -43,6 +68,7 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+ 
+ AutoconfigLooper::~AutoconfigLooper()
+ {
++	delete fJoinCheckRunner;
+ 	_RemoveClient();
+ }
+ 
+@@ -181,11 +207,23 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+ 				break;
+ 
+ 			if ((fLastMediaStatus & IFM_ACTIVE) == 0 && (media & IFM_ACTIVE) != 0) {
++				// The join worked; the next one after a link loss starts
++				// from the short grace period again.
++				fJoinNetworkRetryTimeout = kJoinNetworkRetryTimeout;
++
+ 				// Reconfigure the interface when we have a link again
+ 				_ConfigureIPv4();
+ 				//_ConfigureIPv6();	// TODO: router advertisement and dhcpv6
+ 			} else if ((media & IFM_ACTIVE) == 0) {
+ 				_RemoveClient();
++
++				if ((fLastMediaStatus & IFM_ACTIVE) != 0 && fJoiningNetwork) {
++					// A wireless link was lost. The next completed scan may
++					// rejoin at once, and the check covers the case where no
++					// scan comes, which is the same dead end as a failed join.
++					fJoiningNetwork = false;
++					_ArmJoinCheck();
++				}
+ 			}
+ 
+ 			fLastMediaStatus = media;
+@@ -194,28 +232,125 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
  
  		case B_NETWORK_WLAN_SCANNED:
  		{
@@ -6920,16 +6973,112 @@ index 42bae2a7da..b1d8f38f76 100644
  
  			BMessage message(kMsgAutoJoinNetwork);
  			message.AddString("device", fDevice);
+ 			fTarget.SendMessage(&message);
++			_ArmJoinCheck();
+ 			break;
+ 		}
+ 	}
+ }
+ 
+ 
++/*!	Makes sure a join that fails is noticed even when nothing else happens.
++
++	The retry above only runs when a scan completes, and a failed join can
++	leave nothing scanning: measured on the VAIO P, wpa_supplicant gave up on
++	an authentication that got no answer, the interface went AUTH -> INIT, and
++	no scan -- so no retry -- followed for as long as the machine stayed up.
++	So every join also arms a one-shot check for just after its grace period.
++	If there is no link by then, it asks for a scan, and the scan's
++	completion runs the retry, with its backoff, exactly as if the scan had
++	happened on its own. A scan rather than a join, because net_server only
++	joins networks it can see in the scan results, and an interface that fell
++	back to INIT may have none left.
++*/
++void
++AutoconfigLooper::_ArmJoinCheck()
++{
++	delete fJoinCheckRunner;
++	fJoinGeneration++;
++
++	BMessage check(kMsgJoinCheck);
++	check.AddInt32("generation", fJoinGeneration);
++	fJoinCheckRunner = new(std::nothrow) BMessageRunner(BMessenger(this),
++		&check, fJoinNetworkRetryTimeout + 1000000, 1);
++}
++
++
++void
++AutoconfigLooper::_JoinCheck(BMessage* message)
++{
++	int32 generation;
++	if (message->FindInt32("generation", &generation) != B_OK
++		|| generation != fJoinGeneration) {
++		// A later join has armed its own check.
++		return;
++	}
++
++	if ((fLastMediaStatus & IFM_ACTIVE) != 0)
++		return;
++
++	BNetworkDevice device(fDevice.String());
++	status_t status = device.Scan(false, true);
++	syslog(LOG_NOTICE, "net_server: %s: no link %" B_PRIdBIGTIME " s after "
++		"joining, requesting a scan to retry: %s\n", fDevice.String(),
++		fJoinNetworkRetryTimeout / 1000000, strerror(status));
++	if (status != B_OK) {
++		// The device could not scan right now; look again one maximum
++		// grace period later rather than giving up on it.
++		delete fJoinCheckRunner;
++		BMessage check(kMsgJoinCheck);
++		check.AddInt32("generation", fJoinGeneration);
++		fJoinCheckRunner = new(std::nothrow) BMessageRunner(BMessenger(this),
++			&check, kJoinNetworkRetryTimeoutMax, 1);
++	}
++}
++
++
+ void
+ AutoconfigLooper::MessageReceived(BMessage* message)
+ {
+@@ -232,6 +367,10 @@ AutoconfigLooper::MessageReceived(BMessage* message)
+ 			_NetworkMonitorNotification(message);
+ 			break;
+ 
++		case kMsgJoinCheck:
++			_JoinCheck(message);
++			break;
++
+ 		default:
+ 			BLooper::MessageReceived(message);
+ 			break;
 diff --git a/src/servers/net/AutoconfigLooper.h b/src/servers/net/AutoconfigLooper.h
-index 948b9b4d6f..d1b1225f3c 100644
+index 948b9b4d6f..48bf4b31ee 100644
 --- a/src/servers/net/AutoconfigLooper.h
 +++ b/src/servers/net/AutoconfigLooper.h
-@@ -38,6 +38,8 @@ private:
+@@ -11,6 +11,7 @@
+ 
+ #include <Looper.h>
+ #include <Messenger.h>
++#include <MessageRunner.h>
+ #include <String.h>
+ #include <netinet6/in6.h>
+ 
+@@ -32,12 +33,18 @@ private:
+ 			void				_ConfigureIPv4Failed();
+ 			void				_ReadyToRun();
+ 			void				_NetworkMonitorNotification(BMessage* message);
++			void				_ArmJoinCheck();
++			void				_JoinCheck(BMessage* message);
+ 
+ 			BMessenger			fTarget;
+ 			BString				fDevice;
  			AutoconfigClient*	fCurrentClient;
  			int32				fLastMediaStatus;
  			bool				fJoiningNetwork;
 +			bigtime_t			fJoiningNetworkSince;
 +			bigtime_t			fJoinNetworkRetryTimeout;
++			BMessageRunner*		fJoinCheckRunner;
++			int32				fJoinGeneration;
  };
  
  #endif	// AUTOCONFIG_LOOPER_H

@@ -267,6 +267,42 @@ topo: CPUID.0xb absent, so MSR 0x35 (MSR_CORE_THREAD_COUNT) is not architectural
 
 빌드 스크립트가 이미 3-way 병합으로 재시도하므로, 여기까지 오는 건 진짜 충돌일 때뿐입니다. 체크아웃에서 `git apply -3 tools/vaio-p/vaio-p-patches.diff`를 실행해 충돌 표시를 확인한 뒤 각각을 살펴보세요. "패치 기준 시점"에 나열한 범용 정합성 버그처럼 이미 공식 소스에 같은 수정이 들어가 있다면(이미 세 건이 그렇게 됐습니다) 업스트림 쪽을 남기고 해당 hunk를 버리면 되고, 아니면 다시 작성하세요. 이후 `git diff HEAD --binary`로 diff 전체를 재생성합니다 — Intel 마이크로코드 바이너리가 들어 있으므로 `--binary`가 필요합니다.
 
+### 무선이 여전히 가끔 안 붙었다: 재시도가 오지 않는 스캔을 기다렸다 (2026-09-30)
+
+두 번째 CPU 가 매번 뜨게 된 뒤에도 다섯 번에 한 번은 무선 없이 떴습니다. syslog 를
+부팅별로 잘라(경계는 `smp: using ACPI to detect MP configuration`) 세어 보면 실패한
+부팅은 두 가지가 다릅니다.
+
+```text
+12:57:04  SCAN -> AUTH           (인증 응답 없음)
+12:57:05 ... 12:57:13            AUTH 상태에서 2초마다 notify_scan_done
+12:57:14  station deauth via MLME (reason 3), AUTH -> INIT
+          ... 그 뒤로 기기가 켜져 있는 내내 아무 일도 없음
+```
+
+성공한 부팅은 join 이 시작되면 스캔이 멈춥니다. 여기서는 net80211 의 연속 스캔이
+인증 중에도 채널을 옮겨 다녀 AP 의 응답을 놓쳤습니다 - `setmlme_assoc_sta()` 에
+FreeBSD 가 직접 남긴 `NB: this is racey if roaming is !manual` 이 있습니다. 그다음
+wpa_supplicant 가 포기하고 인터페이스가 INIT 에 멈췄습니다. AutoconfigLooper 는
+스캔이 끝날 때만 재시도하는데 INIT 에서는 아무것도 스캔하지 않으니, 재시도가
+오지 않았습니다.
+
+뒤쪽 절반을 `AutoconfigLooper.cpp` 에서 고쳤습니다. join 할 때마다, 그리고 무선
+링크를 잃을 때마다 유예 시간 직후의 일회성 점검을 겁니다. 그때까지 링크가 없으면
+스캔을 요청하고, 스캔이 끝나면 기존 재시도와 백오프가 돕니다. join 이 아니라
+스캔인 이유는 net_server 가 스캔 결과에 보이는 네트워크에만 join 하기 때문입니다.
+동작할 때는 syslog 에 남깁니다.
+
+```text
+net_server: /dev/net/atheroswifi/0: no link 30 s after joining, requesting a scan to retry: No error
+```
+
+막다른 상태를 일부러 만들어 시험했습니다. `ifconfig /dev/net/atheroswifi/0 leave
+"<ssid>"` 는 인터페이스를 스캔 없는 INIT 에 둡니다. 예전 net_server 는 거기 머물고,
+이것은 2분 10초 뒤 스스로 다시 붙었습니다(명시적 leave 직후 두 번의 join 은
+먹지 않았고 세 번째가 됐습니다). 스캔/join 경합 자체는 net80211 쪽이라 여기서
+바꾸지 않았습니다. 이제 그 경합은 연결을 잃는 대신 재시도 한 번으로 끝납니다.
+
 ## 재설치 없이 수정 적용하기
 
 커널 드라이버와 미디어 애드온은 동작 방식이 다릅니다. 여기서 틀리면 장치가 죽거나 재설치를 하게 됩니다.
@@ -308,6 +344,29 @@ package list -i haiku-patched.hpkg                             # PackageInfo가 
 ```
 
 그 다음 원본을 백업하고, `/boot/system/packages`에 같은 이름으로 덮어쓴 뒤 재부팅합니다. 리비전 문자열은 바뀌지 않고, 패키지 안의 `libnetapi.so` 호환 심볼릭 링크도 교체된 파일을 그대로 가리킵니다. 믿기 전에 두 가지를 확인하세요. 소비자가 가져다 쓰는 심볼(`objdump -T /boot/system/servers/net_server | grep UND`를 기존 라이브러리의 export와 교집합)이 새 라이브러리에도 전부 있어야 하고, `objdump -p`의 NEEDED 목록이 늘었을 수 있습니다. 여기서는 최신 트리에서 빌드한 라이브러리가 `libssl.so.3`/`libcrypto.so.3`를 끌어왔고, OpenSSL 3가 마침 설치돼 있어서 해결됐습니다. 잘못 교체했을 때의 복구 수단은 부팅 로더의 이전 패키지 상태이고, 물리적 접근이 필요합니다.
+
+**시스템 서버는 잡을 덮어써서 바꿀 수 없습니다.** app_server 에 쓴 launch 설정
+방법은 사용자 launch_daemon 에서만 됩니다. 시스템 launch_daemon 에서
+`/boot/system/settings/launch` 로 잡을 덮어쓰면 `_AddJob()` 이 init target 을
+요구사항에 한 번 더 넣고, `Job::Init()` 은 그 반복을 순환 의존으로 보고 잡을
+버립니다(`launch_roster log`: `Ignored job "x-vnd.haiku-net_server" due General
+system error`). 그러면 net_server 없이 부팅됩니다. 원래 잡은 끄고 시험용 바이너리를
+다른 이름으로 띄웁니다.
+
+```
+service x-vnd.Haiku-net_server {
+	disabled
+}
+service x-vnd.rainygirl-net_server-test {
+	launch /boot/home/dragtest/net_server
+	no_safemode
+	legacy
+}
+```
+
+실행 중인 바이너리를 `cp` 로 덮으면 안 됩니다. 매핑돼 있어서 돌고 있는 프로세스가
+새 파일의 페이지를 읽게 됩니다(gma500-driver 의 AGENTS.md 참고). 새 이름으로
+복사한 뒤 `mv` 로 바꿔 넣습니다.
 
 ## WiFi: 송신 오류 카운터와 `bb hang`의 실제 의미 (2026-09-19)
 

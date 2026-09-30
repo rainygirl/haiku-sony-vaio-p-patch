@@ -316,6 +316,30 @@ package list -i haiku-patched.hpkg                             # PackageInfo mus
 
 then back up the original, copy the patched file over the same name in `/boot/system/packages`, and reboot. The revision string does not change, and the `libnetapi.so` compatibility symlink inside the package keeps pointing at the replaced file. Check two things before trusting it: every symbol its consumers import (`objdump -T /boot/system/servers/net_server | grep UND`, intersected with the old library's exports) must still be exported by the new one, and its `objdump -p` NEEDED list may have grown -- a library built on a newer tree picked up `libssl.so.3`/`libcrypto.so.3` here, which resolved only because OpenSSL 3 happens to be installed. Recovery from a bad swap is the boot loader's previous package state, which needs physical access.
 
+**System servers cannot be overridden by amending their job.** The launch
+settings route used for app_server works only for the user launch_daemon.
+In the system one, amending a job from `/boot/system/settings/launch` makes
+`_AddJob()` add the init target to its requirements a second time;
+`Job::Init()` sees the repeat as a cyclic dependency and drops the job
+(`launch_roster log`: `Ignored job "x-vnd.haiku-net_server" due General system
+error`), and the machine boots with no net_server at all. Switch the original
+off and run the test binary under another name instead:
+
+```
+service x-vnd.Haiku-net_server {
+	disabled
+}
+service x-vnd.rainygirl-net_server-test {
+	launch /boot/home/dragtest/net_server
+	no_safemode
+	legacy
+}
+```
+
+Never `cp` over a binary that is running -- it is mapped, and the running
+process picks up the new file's pages (see gma500-driver's AGENTS.md). Copy to
+a new name and `mv` it into place.
+
 ## AP bring-up: measured values that contradict this document (2026-08-19)
 
 The second CPU stopped coming up on 2026-08-18 and has not returned. This
@@ -1328,6 +1352,42 @@ network that cannot be joined. `jam -q net_server` builds clean.
 `syslog_time_stamps true` is now set in the machine's kernel settings. These
 logs had no timestamps, so how long the join actually took could only be
 bounded, not measured; a recurrence will be measurable.
+
+### Wireless still failed now and then: the retry waited for a scan that never came (2026-09-30)
+
+With the second CPU up on every boot, one boot in five still came up without
+wireless. Scored per boot as above, the failing one differs in two ways:
+
+```text
+12:57:04  SCAN -> AUTH           (no auth reply follows)
+12:57:05 ... 12:57:13            notify_scan_done every 2 s, while in AUTH
+12:57:14  station deauth via MLME (reason 3), AUTH -> INIT
+          ... nothing, for as long as the machine stayed up
+```
+
+On the boots that work, scanning stops once the join starts. Here net80211's
+continuous scan kept hopping channels during authentication, so the AP's reply
+was missed -- `setmlme_assoc_sta()` carries FreeBSD's own `NB: this is racey if
+roaming is !manual`. Then wpa_supplicant gave up and the interface sat at INIT.
+AutoconfigLooper only ever retried when a scan completed, and at INIT nothing
+scans, so it never retried.
+
+The second half is fixed in `AutoconfigLooper.cpp`: every join, and every loss
+of a wireless link, arms a one-shot check for just after the grace period. With
+no link by then it requests a scan, and the scan's completion runs the existing
+retry and backoff. A scan rather than a join, because net_server only joins a
+network it can see in the scan results. When it acts it says so in the syslog:
+
+```text
+net_server: /dev/net/atheroswifi/0: no link 30 s after joining, requesting a scan to retry: No error
+```
+
+Tested by forcing the dead end: `ifconfig /dev/net/atheroswifi/0 leave "<ssid>"`
+leaves the interface at INIT with nothing scanning. The old net_server stays
+there; this one rejoined on its own after 2 min 10 s (the first two joins right
+after an explicit leave did not take, the third did). The scan/join race itself
+is in net80211 and is not changed here; it now costs a retry instead of the
+connection.
 
 ### The AP failure is a stall, and USB is not the source (2026-08-20, measured)
 
