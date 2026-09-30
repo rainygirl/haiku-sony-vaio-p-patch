@@ -8608,6 +8608,30 @@ index 69778cdf24..8d099d9229 100644
  	if (!apic_available())
  		return;
  
+diff --git a/src/system/kernel/fs/socket.cpp b/src/system/kernel/fs/socket.cpp
+index 468b85b80f..640b7b3136 100644
+--- a/src/system/kernel/fs/socket.cpp
++++ b/src/system/kernel/fs/socket.cpp
+@@ -394,6 +394,19 @@ create_socket_fd(net_socket* socket, int flags, bool kernel)
+ 		SO_NONBLOCK, &nonBlock, &nonBlockLen);
+ 	if (error != B_OK)
+ 		return error;
++	// SOCK_NONBLOCK has to reach the socket, not just the descriptor's open
++	// mode: the stack decides whether connect(), recv() and friends block,
++	// and it never looks at the open mode. Setting only O_NONBLOCK left a
++	// socket that F_GETFL reported non-blocking but that blocked anyway, so
++	// callers that trust it (curl) sat in recv() until the peer closed.
++	// fcntl(F_SETFL, O_NONBLOCK) goes through socket_set_flags(), which does
++	// the same.
++	if ((flags & SOCK_NONBLOCK) != 0 && !nonBlock) {
++		error = sStackInterface->ioctl(socket, B_SET_NONBLOCKING_IO, NULL, 0);
++		if (error != B_OK)
++			return error;
++	}
++
+ 	int oflags = 0;
+ 	if ((flags & SOCK_CLOEXEC) != 0)
+ 		oflags |= O_CLOEXEC;
 diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
 index 45e7fb785a..277f055149 100644
 --- a/src/system/kernel/fs/vfs_boot.cpp

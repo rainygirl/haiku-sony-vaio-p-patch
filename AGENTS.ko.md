@@ -141,6 +141,20 @@ haiku.git 기준일 때도 세 건이 같은 식으로 빠졌습니다:
 - **설치기** — `WorkerThread.cpp`/`.h`: 설치 후 대상 파티션을 실제로 active로 표시하고 MBR 부트코드를 기록해서, 수동으로 `writembr`를 하지 않아도 설치 직후 바로 부팅 가능하게 함. 디스크 디바이스 매니저는 마운트된 상태의 파티션에는 파티션 테이블 변경(active 플래그 포함)을 커밋해주지 않으므로, 이 시점부터는 더 이상 마운트가 필요 없다는 걸 확인하고 대상을 먼저 마운트 해제합니다. active 표시가 실제로 성공했을 때만 MBR을 덮어씁니다 — active 파티션이 하나도 없는 상태에서 범용 MBR 코드만 새로 쓰면 디스크가 완전히 부팅 불가능해지므로(부트로더가 전혀 실행되지 않아 부팅 옵션 메뉴조차 뜨지 않음), 실패 시에는 디스크에 원래 있던 부팅 설정을 그대로 두고 건드리지 않습니다. 두 단계 모두 이후 `sync()`를 호출합니다(MBR 쓰기는 디스크 디바이스 매니저를 완전히 우회하는 외부 `writembr` 프로세스로 이루어지기 때문).
 - **launch_daemon** — `Job.cpp`: `launch_daemon`이 아직 앱을 등록하지 못한 시점이면 즉시 실패하지 않고 한동안 재시도(느린 저장장치에서 중요).
 
+### socket(SOCK_NONBLOCK) 이 소켓을 차단 모드로 남겼다 (2026-09-30)
+
+`src/system/kernel/fs/socket.cpp` 의 `create_socket_fd()` 가 `SOCK_NONBLOCK` 을
+fd 의 open mode 에 `O_NONBLOCK` 으로만 옮기고 끝났습니다. `connect()`/`recv()`
+가 막힐지는 네트워크 스택이 정하는데 스택은 open mode 를 보지 않으므로,
+`F_GETFL` 은 비차단이라 하는데 소켓은 막혔습니다. `fcntl(F_SETFL, O_NONBLOCK)`
+은 괜찮았습니다(`socket_set_flags()` 가 `B_SET_NONBLOCKING_IO` 를 보냄). 이
+기기와 RENKU arm64 모두에서 `SOCK_NONBLOCK` 소켓의 `connect()` 가 응답 없는
+주소로 `EINPROGRESS` 대신 75초 걸렸습니다. `F_GETFL` 을 믿는 curl 이 매번
+서버의 유휴 제한까지 `recv()` 에서 기다리면서 드러났습니다. 스택에도 알리게
+고쳤고, `accept4()` 와 `socketpair()` 도 같은 함수를 지납니다. 이 수정으로
+빌드한 RENKU arm64 이미지에서 확인했고(RENKU media-patch 0013 이 같은 변경),
+여기서는 패치 적용과 컴파일을 확인했습니다.
+
 ## 두 번째 논리 CPU: 경합과 해결 (2026-09-30)
 
 이 절 아래는 긴 추적 기록이고, 여기가 그 끝입니다. 부팅마다 되다 안 되다

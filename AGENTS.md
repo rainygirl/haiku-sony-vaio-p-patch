@@ -144,6 +144,21 @@ The diff no longer reverts upstream's boot loader timing work (`a89c12444a`, `30
 - **Installer** — `WorkerThread.cpp`/`.h`: actually marks the target partition active and writes MBR boot code after install, so a fresh install is bootable without a manual `writembr` step. The disk device manager won't commit a partition-table change (including the active flag) against a live, mounted partition, so this unmounts the target first -- nothing after this point in the install still needs it mounted. The MBR is only overwritten if marking the partition active actually succeeded; a fresh install with no active partition and generic MBR code is completely unbootable (no boot loader ever runs, not even to show the boot options menu), so on failure this leaves whatever boot setup was already on the disk alone instead of risking that. Both steps `sync()` afterwards, since the MBR write goes through an external `writembr` process that bypasses the disk device manager entirely.
 - **launch_daemon** — `Job.cpp`: retries launching a signature-based app for a while instead of failing immediately if `launch_daemon` hasn't seen it registered yet (matters on slow storage).
 
+### socket(SOCK_NONBLOCK) left the socket blocking (2026-09-30)
+
+`src/system/kernel/fs/socket.cpp`, `create_socket_fd()`: `SOCK_NONBLOCK`
+became `O_NONBLOCK` on the descriptor's open mode and nothing else. The
+network stack decides whether `connect()`/`recv()` block and never looks at
+the open mode, so the socket blocked while `F_GETFL` said non-blocking.
+`fcntl(F_SETFL, O_NONBLOCK)` was fine (`socket_set_flags()` sends
+`B_SET_NONBLOCKING_IO`). Measured on this machine and on RENKU arm64 alike: a
+`connect()` to an unreachable address on a `SOCK_NONBLOCK` socket took 75 s
+instead of returning `EINPROGRESS`. Found through curl, which trusts
+`F_GETFL` and sat in `recv()` for the server's idle timeout on every run. The
+fix tells the stack too; `accept4()` and `socketpair()` share the function.
+Verified on a RENKU arm64 image built with it (RENKU media-patch 0013 is the
+same change); here the patch applies clean and the file compiles.
+
 ## Second logical CPU: the race, and why it is gone (2026-09-30)
 
 Everything below this section records the long hunt; this is where it ended.
