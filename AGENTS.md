@@ -176,7 +176,7 @@ it; `start.cpp`'s stage timings use the same clock. Upstream's `spin()` also
 has `regs.ecx = microseconds << 16` where `>> 16` is meant, so waits of 64 ms
 and longer are cut short -- worth reporting, not patched here.
 
-Measured with the installed loader, four boots in a row:
+Measured with the installed loader, five boots in a row (12:43, 12:53, 12:54, 12:56, 12:58):
 
 ```text
 smp: early wake sent to 1 ap(s) at 11485 ms after power-on (took 0 ms,

@@ -170,7 +170,7 @@ wait-for-SIPI 상태에 있고, 그때 SMI 가 오면 핸들러가 AP 와 합류
 `>> 16` 이어야 할 `regs.ecx = microseconds << 16` 이 있어 64 ms 이상의 대기가
 잘립니다. 보고할 거리이고 여기서는 고치지 않았습니다.
 
-설치한 로더로 네 번 연속 부팅한 결과:
+설치한 로더로 다섯 번 연속 부팅한 결과(12:43, 12:53, 12:54, 12:56, 12:58):
 
 ```text
 smp: early wake sent to 1 ap(s) at 11485 ms after power-on (took 0 ms,
