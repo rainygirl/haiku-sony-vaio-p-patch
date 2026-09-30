@@ -152,8 +152,10 @@ fd 의 open mode 에 `O_NONBLOCK` 으로만 옮기고 끝났습니다. `connect(
 주소로 `EINPROGRESS` 대신 75초 걸렸습니다. `F_GETFL` 을 믿는 curl 이 매번
 서버의 유휴 제한까지 `recv()` 에서 기다리면서 드러났습니다. 스택에도 알리게
 고쳤고, `accept4()` 와 `socketpair()` 도 같은 함수를 지납니다. 이 수정으로
-빌드한 RENKU arm64 이미지에서 확인했고(RENKU media-patch 0013 이 같은 변경),
-여기서는 패치 적용과 컴파일을 확인했습니다.
+빌드한 RENKU arm64 이미지(RENKU media-patch 0013 이 같은 변경)와 이 기기
+모두에서 확인했습니다. 다시 빌드한 커널에서 같은 `connect()` 가 0 ms 만에
+`EINPROGRESS` 를 돌려주고, 우회 수정이 없는 HaikuPorts curl-8.22.0-3 이
+https://www.haiku-os.org/ 를 1.2초에 받아 옵니다.
 
 ## 두 번째 논리 CPU: 경합과 해결 (2026-09-30)
 

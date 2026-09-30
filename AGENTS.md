@@ -157,7 +157,9 @@ instead of returning `EINPROGRESS`. Found through curl, which trusts
 `F_GETFL` and sat in `recv()` for the server's idle timeout on every run. The
 fix tells the stack too; `accept4()` and `socketpair()` share the function.
 Verified on a RENKU arm64 image built with it (RENKU media-patch 0013 is the
-same change); here the patch applies clean and the file compiles.
+same change) and on this machine: with the rebuilt kernel the same `connect()`
+returns `EINPROGRESS` in 0 ms, and the stock HaikuPorts curl-8.22.0-3 (no
+workaround) fetches https://www.haiku-os.org/ in 1.2 s.
 
 ## Second logical CPU: the race, and why it is gone (2026-09-30)
 
