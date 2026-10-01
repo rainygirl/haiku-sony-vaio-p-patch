@@ -84,7 +84,7 @@ index 1624aa58f8..aba7419185 100644
 +			# (haiku-webpositive-msvdx; pkgman.rainygirl.com's
 +			# x86_gcc2-webpositive repository, fetched by build-vaio-p-iso.sh).
 +			# HaikuWebKit 1.9.19 never registers its media engine, so without
-+			# this no <video> plays at all. haikuwebkit_x86 1.9.19-6 is the
++			# this no <video> plays at all. haikuwebkit_x86 1.9.19-22 is the
 +			# same 1.9.19 the repository's -2 is, with that fixed;
 +			# msvdx_media_x86 is the Media Kit decoder add-on, whose
 +			# post-install script runs in first-boot processing.
@@ -93,10 +93,10 @@ index 1624aa58f8..aba7419185 100644
 +			# AddFilesToHaikuImage like vim_x86 above: that puts them on the
 +			# system package list the image build resolves dependencies
 +			# against, so WebPositive's lib:libwebkitlegacy_x86 is met by
-+			# -6 and the repository's -2 is not added beside it, and the
++			# -22 and the repository's -2 is not added beside it, and the
 +			# add-on's FFmpeg libraries are pulled in from the repository.
 +			local vaioPVideoPackages =
-+				haikuwebkit_x86-1.9.19-6-x86_gcc2.hpkg
++				haikuwebkit_x86-1.9.19-22-x86_gcc2.hpkg
 +				msvdx_media_x86-1.0.0-1-x86_gcc2.hpkg
 +				msvdx_firmware-0.30-1-any.hpkg
 +				webpositive_hwvideo-1.0.0-1-x86_gcc2.hpkg ;

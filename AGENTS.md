@@ -163,7 +163,7 @@ workaround) fetches https://www.haiku-os.org/ in 1.2 s.
 
 ## WebPositive's HTML5 video ships in the image (2026-10-01)
 
-The image carries `haikuwebkit_x86` 1.9.19-6, `msvdx_media_x86` 1.0.0-1,
+The image carries `haikuwebkit_x86` 1.9.19-22 (Media Source Extensions and an assembly JavaScript interpreter, from [haiku-webpositive-youtube-patch](https://github.com/rainygirl/haiku-webpositive-youtube-patch)), `msvdx_media_x86` 1.0.0-1,
 `msvdx_firmware` 0.30-1 and `webpositive_hwvideo` 1.0.0-1, fetched by
 `build-vaio-p-iso.sh` from `https://pkgman.rainygirl.com/x86_gcc2-webpositive`
 and pinned there by SHA-256. What they fix and how is in

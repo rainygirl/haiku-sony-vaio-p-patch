@@ -280,7 +280,7 @@ HAIKUPORTS_URL="https://eu.hpkg.haiku-os.org/haikuports/master/x86_gcc2/current/
 VIDEO_URL="https://pkgman.rainygirl.com/x86_gcc2-webpositive/packages"
 EXTRA_PACKAGES=(
 	"$HAIKUPORTS_URL vim_x86-9.1.1618-1-x86_gcc2.hpkg"
-	"$VIDEO_URL haikuwebkit_x86-1.9.19-6-x86_gcc2.hpkg fb49d91cc8bc85ca874760b11067a06c27fa1f9c87df2b915c6f48f927d5b124"
+	"$VIDEO_URL haikuwebkit_x86-1.9.19-22-x86_gcc2.hpkg d539311952e81e2c993c8bc62ecac133f573dd42cdcc5a2fbe09577e9e223eab"
 	"$VIDEO_URL msvdx_media_x86-1.0.0-1-x86_gcc2.hpkg ef8a52c4c47cfc7c8a0ab0c461e4fc186bc09e9f8a915440161c76a32d64fc2f"
 	"$VIDEO_URL msvdx_firmware-0.30-1-any.hpkg 72544ce1fc6a4abb9b09ccde6e3f8c708857c1a6bb947994ac23832812bcb6b6"
 	"$VIDEO_URL webpositive_hwvideo-1.0.0-1-x86_gcc2.hpkg 59c5af99b2eed3e8511d330e34ef21b0d1e23d1b9a577dae7b8cb4158b8685b9"

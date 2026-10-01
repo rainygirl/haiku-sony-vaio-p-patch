@@ -107,7 +107,7 @@ RenkuOS nightly가 이 설정으로 빌드하기 때문입니다. 상표가 있�
 WebPositive에서 YouTube를 포함한 HTML5 비디오가 재생되고, H.264는 GMA500의
 비디오 디코더에서 디코딩됩니다. YouTube 360p의 프레임당 CPU는 소프트웨어 17.1 ms
 대신 5.8 ms입니다. ISO에는 pkgman.rainygirl.com의 `x86_gcc2-webpositive`
-저장소에서 받은 패키지 네 개가 들어갑니다. `haikuwebkit_x86` 1.9.19-6
+저장소에서 받은 패키지 네 개가 들어갑니다. `haikuwebkit_x86` 1.9.19-22
 (HaikuWebKit 1.9.19는 미디어 엔진을 등록하지 않아 `<video>`가 아예 재생되지
 않았습니다), Media Kit 디코더 `msvdx_media_x86`, Intel 펌웨어 `msvdx_firmware`,
 그리고 이들을 묶는 `webpositive_hwvideo`입니다. 소스와 노트:

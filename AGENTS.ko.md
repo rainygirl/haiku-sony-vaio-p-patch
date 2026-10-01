@@ -159,7 +159,7 @@ https://www.haiku-os.org/ 를 1.2초에 받아 옵니다.
 
 ## WebPositive HTML5 비디오를 이미지에 넣는다 (2026-10-01)
 
-이미지에 `haikuwebkit_x86` 1.9.19-6, `msvdx_media_x86` 1.0.0-1,
+이미지에 `haikuwebkit_x86` 1.9.19-22(Media Source Extensions와 어셈블리 JavaScript 인터프리터, [haiku-webpositive-youtube-patch](https://github.com/rainygirl/haiku-webpositive-youtube-patch)), `msvdx_media_x86` 1.0.0-1,
 `msvdx_firmware` 0.30-1, `webpositive_hwvideo` 1.0.0-1 이 들어갑니다.
 `build-vaio-p-iso.sh` 가 `https://pkgman.rainygirl.com/x86_gcc2-webpositive`
 에서 받아 SHA-256 으로 고정합니다. 무엇을 어떻게 고치는지는
