@@ -102,6 +102,18 @@ RenkuOS nightly가 이 설정으로 빌드하기 때문입니다. 상표가 있�
 [haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver) 에서 따로
 받을 수 있습니다.
 
+## 비디오
+
+WebPositive에서 YouTube를 포함한 HTML5 비디오가 재생되고, H.264는 GMA500의
+비디오 디코더에서 디코딩됩니다. YouTube 360p의 프레임당 CPU는 소프트웨어 17.1 ms
+대신 5.8 ms입니다. ISO에는 pkgman.rainygirl.com의 `x86_gcc2-webpositive`
+저장소에서 받은 패키지 네 개가 들어갑니다. `haikuwebkit_x86` 1.9.19-6
+(HaikuWebKit 1.9.19는 미디어 엔진을 등록하지 않아 `<video>`가 아예 재생되지
+않았습니다), Media Kit 디코더 `msvdx_media_x86`, Intel 펌웨어 `msvdx_firmware`,
+그리고 이들을 묶는 `webpositive_hwvideo`입니다. 소스와 노트:
+[haiku-webpositive-msvdx](https://github.com/rainygirl/haiku-webpositive-msvdx).
+WebPositive 환경변수 `MSVDX_MEDIA=0`은 소프트웨어 디코딩을 강제합니다.
+
 ## 빌드 후 확인
 
 빌드 자체는 소스 검증일 뿐이며, 실제 검증은 실기기에서만 가능합니다: USB로 ACPI를 켜고 Safe Mode 없이 부팅 -> 내장 디스크에 설치 (DriveSetup으로 Intel 파티션 맵 + BFS 파티션을 먼저 만든 뒤 설치) -> 재부팅까지 확인해야 합니다.

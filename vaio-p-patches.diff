@@ -1,5 +1,5 @@
 diff --git a/build/jam/DefaultBuildProfiles b/build/jam/DefaultBuildProfiles
-index 1624aa58f8..0d8e8e4fce 100644
+index 1624aa58f8..aba7419185 100644
 --- a/build/jam/DefaultBuildProfiles
 +++ b/build/jam/DefaultBuildProfiles
 @@ -119,6 +119,11 @@ rule DefineDefaultBuildProfiles
@@ -57,7 +57,7 @@ index 1624aa58f8..0d8e8e4fce 100644
  				;
  			AddHaikuImageSourcePackages
  				nano
-@@ -169,6 +209,40 @@ rule DefineDefaultBuildProfiles
+@@ -169,6 +209,65 @@ rule DefineDefaultBuildProfiles
  
  			AddOptionalHaikuImagePackages Development Git ;
  
@@ -80,6 +80,29 @@ index 1624aa58f8..0d8e8e4fce 100644
 +			SEARCH on $(vaioPExtraPackages)
 +				= [ FDirName $(HAIKU_TOP) .. vaio-p-packages ] ;
 +
++			# HTML5 video in WebPositive, with H.264 decoded on the GMA500
++			# (haiku-webpositive-msvdx; pkgman.rainygirl.com's
++			# x86_gcc2-webpositive repository, fetched by build-vaio-p-iso.sh).
++			# HaikuWebKit 1.9.19 never registers its media engine, so without
++			# this no <video> plays at all. haikuwebkit_x86 1.9.19-6 is the
++			# same 1.9.19 the repository's -2 is, with that fixed;
++			# msvdx_media_x86 is the Media Kit decoder add-on, whose
++			# post-install script runs in first-boot processing.
++			#
++			# These go through AddPackageFilesToHaikuImage, not
++			# AddFilesToHaikuImage like vim_x86 above: that puts them on the
++			# system package list the image build resolves dependencies
++			# against, so WebPositive's lib:libwebkitlegacy_x86 is met by
++			# -6 and the repository's -2 is not added beside it, and the
++			# add-on's FFmpeg libraries are pulled in from the repository.
++			local vaioPVideoPackages =
++				haikuwebkit_x86-1.9.19-6-x86_gcc2.hpkg
++				msvdx_media_x86-1.0.0-1-x86_gcc2.hpkg
++				msvdx_firmware-0.30-1-any.hpkg
++				webpositive_hwvideo-1.0.0-1-x86_gcc2.hpkg ;
++			SEARCH on $(vaioPVideoPackages)
++				= [ FDirName $(HAIKU_TOP) .. vaio-p-packages ] ;
++
 +			# And only for a build that actually has an x86_gcc2 secondary
 +			# architecture. Every file here is an x86_gcc2 package: the
 +			# repository packages above are already gated behind gcc2 @{ }@
@@ -90,6 +113,8 @@ index 1624aa58f8..0d8e8e4fce 100644
 +			if x86_gcc2 in $(HAIKU_PACKAGING_ARCHS) {
 +				AddFilesToHaikuImage system packages
 +					: $(vaioPExtraPackages) ;
++				AddPackageFilesToHaikuImage system packages
++					: $(vaioPVideoPackages) ;
 +			} else {
 +				Echo "vaio-p: skipping the x86_gcc2 package injection,"
 +					"HAIKU_PACKAGING_ARCHS is $(HAIKU_PACKAGING_ARCHS)" ;

@@ -101,6 +101,19 @@ application correctly, so nothing uses it today.
 The same driver is available separately, for unpatched systems, at
 [haiku-gma500-driver](https://github.com/rainygirl/haiku-gma500-driver).
 
+## Video
+
+WebPositive plays HTML5 video, YouTube included, and the H.264 is decoded on
+the GMA500's video decoder: 360p from YouTube costs 5.8 ms of CPU per frame
+against 17.1 ms in software. The ISO ships four packages for it from the
+`x86_gcc2-webpositive` repository on pkgman.rainygirl.com --
+`haikuwebkit_x86` 1.9.19-6 (HaikuWebKit 1.9.19 never registered its media
+engine, so no `<video>` played at all), the `msvdx_media_x86` Media Kit
+decoder, Intel's `msvdx_firmware`, and `webpositive_hwvideo` tying them
+together. Source and notes:
+[haiku-webpositive-msvdx](https://github.com/rainygirl/haiku-webpositive-msvdx).
+`MSVDX_MEDIA=0` in WebPositive's environment forces software decoding.
+
 ## After building
 
 A successful build only verifies the source compiles — real verification requires the actual hardware: boot from USB with ACPI on and no Safe Mode, install to the internal disk (create an Intel partition map + BFS partition in DriveSetup first, then install), then confirm it survives a reboot.

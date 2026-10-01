@@ -161,6 +161,36 @@ same change) and on this machine: with the rebuilt kernel the same `connect()`
 returns `EINPROGRESS` in 0 ms, and the stock HaikuPorts curl-8.22.0-3 (no
 workaround) fetches https://www.haiku-os.org/ in 1.2 s.
 
+## WebPositive's HTML5 video ships in the image (2026-10-01)
+
+The image carries `haikuwebkit_x86` 1.9.19-6, `msvdx_media_x86` 1.0.0-1,
+`msvdx_firmware` 0.30-1 and `webpositive_hwvideo` 1.0.0-1, fetched by
+`build-vaio-p-iso.sh` from `https://pkgman.rainygirl.com/x86_gcc2-webpositive`
+and pinned there by SHA-256. What they fix and how is in
+[haiku-webpositive-msvdx](https://github.com/rainygirl/haiku-webpositive-msvdx);
+in short, HaikuWebKit 1.9.19 never registers its media engine, so no HTML5
+media plays in WebPositive at all, and the add-on decodes H.264 on the GMA500.
+
+They are added with `AddPackageFilesToHaikuImage`, unlike `vim_x86`, which goes
+in with `AddFilesToHaikuImage`. The difference matters here. `build_haiku_image`
+resolves dependencies with `get_package_dependencies`, which treats the system
+package list as the installed set and adds from the repositories only what that
+set is missing. A package added with `AddFilesToHaikuImage` is not on that list:
+WebPositive's `lib:libwebkitlegacy_x86` would then be resolved to the
+repository's `haikuwebkit_x86-1.9.19-2`, and two `haikuwebkit_x86` packages
+would land in `/system/packages`. On the list, -6 meets the requirement and -2
+conflicts with it, so it is not added; and the add-on's
+`lib:libswscale_x86`/`lib:libavutil_x86` come from the repository's
+`ffmpeg6_x86` the ordinary way. (`vim_x86`'s requirements are listed by hand
+in the profile for exactly this reason.)
+
+-6 is the same HaikuWebKit 1.9.19 the repository pins, so WebPositive, which
+builds against `haikuwebkit_x86_devel-1.9.19-2`, links against it unchanged.
+Its `haiku_x86 >= r1~beta6_hrev59866_5-1` requirement is met by this build's
+`hrev60072+N`. `msvdx_media_x86`'s post-install script, which copies the
+add-on into the system's non-packaged add-ons directory so the Media Kit picks
+it before the ffmpeg plugin, runs in package_daemon's first-boot processing.
+
 ## Second logical CPU: the race, and why it is gone (2026-09-30)
 
 Everything below this section records the long hunt; this is where it ended.

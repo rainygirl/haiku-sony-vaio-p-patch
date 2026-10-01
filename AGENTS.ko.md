@@ -157,6 +157,36 @@ fd 의 open mode 에 `O_NONBLOCK` 으로만 옮기고 끝났습니다. `connect(
 `EINPROGRESS` 를 돌려주고, 우회 수정이 없는 HaikuPorts curl-8.22.0-3 이
 https://www.haiku-os.org/ 를 1.2초에 받아 옵니다.
 
+## WebPositive HTML5 비디오를 이미지에 넣는다 (2026-10-01)
+
+이미지에 `haikuwebkit_x86` 1.9.19-6, `msvdx_media_x86` 1.0.0-1,
+`msvdx_firmware` 0.30-1, `webpositive_hwvideo` 1.0.0-1 이 들어갑니다.
+`build-vaio-p-iso.sh` 가 `https://pkgman.rainygirl.com/x86_gcc2-webpositive`
+에서 받아 SHA-256 으로 고정합니다. 무엇을 어떻게 고치는지는
+[haiku-webpositive-msvdx](https://github.com/rainygirl/haiku-webpositive-msvdx)
+에 있습니다. 요약하면 HaikuWebKit 1.9.19 가 미디어 엔진을 등록하지 않아
+WebPositive 에서 HTML5 미디어가 전혀 재생되지 않았고, 애드온은 GMA500 에서
+H.264 를 디코딩합니다.
+
+`vim_x86` 은 `AddFilesToHaikuImage` 로 넣지만 이 패키지들은
+`AddPackageFilesToHaikuImage` 로 넣습니다. 여기서는 그 차이가 중요합니다.
+`build_haiku_image` 는 `get_package_dependencies` 로 의존성을 푸는데, 시스템
+패키지 목록을 설치된 집합으로 보고 거기 없는 것만 저장소에서 추가합니다.
+`AddFilesToHaikuImage` 로 넣은 패키지는 이 목록에 없으므로, WebPositive 의
+`lib:libwebkitlegacy_x86` 이 저장소의 `haikuwebkit_x86-1.9.19-2` 로 풀려
+`/system/packages` 에 `haikuwebkit_x86` 이 두 개 들어갑니다. 목록에 있으면 -6
+이 요구조건을 채우고 -2 는 -6 과 충돌하므로 추가되지 않습니다. 애드온의
+`lib:libswscale_x86`/`lib:libavutil_x86` 은 저장소의 `ffmpeg6_x86` 에서
+평소처럼 들어옵니다. (`vim_x86` 의 의존 패키지를 프로필에 손으로 적어 둔 것도
+같은 이유입니다.)
+
+-6 은 저장소가 고정한 것과 같은 HaikuWebKit 1.9.19 이므로,
+`haikuwebkit_x86_devel-1.9.19-2` 로 빌드되는 WebPositive 가 그대로 링크됩니다.
+`haiku_x86 >= r1~beta6_hrev59866_5-1` 요구조건은 이 빌드의 `hrev60072+N` 이
+만족합니다. 애드온을 시스템 non-packaged 애드온 디렉터리로 복사해 Media Kit 이
+ffmpeg 플러그인보다 먼저 고르게 하는 `msvdx_media_x86` 의 post-install
+스크립트는 package_daemon 의 첫 부팅 처리에서 실행됩니다.
+
 ## 두 번째 논리 CPU: 경합과 해결 (2026-09-30)
 
 이 절 아래는 긴 추적 기록이고, 여기가 그 끝입니다. 부팅마다 되다 안 되다

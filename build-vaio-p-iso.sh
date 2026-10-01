@@ -269,27 +269,44 @@ log "Fetching packages the image injects as plain files"
 # directly, looking for them in vaio-p-packages beside the source tree. They are
 # not in the x86_gcc2 repository definition, so the build cannot fetch them
 # itself and fails with "don't know how to make <file>" without them. Keep this
-# list in step with vaioPExtraPackages there.
+# list in step with vaioPExtraPackages and vaioPVideoPackages there.
+#
+# Each entry is "<base URL> <file> [<sha256>]". vim_x86 comes from HaikuPorts.
+# The rest are WebPositive's HTML5 video with H.264 on the GMA500
+# (github.com/rainygirl/haiku-webpositive-msvdx), from pkgman.rainygirl.com's
+# x86_gcc2-webpositive repository; those are ours, so they are pinned by hash.
 EXTRA_PACKAGES_DIR="$WORK_DIR/vaio-p-packages"
-EXTRA_PACKAGES_URL="https://eu.hpkg.haiku-os.org/haikuports/master/x86_gcc2/current/packages"
+HAIKUPORTS_URL="https://eu.hpkg.haiku-os.org/haikuports/master/x86_gcc2/current/packages"
+VIDEO_URL="https://pkgman.rainygirl.com/x86_gcc2-webpositive/packages"
 EXTRA_PACKAGES=(
-	vim_x86-9.1.1618-1-x86_gcc2.hpkg
+	"$HAIKUPORTS_URL vim_x86-9.1.1618-1-x86_gcc2.hpkg"
+	"$VIDEO_URL haikuwebkit_x86-1.9.19-6-x86_gcc2.hpkg fb49d91cc8bc85ca874760b11067a06c27fa1f9c87df2b915c6f48f927d5b124"
+	"$VIDEO_URL msvdx_media_x86-1.0.0-1-x86_gcc2.hpkg ef8a52c4c47cfc7c8a0ab0c461e4fc186bc09e9f8a915440161c76a32d64fc2f"
+	"$VIDEO_URL msvdx_firmware-0.30-1-any.hpkg 72544ce1fc6a4abb9b09ccde6e3f8c708857c1a6bb947994ac23832812bcb6b6"
+	"$VIDEO_URL webpositive_hwvideo-1.0.0-1-x86_gcc2.hpkg 59c5af99b2eed3e8511d330e34ef21b0d1e23d1b9a577dae7b8cb4158b8685b9"
 )
 mkdir -p "$EXTRA_PACKAGES_DIR"
-for package in "${EXTRA_PACKAGES[@]}"; do
+for entry in "${EXTRA_PACKAGES[@]}"; do
+	read -r url package sha256 <<<"$entry"
 	target="$EXTRA_PACKAGES_DIR/$package"
 	# A package file starts with the "hpkg" magic; anything else is an error
 	# page saved under the package's name.
-	if [ -f "$target" ] && [ "$(head -c 4 "$target")" = "hpkg" ]; then
+	if [ -f "$target" ] && [ "$(head -c 4 "$target")" = "hpkg" ] \
+		&& { [ -z "$sha256" ] \
+			|| [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$sha256" ]; }; then
 		continue
 	fi
 	log "Downloading $package"
-	wget -q -O "$target.part" "$EXTRA_PACKAGES_URL/$package" \
-		|| die "could not download $package from $EXTRA_PACKAGES_URL" \
-			"-- HaikuPorts may have replaced that version. Update the" \
-			"filename here and in vaioPExtraPackages in DefaultBuildProfiles."
+	wget -q -O "$target.part" "$url/$package" \
+		|| die "could not download $package from $url" \
+			"-- the repository may have replaced that version. Update the" \
+			"filename here and in DefaultBuildProfiles."
 	[ "$(head -c 4 "$target.part")" = "hpkg" ] \
 		|| die "$package downloaded, but is not a package file"
+	if [ -n "$sha256" ] \
+		&& [ "$(sha256sum "$target.part" | cut -d' ' -f1)" != "$sha256" ]; then
+		die "$package downloaded, but its SHA-256 is not the pinned one"
+	fi
 	mv "$target.part" "$target"
 done
 
